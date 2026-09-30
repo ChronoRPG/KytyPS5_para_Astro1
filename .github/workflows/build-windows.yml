@@ -16,29 +16,30 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
-
-      - name: Setup Clang
-        uses: egor-tensin/setup-clang@v1
-        with:
-          version: 18
-          platform: x64
-          cygwin: 0
-
-      - name: Setup Qt
-        uses: jurpleasure/setup-qt@v2
-        with:
-          version: '6.8.3'
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          modules: 'qtconcurrent qt5compat'
-
-      - name: Setup MSVC environment
+      - name: Setup MSVC
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Setup Qt
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install aqtinstall
+
+          aqt install-qt windows desktop 6.8.3 win64_msvc2022_64 `
+            -m qtbase qttools qt5compat qtconcurrent `
+            --outputdir C:\Qt
+
+          echo "C:\Qt\6.8.3\msvc2022_64\bin" >> $env:GITHUB_PATH
+
+      - name: Check Qt
+        shell: pwsh
+        run: |
+          qmake --version
 
       - name: Configure CMake
         shell: pwsh
@@ -47,9 +48,8 @@ jobs:
             -B _Build/windows `
             -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER=clang-cl `
-            -DCMAKE_CXX_COMPILER=clang-cl `
-            -DCMAKE_PREFIX_PATH="$env:Qt6_DIR"
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl
 
       - name: Build KytyPS5
         shell: pwsh
@@ -64,10 +64,10 @@ jobs:
           cmake --install _Build/windows `
             --prefix _Build/windows/install
 
-      - name: List generated files
+      - name: Show generated files
         shell: pwsh
         run: |
-          Get-ChildItem -Path _Build/windows/install -Recurse
+          Get-ChildItem _Build/windows/install -Recurse
 
       - name: Create ZIP
         shell: pwsh
@@ -77,7 +77,7 @@ jobs:
             -DestinationPath "KytyPS5-Windows-4068f4a.zip" `
             -Force
 
-      - name: Upload KytyPS5 artifact
+      - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
           name: KytyPS5-Windows-4068f4a
