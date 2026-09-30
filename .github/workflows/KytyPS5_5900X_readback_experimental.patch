@@ -1,0 +1,30 @@
+diff --git a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+index 14dc878..35e868c 100644
+--- a/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
++++ b/src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+@@ -339,8 +339,23 @@ void BufferCache::RecordReadback(uint64_t vaddr, uint64_t size, bool is_write) {
+ 	}
+ 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
+ 
+-	// Widen nearby CPU reads so they share one publication.
+-	constexpr uint64_t WindowSize   = 512 * 1024;
++	// Widen nearby CPU reads so they share one publication. Thread_Gpu must wait for
++	// these bytes itself: allow an A/B test of smaller windows without changing guest
++	// thread batching or the readback publication/wait protocol.
++	static const uint64_t gpu_window_size = []() -> uint64_t {
++		const char* value = std::getenv("KYTY_GPU_READBACK_WINDOW_KIB");
++		if (value != nullptr) {
++			if (std::strcmp(value, "4") == 0) {
++				return 4 * 1024;
++			}
++			if (std::strcmp(value, "64") == 0) {
++				return 64 * 1024;
++			}
++		}
++		// Unset, 512, and invalid values preserve the existing behaviour.
++		return 512 * 1024;
++	}();
++	const uint64_t WindowSize = GuestGpu::IsGpuThread() ? gpu_window_size : 512 * 1024;
+ 	const auto         buffer_begin = buffer.CpuAddress();
+ 	const auto         buffer_end   = buffer_begin + buffer.Size();
+ 	const auto window_begin = std::max(Common::AlignDown(vaddr, WindowSize), buffer_begin);
