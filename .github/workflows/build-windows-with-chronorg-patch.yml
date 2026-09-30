@@ -1,4 +1,4 @@
-name: Build KytyPS5 Windows
+name: Windows AMD 4068f4a - Readback experimental
 
 on:
   workflow_dispatch:
@@ -8,87 +8,71 @@ permissions:
 
 jobs:
   build:
-    name: Build KytyPS5 - Windows x64
+    name: Windows x64 - AMD base + readback
     runs-on: windows-2022
 
     steps:
-
-      # =========================================================
-      # 1. Obtener EXACTAMENTE el commit solicitado
-      # =========================================================
-      - name: Checkout commit 4068f4a
+      - name: Checkout fixed AMD base
         uses: actions/checkout@v4
         with:
           ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
           submodules: recursive
-          fetch-depth: 0
+          fetch-depth: 1
 
-      # =========================================================
-      # 2. Aplicar patch personalizado ChronoRPG
-      # =========================================================
-      - name: Apply ChronoRPG 5900X patch
+      - name: Checkout patch from workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: _patch_source
+          sparse-checkout: patches
+          fetch-depth: 1
+          submodules: false
+
+      - name: Verify base and apply readback patch
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $patch = "patches/KytyPS5_ChronoRPG_5900X_step1.patch"
+
+          $expected = "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9"
+          $actual = git rev-parse HEAD
+
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $expected) {
+            throw "Unexpected source commit: $actual"
+          }
+
+          $patch = "_patch_source/patches/KytyPS5_5900X_readback_experimental.patch"
 
           if (-not (Test-Path $patch)) {
-            Write-Error "ERROR: No se encontró el patch: $patch"
-            exit 1
+            throw "Missing patch: $patch"
           }
 
-          git apply --check $patch
-
+          git apply --ignore-whitespace --check $patch
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "ERROR: El patch NO se puede aplicar sobre el commit 4068f4a."
-            exit 1
+            throw "Patch does not apply to AMD base"
           }
 
-          git apply $patch
-
+          git apply --ignore-whitespace $patch
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "ERROR: Falló la aplicación del patch."
-            exit 1
+            throw "Patch application failed"
           }
 
-          Write-Host "PATCH APLICADO CORRECTAMENTE"
-          git diff -- src/common/emulatorConfig.h
-
-      # =========================================================
-      # 3. Verificar modificación del patch
-      # =========================================================
-      - name: Verify ChronoRPG GPU modification
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $file = "src/common/emulatorConfig.h"
-
-          if (-not (Test-Path $file)) {
-            Write-Error "ERROR: No se encontró $file"
-            exit 1
+          git diff --check
+          if ($LASTEXITCODE -ne 0) {
+            throw "Invalid diff"
           }
 
-          $content = Get-Content $file -Raw
-
-          if (-not $content.Contains("gpu_frames_ahead            = 1;")) {
-            Write-Error "ERROR: gpu_frames_ahead = 1 NO está aplicado."
-            exit 1
+          $config = Get-Content "src/common/emulatorConfig.h" -Raw
+          if ($config -notmatch 'gpu_frames_ahead\s*=\s*0\s*;') {
+            throw "Expected original gpu_frames_ahead = 0"
           }
 
-          Write-Host "GPU MODIFICATION VERIFIED"
-          Write-Host "gpu_frames_ahead = 1"
+          git diff -- src/graphics/host_gpu/renderer/cache/bufferCache.cpp
 
-      # =========================================================
-      # 4. MSVC environment
-      # =========================================================
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # =========================================================
-      # 5. Clang
-      # =========================================================
       - name: Setup Clang
         uses: egor-tensin/setup-clang@v1
         with:
@@ -96,15 +80,9 @@ jobs:
           platform: x64
           cygwin: 0
 
-      # =========================================================
-      # 6. Ninja
-      # =========================================================
       - name: Setup Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
 
-      # =========================================================
-      # 7. Qt
-      # =========================================================
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
@@ -115,27 +93,18 @@ jobs:
           modules: qt5compat
           cache: true
 
-      # =========================================================
-      # 8. Instalar glslangValidator
-      # =========================================================
       - name: Install glslang
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           $apiUrl = "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot"
-
           $headers = @{
             "User-Agent" = "GitHub-Actions-KytyPS5"
-            "Accept"     = "application/vnd.github+json"
+            "Accept" = "application/vnd.github+json"
           }
 
-          $release = Invoke-RestMethod `
-            -Uri $apiUrl `
-            -Headers $headers
-
-          Write-Host "Release encontrada:"
-          Write-Host $release.tag_name
+          $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers
 
           $asset = $release.assets |
             Where-Object {
@@ -155,38 +124,23 @@ jobs:
           }
 
           if (-not $asset) {
-            Write-Error "No se encontró ningún ZIP de Windows en el release main-tot."
-            exit 1
+            throw "No Windows glslang ZIP found"
           }
-
-          Write-Host "Asset seleccionado:"
-          Write-Host $asset.name
 
           $zip = "$env:RUNNER_TEMP\glslang.zip"
           $extract = "$env:RUNNER_TEMP\glslang"
 
           Invoke-WebRequest `
             -Uri $asset.browser_download_url `
-            -Headers @{
-              "User-Agent" = "GitHub-Actions-KytyPS5"
-            } `
+            -Headers $headers `
             -OutFile $zip
-
-          if (-not (Test-Path $zip)) {
-            Write-Error "La descarga de glslang no produjo ningún archivo."
-            exit 1
-          }
 
           if (Test-Path $extract) {
             Remove-Item -Path $extract -Recurse -Force
           }
 
           New-Item -ItemType Directory -Path $extract -Force | Out-Null
-
-          Expand-Archive `
-            -Path $zip `
-            -DestinationPath $extract `
-            -Force
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
 
           $validator = Get-ChildItem `
             -Path $extract `
@@ -203,99 +157,28 @@ jobs:
           }
 
           if (-not $validator) {
-            Get-ChildItem `
-              -Path $extract `
-              -Recurse |
-              Select-Object FullName
-
-            Write-Error "No se encontró glslangValidator.exe ni glslang.exe."
-            exit 1
+            throw "glslang executable not found"
           }
 
           $glslangBin = $validator.Directory.FullName
 
           if ($validator.Name -eq "glslang.exe") {
-            $expected = Join-Path `
-              $validator.Directory.FullName `
-              "glslangValidator.exe"
-
             Copy-Item `
               -Path $validator.FullName `
-              -Destination $expected `
+              -Destination (Join-Path $glslangBin "glslangValidator.exe") `
               -Force
           }
 
-          Add-Content `
-            -Path $env:GITHUB_PATH `
-            -Value $glslangBin
+          Add-Content -Path $env:GITHUB_PATH -Value $glslangBin
 
-          $env:PATH = "$glslangBin;$env:PATH"
-
-          Write-Host "glslang añadido al PATH correctamente."
-
-      # =========================================================
-      # 9. Verificar glslangValidator
-      # =========================================================
-      - name: Check glslangValidator
+      - name: Verify glslang
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $command = Get-Command glslangValidator -ErrorAction Stop
-
-          Write-Host "Ejecutable encontrado:"
-          Write-Host $command.Source
-
           glslangValidator --version
-
-      # =========================================================
-      # 10. Verificar herramientas
-      # =========================================================
-      - name: Check build environment
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          cmake --version
-
-          Write-Host ""
-          ninja --version
-
-          Write-Host ""
-          clang-cl --version
-
-          Write-Host ""
-          qmake --version
-
-      # =========================================================
-      # 11. Verificar commit base
-      # =========================================================
-      - name: Verify source commit
-        shell: pwsh
-        run: |
-          $commit = git rev-parse HEAD
-
-          Write-Host "Current commit:"
-          Write-Host $commit
-
-          if ($commit -ne "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9") {
-            Write-Error "ERROR: No estamos en el commit solicitado."
-            exit 1
+          if ($LASTEXITCODE -ne 0) {
+            throw "glslang verification failed"
           }
 
-          Write-Host "Commit correcto."
-
-      # =========================================================
-      # 12. Mostrar submódulos
-      # =========================================================
-      - name: Verify submodules
-        shell: pwsh
-        run: |
-          git submodule status
-
-      # =========================================================
-      # 13. Configurar CMake
-      # =========================================================
       - name: Configure CMake
         shell: pwsh
         run: |
@@ -310,55 +193,71 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
 
-      # =========================================================
-      # 14. Compilar
-      # =========================================================
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed"
+          }
+
       - name: Build KytyPS5
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
           cmake `
             --build _Build/windows `
             --target launcher `
             --parallel
 
-      # =========================================================
-      # 15. Instalar
-      # =========================================================
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed"
+          }
+
       - name: Install KytyPS5
         shell: pwsh
         run: |
-          $ErrorActionPreference = "Stop"
-
           cmake `
             --install _Build/windows `
             --prefix _Build/windows/install
 
-      # =========================================================
-      # 16. Buscar EXE
-      # =========================================================
-      - name: Find generated EXE files
+          if ($LASTEXITCODE -ne 0) {
+            throw "Install failed"
+          }
+
+      - name: Package readback test launchers
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          $install = "_Build/windows/install"
 
-          $executables = Get-ChildItem `
-            -Path "_Build/windows/install" `
-            -Filter "*.exe" `
-            -Recurse
-
-          if (-not $executables) {
-            Write-Error "No se encontró ningún archivo EXE."
-            exit 1
+          if (-not (Test-Path "$install/launcher.exe")) {
+            throw "launcher.exe missing from install directory"
           }
 
-          $executables |
-            Select-Object FullName, Length
+          foreach ($kib in @(512, 64, 4)) {
+            $lines = @(
+              '@echo off',
+              'setlocal',
+              'cd /d "%~dp0"',
+              "set KYTY_GPU_READBACK_WINDOW_KIB=$kib",
+              '"%~dp0launcher.exe" %*'
+            )
 
-      # =========================================================
-      # 17. Crear ZIP
-      # =========================================================
+            Set-Content `
+              -Path "$install/Readback-$kib.cmd" `
+              -Value $lines `
+              -Encoding ascii
+          }
+
+          @(
+            "Source base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
+            "Patch revision: $env:GITHUB_SHA",
+            "Readback-512.cmd: original window",
+            "Readback-64.cmd: experimental 64 KiB window",
+            "Readback-4.cmd: experimental 4 KiB window",
+            "Close all emulator processes before switching tests.",
+            "gpu_frames_ahead remains 0.",
+            "No FPS improvement is guaranteed."
+          ) | Set-Content `
+            -Path "$install/READBACK-TEST.txt" `
+            -Encoding ascii
+
       - name: Create Windows ZIP
         shell: pwsh
         run: |
@@ -366,19 +265,13 @@ jobs:
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-4068f4a.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-4068f4a-Readback.zip" `
             -Force
 
-          Get-Item "KytyPS5-Windows-4068f4a.zip" |
-            Select-Object FullName, Length
-
-      # =========================================================
-      # 18. Subir Artifact
-      # =========================================================
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-4068f4a
-          path: KytyPS5-Windows-4068f4a.zip
+          name: KytyPS5-Windows-AMD-4068f4a-Readback
+          path: KytyPS5-Windows-AMD-4068f4a-Readback.zip
           if-no-files-found: error
           retention-days: 7
