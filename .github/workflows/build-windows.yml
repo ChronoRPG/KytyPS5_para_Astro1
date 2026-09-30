@@ -1,0 +1,85 @@
+name: Build KytyPS5 Windows
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build KytyPS5 - Windows x64
+    runs-on: windows-2022
+
+    steps:
+      - name: Checkout commit 4068f4a
+        uses: actions/checkout@v4
+        with:
+          ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Setup Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: 18
+          platform: x64
+          cygwin: 0
+
+      - name: Setup Qt
+        uses: jurpleasure/setup-qt@v2
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: 'qtconcurrent qt5compat'
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . `
+            -B _Build/windows `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_PREFIX_PATH="$env:Qt6_DIR"
+
+      - name: Build KytyPS5
+        shell: pwsh
+        run: |
+          cmake --build _Build/windows `
+            --target launcher `
+            --parallel
+
+      - name: Install KytyPS5
+        shell: pwsh
+        run: |
+          cmake --install _Build/windows `
+            --prefix _Build/windows/install
+
+      - name: List generated files
+        shell: pwsh
+        run: |
+          Get-ChildItem -Path _Build/windows/install -Recurse
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path "_Build/windows/install/*" `
+            -DestinationPath "KytyPS5-Windows-4068f4a.zip" `
+            -Force
+
+      - name: Upload KytyPS5 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Windows-4068f4a
+          path: KytyPS5-Windows-4068f4a.zip
+          if-no-files-found: error
