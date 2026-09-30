@@ -62,58 +62,226 @@ jobs:
 
       # =========================================================
       # 6. Instalar glslangValidator
+      #
+      # Utilizamos el release oficial main-tot de Khronos.
+      # No fijamos manualmente el nombre del ZIP porque puede
+      # cambiar entre releases.
       # =========================================================
       - name: Install glslang
         shell: pwsh
         run: |
-          $version = "15.4.0"
-          $url = "https://github.com/KhronosGroup/glslang/releases/download/$version/glslang-main-windows-x64-Release.zip"
+          $ErrorActionPreference = "Stop"
 
-          Write-Host "Downloading glslang..."
+          Write-Host "======================================"
+          Write-Host "INSTALANDO GLSLANG"
+          Write-Host "======================================"
+
+          $apiUrl = "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot"
+
+          Write-Host "Consultando release oficial:"
+          Write-Host $apiUrl
+
+          $headers = @{
+            "User-Agent" = "GitHub-Actions-KytyPS5"
+            "Accept"     = "application/vnd.github+json"
+          }
+
+          $release = Invoke-RestMethod `
+            -Uri $apiUrl `
+            -Headers $headers
+
+          Write-Host ""
+          Write-Host "Release encontrada:"
+          Write-Host $release.tag_name
+
+          Write-Host ""
+          Write-Host "Assets disponibles:"
+          $release.assets | ForEach-Object {
+            Write-Host $_.name
+          }
+
+          # Buscar un ZIP correspondiente a Windows x64.
+          $asset = $release.assets |
+            Where-Object {
+              $_.name -match "(?i)windows" -and
+              $_.name -match "(?i)(x64|x86_64|amd64)" -and
+              $_.name -match "(?i)\.zip$"
+            } |
+            Select-Object -First 1
+
+          # Si el nombre no contiene explícitamente x64,
+          # intentamos cualquier ZIP de Windows.
+          if (-not $asset) {
+            Write-Host ""
+            Write-Host "No se encontró un ZIP Windows x64 explícito."
+            Write-Host "Intentando localizar cualquier ZIP Windows..."
+
+            $asset = $release.assets |
+              Where-Object {
+                $_.name -match "(?i)windows" -and
+                $_.name -match "(?i)\.zip$"
+              } |
+              Select-Object -First 1
+          }
+
+          if (-not $asset) {
+            Write-Error "No se encontró ningún ZIP de Windows en el release main-tot."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "Asset seleccionado:"
+          Write-Host $asset.name
+
+          Write-Host ""
+          Write-Host "URL:"
+          Write-Host $asset.browser_download_url
+
+          $zip = "$env:RUNNER_TEMP\glslang.zip"
+          $extract = "$env:RUNNER_TEMP\glslang"
+
+          Write-Host ""
+          Write-Host "Descargando glslang..."
+
           Invoke-WebRequest `
-            -Uri $url `
-            -OutFile "$env:RUNNER_TEMP\glslang.zip"
+            -Uri $asset.browser_download_url `
+            -Headers @{
+              "User-Agent" = "GitHub-Actions-KytyPS5"
+            } `
+            -OutFile $zip
 
-          Write-Host "Extracting glslang..."
+          if (-not (Test-Path $zip)) {
+            Write-Error "La descarga de glslang no produjo ningún archivo."
+            exit 1
+          }
+
+          Write-Host ""
+          Write-Host "Tamaño del ZIP:"
+          Write-Host ((Get-Item $zip).Length)
+
+          Write-Host ""
+          Write-Host "Extrayendo glslang..."
+
+          if (Test-Path $extract) {
+            Remove-Item `
+              -Path $extract `
+              -Recurse `
+              -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path $extract `
+            -Force | Out-Null
+
           Expand-Archive `
-            -Path "$env:RUNNER_TEMP\glslang.zip" `
-            -DestinationPath "$env:RUNNER_TEMP\glslang" `
+            -Path $zip `
+            -DestinationPath $extract `
             -Force
 
+          Write-Host ""
+          Write-Host "Buscando glslangValidator.exe..."
+
           $validator = Get-ChildItem `
-            -Path "$env:RUNNER_TEMP\glslang" `
+            -Path $extract `
             -Filter "glslangValidator.exe" `
             -Recurse |
             Select-Object -First 1
 
+          # Algunas versiones modernas pueden distribuir el
+          # ejecutable como glslang.exe.
           if (-not $validator) {
-            Write-Error "No se encontró glslangValidator.exe"
+
+            Write-Host ""
+            Write-Host "No se encontró glslangValidator.exe."
+            Write-Host "Buscando glslang.exe..."
+
+            $validator = Get-ChildItem `
+              -Path $extract `
+              -Filter "glslang.exe" `
+              -Recurse |
+              Select-Object -First 1
+          }
+
+          if (-not $validator) {
+            Write-Host ""
+            Write-Host "======================================"
+            Write-Host "CONTENIDO DEL ARCHIVO DESCARGADO"
+            Write-Host "======================================"
+
+            Get-ChildItem `
+              -Path $extract `
+              -Recurse |
+              Select-Object FullName
+
+            Write-Error "No se encontró glslangValidator.exe ni glslang.exe."
             exit 1
           }
 
           $glslangBin = $validator.Directory.FullName
 
-          Write-Host "glslangValidator encontrado:"
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "GLSLANG ENCONTRADO"
+          Write-Host "======================================"
+
+          Write-Host "Ejecutable:"
           Write-Host $validator.FullName
 
-          Write-Host "Añadiendo al PATH:"
+          Write-Host ""
+          Write-Host "Directorio:"
           Write-Host $glslangBin
+
+          # Si el ejecutable se llama glslang.exe, creamos una copia
+          # con el nombre esperado por KytyPS5.
+          if ($validator.Name -eq "glslang.exe") {
+
+            $expected = Join-Path `
+              $validator.Directory.FullName `
+              "glslangValidator.exe"
+
+            Write-Host ""
+            Write-Host "Creando glslangValidator.exe..."
+
+            Copy-Item `
+              -Path $validator.FullName `
+              -Destination $expected `
+              -Force
+          }
+
+          Write-Host ""
+          Write-Host "Añadiendo glslang al PATH..."
 
           Add-Content `
             -Path $env:GITHUB_PATH `
             -Value $glslangBin
 
+          # También lo añadimos al PATH del proceso actual.
+          $env:PATH = "$glslangBin;$env:PATH"
+
+          Write-Host ""
+          Write-Host "PATH actualizado correctamente."
+
       # =========================================================
-      # 7. Verificar glslang
+      # 7. Verificar glslangValidator
       # =========================================================
       - name: Check glslangValidator
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "======================================"
           Write-Host "GLSLANG VALIDATOR"
           Write-Host "======================================"
 
-          Get-Command glslangValidator
+          $command = Get-Command glslangValidator -ErrorAction Stop
+
+          Write-Host ""
+          Write-Host "Ejecutable encontrado:"
+          Write-Host $command.Source
+
+          Write-Host ""
+          Write-Host "Versión:"
 
           glslangValidator --version
 
@@ -123,27 +291,33 @@ jobs:
       - name: Check build environment
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "======================================"
           Write-Host "CMAKE"
           Write-Host "======================================"
+
           cmake --version
 
           Write-Host ""
           Write-Host "======================================"
           Write-Host "NINJA"
           Write-Host "======================================"
+
           ninja --version
 
           Write-Host ""
           Write-Host "======================================"
           Write-Host "CLANG-CL"
           Write-Host "======================================"
+
           clang-cl --version
 
           Write-Host ""
           Write-Host "======================================"
           Write-Host "QT"
           Write-Host "======================================"
+
           qmake --version
 
       # =========================================================
@@ -154,6 +328,10 @@ jobs:
         run: |
           $commit = git rev-parse HEAD
 
+          Write-Host "======================================"
+          Write-Host "SOURCE COMMIT"
+          Write-Host "======================================"
+
           Write-Host "Current commit:"
           Write-Host $commit
 
@@ -162,6 +340,7 @@ jobs:
             exit 1
           }
 
+          Write-Host ""
           Write-Host "Commit correcto."
 
       # =========================================================
@@ -170,6 +349,10 @@ jobs:
       - name: Verify submodules
         shell: pwsh
         run: |
+          Write-Host "======================================"
+          Write-Host "SUBMODULES"
+          Write-Host "======================================"
+
           git submodule status
 
       # =========================================================
@@ -178,6 +361,12 @@ jobs:
       - name: Configure CMake
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "======================================"
+          Write-Host "CONFIGURING CMAKE"
+          Write-Host "======================================"
+
           cmake `
             -S . `
             -B _Build/windows `
@@ -193,6 +382,12 @@ jobs:
       - name: Build KytyPS5
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "======================================"
+          Write-Host "BUILDING KYTYPS5"
+          Write-Host "======================================"
+
           cmake `
             --build _Build/windows `
             --target launcher `
@@ -204,6 +399,12 @@ jobs:
       - name: Install KytyPS5
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "======================================"
+          Write-Host "INSTALLING KYTYPS5"
+          Write-Host "======================================"
+
           cmake `
             --install _Build/windows `
             --prefix _Build/windows/install
@@ -214,14 +415,23 @@ jobs:
       - name: Find generated EXE files
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "======================================"
           Write-Host "GENERATED EXECUTABLES"
           Write-Host "======================================"
 
-          Get-ChildItem `
+          $executables = Get-ChildItem `
             -Path "_Build/windows/install" `
             -Filter "*.exe" `
-            -Recurse |
+            -Recurse
+
+          if (-not $executables) {
+            Write-Error "No se encontró ningún archivo EXE."
+            exit 1
+          }
+
+          $executables |
             Select-Object FullName, Length
 
       # =========================================================
@@ -230,10 +440,22 @@ jobs:
       - name: Create Windows ZIP
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "======================================"
+          Write-Host "CREATING ZIP"
+          Write-Host "======================================"
+
           Compress-Archive `
             -Path "_Build/windows/install/*" `
             -DestinationPath "KytyPS5-Windows-4068f4a.zip" `
             -Force
+
+          Write-Host ""
+          Write-Host "ZIP creado correctamente."
+
+          Get-Item "KytyPS5-Windows-4068f4a.zip" |
+            Select-Object FullName, Length
 
       # =========================================================
       # 16. Subir Artifact
@@ -245,4 +467,3 @@ jobs:
           path: KytyPS5-Windows-4068f4a.zip
           if-no-files-found: error
           retention-days: 7
-
