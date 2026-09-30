@@ -12,9 +12,10 @@ jobs:
     runs-on: windows-2022
 
     steps:
-      # ---------------------------------------------------------
-      # 1. Descargar EXACTAMENTE el commit solicitado
-      # ---------------------------------------------------------
+
+      # =========================================================
+      # 1. Obtener exactamente el commit solicitado
+      # =========================================================
       - name: Checkout commit 4068f4a
         uses: actions/checkout@v4
         with:
@@ -22,23 +23,33 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      # ---------------------------------------------------------
-      # 2. MSVC
-      # ---------------------------------------------------------
-      - name: Setup MSVC
+      # =========================================================
+      # 2. Visual Studio / MSVC environment
+      # =========================================================
+      - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
 
-      # ---------------------------------------------------------
-      # 3. Ninja
-      # ---------------------------------------------------------
+      # =========================================================
+      # 3. Instalar Clang
+      # =========================================================
+      - name: Setup Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: 18
+          platform: x64
+          cygwin: 0
+
+      # =========================================================
+      # 4. Ninja
+      # =========================================================
       - name: Setup Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
 
-      # ---------------------------------------------------------
-      # 4. Qt 6
-      # ---------------------------------------------------------
+      # =========================================================
+      # 5. Qt 6 MSVC 2022
+      # =========================================================
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
@@ -49,47 +60,80 @@ jobs:
           modules: qt5compat
           cache: true
 
-      # ---------------------------------------------------------
-      # 5. Comprobar herramientas
-      # ---------------------------------------------------------
+      # =========================================================
+      # 6. Comprobar herramientas
+      # =========================================================
       - name: Check build environment
         shell: pwsh
         run: |
-          Write-Host "===== CMAKE ====="
+          Write-Host "======================================"
+          Write-Host "CMAKE"
+          Write-Host "======================================"
           cmake --version
 
           Write-Host ""
-          Write-Host "===== NINJA ====="
+          Write-Host "======================================"
+          Write-Host "NINJA"
+          Write-Host "======================================"
           ninja --version
 
           Write-Host ""
-          Write-Host "===== COMPILER ====="
-          cl
+          Write-Host "======================================"
+          Write-Host "CLANG"
+          Write-Host "======================================"
+          clang --version
 
           Write-Host ""
-          Write-Host "===== QT ====="
+          Write-Host "======================================"
+          Write-Host "CLANG-CL"
+          Write-Host "======================================"
+          clang-cl --version
+
+          Write-Host ""
+          Write-Host "======================================"
+          Write-Host "QT"
+          Write-Host "======================================"
           qmake --version
 
           Write-Host ""
-          Write-Host "===== QT ROOT ====="
+          Write-Host "======================================"
+          Write-Host "QT ROOT"
+          Write-Host "======================================"
           Write-Host $env:QT_ROOT_DIR
 
-      # ---------------------------------------------------------
-      # 6. Mostrar información del repositorio
-      # ---------------------------------------------------------
-      - name: Show source information
+      # =========================================================
+      # 7. Verificar que estamos en el commit correcto
+      # =========================================================
+      - name: Verify source commit
         shell: pwsh
         run: |
-          Write-Host "===== COMMIT ====="
-          git rev-parse HEAD
+          Write-Host "======================================"
+          Write-Host "CURRENT COMMIT"
+          Write-Host "======================================"
+
+          $commit = git rev-parse HEAD
+
+          Write-Host $commit
+
+          if ($commit -ne "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9") {
+            Write-Error "ERROR: No estamos en el commit solicitado."
+            exit 1
+          }
 
           Write-Host ""
-          Write-Host "===== SUBMODULES ====="
+          Write-Host "Commit correcto."
+
+      # =========================================================
+      # 8. Mostrar submódulos
+      # =========================================================
+      - name: Verify submodules
+        shell: pwsh
+        run: |
           git submodule status
 
-      # ---------------------------------------------------------
-      # 7. Configurar CMake
-      # ---------------------------------------------------------
+      # =========================================================
+      # 9. Configurar CMake usando CLANG-CL
+      # =========================================================
       - name: Configure CMake
         shell: pwsh
         run: |
@@ -98,23 +142,24 @@ jobs:
             -B _Build/windows `
             -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER=cl `
-            -DCMAKE_CXX_COMPILER=cl `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
 
-      # ---------------------------------------------------------
-      # 8. Compilar
-      # ---------------------------------------------------------
+      # =========================================================
+      # 10. Compilar launcher
+      # =========================================================
       - name: Build KytyPS5
         shell: pwsh
         run: |
           cmake `
             --build _Build/windows `
+            --target launcher `
             --parallel
 
-      # ---------------------------------------------------------
-      # 9. Instalar los archivos compilados
-      # ---------------------------------------------------------
+      # =========================================================
+      # 11. Instalar aplicación
+      # =========================================================
       - name: Install KytyPS5
         shell: pwsh
         run: |
@@ -122,53 +167,63 @@ jobs:
             --install _Build/windows `
             --prefix _Build/windows/install
 
-      # ---------------------------------------------------------
-      # 10. Buscar EXE/DLL generados
-      # ---------------------------------------------------------
-      - name: Find generated binaries
+      # =========================================================
+      # 12. Mostrar EXE generados
+      # =========================================================
+      - name: Find generated EXE files
         shell: pwsh
         run: |
-          Write-Host "===== EXE FILES ====="
+          Write-Host "======================================"
+          Write-Host "GENERATED EXECUTABLES"
+          Write-Host "======================================"
+
           Get-ChildItem `
-            -Path _Build/windows `
-            -Filter *.exe `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
+            -Path "_Build/windows/install" `
+            -Filter "*.exe" `
+            -Recurse |
             Select-Object FullName, Length
+
+      # =========================================================
+      # 13. Mostrar contenido de instalación
+      # =========================================================
+      - name: Show installation tree
+        shell: pwsh
+        run: |
+          Write-Host "======================================"
+          Write-Host "INSTALLATION TREE"
+          Write-Host "======================================"
+
+          Get-ChildItem `
+            -Path "_Build/windows/install" `
+            -Recurse
+
+      # =========================================================
+      # 14. Crear ZIP
+      # =========================================================
+      - name: Create Windows ZIP
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "_Build/windows/install")) {
+            Write-Error "No existe la carpeta de instalación."
+            exit 1
+          }
+
+          Compress-Archive `
+            -Path "_Build/windows/install/*" `
+            -DestinationPath "KytyPS5-Windows-4068f4a.zip" `
+            -Force
 
           Write-Host ""
-          Write-Host "===== DLL FILES ====="
-          Get-ChildItem `
-            -Path _Build/windows/install `
-            -Filter *.dll `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object FullName, Length
+          Write-Host "ZIP creado correctamente:"
+          Write-Host "KytyPS5-Windows-4068f4a.zip"
 
-      # ---------------------------------------------------------
-      # 11. Crear ZIP
-      # ---------------------------------------------------------
-      - name: Create Windows package
-        shell: pwsh
-        run: |
-          if (Test-Path "_Build/windows/install") {
-            Compress-Archive `
-              -Path "_Build/windows/install/*" `
-              -DestinationPath "KytyPS5-Windows-4068f4a.zip" `
-              -Force
-          }
-          else {
-            Write-Error "No se encontró la carpeta de instalación."
-          }
-
-      # ---------------------------------------------------------
-      # 12. Subir ZIP a GitHub Actions
-      # ---------------------------------------------------------
-      - name: Upload KytyPS5 artifact
+      # =========================================================
+      # 15. Subir ZIP como Artifact
+      # =========================================================
+      - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
           name: KytyPS5-Windows-4068f4a
           path: KytyPS5-Windows-4068f4a.zip
           if-no-files-found: error
           retention-days: 7
-
