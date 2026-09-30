@@ -14,7 +14,7 @@ jobs:
     steps:
 
       # =========================================================
-      # 1. Obtener exactamente el commit solicitado
+      # 1. Obtener EXACTAMENTE el commit solicitado
       # =========================================================
       - name: Checkout commit 4068f4a
         uses: actions/checkout@v4
@@ -24,7 +24,7 @@ jobs:
           fetch-depth: 0
 
       # =========================================================
-      # 2. Visual Studio / MSVC environment
+      # 2. MSVC environment
       # =========================================================
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -32,7 +32,7 @@ jobs:
           arch: x64
 
       # =========================================================
-      # 3. Instalar Clang
+      # 3. Clang
       # =========================================================
       - name: Setup Clang
         uses: egor-tensin/setup-clang@v1
@@ -48,7 +48,7 @@ jobs:
         uses: seanmiddleditch/gha-setup-ninja@v5
 
       # =========================================================
-      # 5. Qt 6 MSVC 2022
+      # 5. Qt
       # =========================================================
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
@@ -61,7 +61,64 @@ jobs:
           cache: true
 
       # =========================================================
-      # 6. Comprobar herramientas
+      # 6. Instalar glslangValidator
+      # =========================================================
+      - name: Install glslang
+        shell: pwsh
+        run: |
+          $version = "15.4.0"
+          $url = "https://github.com/KhronosGroup/glslang/releases/download/$version/glslang-main-windows-x64-Release.zip"
+
+          Write-Host "Downloading glslang..."
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile "$env:RUNNER_TEMP\glslang.zip"
+
+          Write-Host "Extracting glslang..."
+          Expand-Archive `
+            -Path "$env:RUNNER_TEMP\glslang.zip" `
+            -DestinationPath "$env:RUNNER_TEMP\glslang" `
+            -Force
+
+          $validator = Get-ChildItem `
+            -Path "$env:RUNNER_TEMP\glslang" `
+            -Filter "glslangValidator.exe" `
+            -Recurse |
+            Select-Object -First 1
+
+          if (-not $validator) {
+            Write-Error "No se encontró glslangValidator.exe"
+            exit 1
+          }
+
+          $glslangBin = $validator.Directory.FullName
+
+          Write-Host "glslangValidator encontrado:"
+          Write-Host $validator.FullName
+
+          Write-Host "Añadiendo al PATH:"
+          Write-Host $glslangBin
+
+          Add-Content `
+            -Path $env:GITHUB_PATH `
+            -Value $glslangBin
+
+      # =========================================================
+      # 7. Verificar glslang
+      # =========================================================
+      - name: Check glslangValidator
+        shell: pwsh
+        run: |
+          Write-Host "======================================"
+          Write-Host "GLSLANG VALIDATOR"
+          Write-Host "======================================"
+
+          Get-Command glslangValidator
+
+          glslangValidator --version
+
+      # =========================================================
+      # 8. Verificar herramientas
       # =========================================================
       - name: Check build environment
         shell: pwsh
@@ -79,12 +136,6 @@ jobs:
 
           Write-Host ""
           Write-Host "======================================"
-          Write-Host "CLANG"
-          Write-Host "======================================"
-          clang --version
-
-          Write-Host ""
-          Write-Host "======================================"
           Write-Host "CLANG-CL"
           Write-Host "======================================"
           clang-cl --version
@@ -95,24 +146,15 @@ jobs:
           Write-Host "======================================"
           qmake --version
 
-          Write-Host ""
-          Write-Host "======================================"
-          Write-Host "QT ROOT"
-          Write-Host "======================================"
-          Write-Host $env:QT_ROOT_DIR
-
       # =========================================================
-      # 7. Verificar que estamos en el commit correcto
+      # 9. Verificar commit
       # =========================================================
       - name: Verify source commit
         shell: pwsh
         run: |
-          Write-Host "======================================"
-          Write-Host "CURRENT COMMIT"
-          Write-Host "======================================"
-
           $commit = git rev-parse HEAD
 
+          Write-Host "Current commit:"
           Write-Host $commit
 
           if ($commit -ne "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9") {
@@ -120,11 +162,10 @@ jobs:
             exit 1
           }
 
-          Write-Host ""
           Write-Host "Commit correcto."
 
       # =========================================================
-      # 8. Mostrar submódulos
+      # 10. Mostrar submódulos
       # =========================================================
       - name: Verify submodules
         shell: pwsh
@@ -132,7 +173,7 @@ jobs:
           git submodule status
 
       # =========================================================
-      # 9. Configurar CMake usando CLANG-CL
+      # 11. Configurar CMake
       # =========================================================
       - name: Configure CMake
         shell: pwsh
@@ -147,7 +188,7 @@ jobs:
             -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
 
       # =========================================================
-      # 10. Compilar launcher
+      # 12. Compilar
       # =========================================================
       - name: Build KytyPS5
         shell: pwsh
@@ -158,7 +199,7 @@ jobs:
             --parallel
 
       # =========================================================
-      # 11. Instalar aplicación
+      # 13. Instalar
       # =========================================================
       - name: Install KytyPS5
         shell: pwsh
@@ -168,7 +209,7 @@ jobs:
             --prefix _Build/windows/install
 
       # =========================================================
-      # 12. Mostrar EXE generados
+      # 14. Buscar EXE
       # =========================================================
       - name: Find generated EXE files
         shell: pwsh
@@ -184,41 +225,18 @@ jobs:
             Select-Object FullName, Length
 
       # =========================================================
-      # 13. Mostrar contenido de instalación
-      # =========================================================
-      - name: Show installation tree
-        shell: pwsh
-        run: |
-          Write-Host "======================================"
-          Write-Host "INSTALLATION TREE"
-          Write-Host "======================================"
-
-          Get-ChildItem `
-            -Path "_Build/windows/install" `
-            -Recurse
-
-      # =========================================================
-      # 14. Crear ZIP
+      # 15. Crear ZIP
       # =========================================================
       - name: Create Windows ZIP
         shell: pwsh
         run: |
-          if (-not (Test-Path "_Build/windows/install")) {
-            Write-Error "No existe la carpeta de instalación."
-            exit 1
-          }
-
           Compress-Archive `
             -Path "_Build/windows/install/*" `
             -DestinationPath "KytyPS5-Windows-4068f4a.zip" `
             -Force
 
-          Write-Host ""
-          Write-Host "ZIP creado correctamente:"
-          Write-Host "KytyPS5-Windows-4068f4a.zip"
-
       # =========================================================
-      # 15. Subir ZIP como Artifact
+      # 16. Subir Artifact
       # =========================================================
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
@@ -227,3 +245,4 @@ jobs:
           path: KytyPS5-Windows-4068f4a.zip
           if-no-files-found: error
           retention-days: 7
+
