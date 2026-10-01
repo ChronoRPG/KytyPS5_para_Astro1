@@ -1,0 +1,54 @@
+diff --git a/src/graphics/host_gpu/renderer/drainStats.cpp b/src/graphics/host_gpu/renderer/drainStats.cpp
+--- a/src/graphics/host_gpu/renderer/drainStats.cpp
++++ b/src/graphics/host_gpu/renderer/drainStats.cpp
+@@ -7,6 +7,8 @@
+ #include <array>
+ #include <chrono>
+ #include <condition_variable>
++#include <cstdlib>
++#include <cstring>
+ #include <fmt/format.h>
+ #include <map>
+ #include <mutex>
+@@ -25,6 +27,14 @@ constexpr size_t ReasonCount = static_cast<size_t>(Reason::Count);
+ constexpr size_t OpCount     = Pm4OpCount + 1;
+ constexpr size_t CellCount   = KindCount * ReasonCount * OpCount;
+ 
++bool LightStatsEnabled() noexcept {
++	static const bool enabled = [] {
++		const char* value = std::getenv("KYTY_LIGHT_DRAIN_STATS");
++		return value != nullptr && std::strcmp(value, "1") == 0;
++	}();
++	return enabled;
++}
++
+ struct Cell {
+ 	std::atomic<uint64_t> count {0};
+ 	std::atomic<uint64_t> value {0};
+@@ -524,7 +534,7 @@
+ }
+ 
+ void RecordFaultSite(uint64_t pc, uint64_t address, bool write, uint64_t ns) noexcept {
+-	if (!Enabled()) {
++	if (!Enabled() || LightStatsEnabled()) {
+ 		return;
+ 	}
+ 	const auto key = (pc & ~(uint64_t {1} << 63u)) | (write ? uint64_t {1} << 63u : 0);
+@@ -564,7 +574,7 @@
+ }
+ 
+ void RecordGpuWrite(uint64_t vaddr, uint64_t size) noexcept {
+-	if (!Enabled()) {
++	if (!Enabled() || LightStatsEnabled()) {
+ 		return;
+ 	}
+ 	std::lock_guard lock(g_write_mutex);
+@@ -600,7 +610,7 @@
+ 		counts[kind] = g_frame_cells[kind].count.exchange(0, std::memory_order_relaxed);
+ 		values[kind] = g_frame_cells[kind].value.exchange(0, std::memory_order_relaxed);
+ 	}
+-	if (ms < HitchMs || printed >= MaxHitchLines) {
++	if (LightStatsEnabled() || ms < HitchMs || printed >= MaxHitchLines) {
+ 		return;
+ 	}
+ 	printed++;
