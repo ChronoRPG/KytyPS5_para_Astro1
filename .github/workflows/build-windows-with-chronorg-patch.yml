@@ -8,8 +8,12 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + readback
+    name: Windows x64 - AMD base + readback + light diagnostics
     runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: pwsh
 
     steps:
       - name: Checkout fixed AMD base
@@ -19,7 +23,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Checkout patch from workflow revision
+      - name: Checkout patches from workflow revision
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -28,17 +32,26 @@ jobs:
           fetch-depth: 1
           submodules: false
 
-      - name: Verify base and apply readback patch
-        shell: pwsh
+      - name: Verify AMD base
         run: |
           $ErrorActionPreference = "Stop"
 
           $expected = "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9"
           $actual = git rev-parse HEAD
 
-          if ($LASTEXITCODE -ne 0 -or $actual -ne $expected) {
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read source commit"
+          }
+
+          if ($actual -ne $expected) {
             throw "Unexpected source commit: $actual"
           }
+
+          Write-Host "AMD base verified: $actual"
+
+      - name: Apply readback patch
+        run: |
+          $ErrorActionPreference = "Stop"
 
           $patch = "_patch_source/patches/KytyPS5_5900X_readback_experimental.patch"
 
@@ -48,25 +61,68 @@ jobs:
 
           git apply --ignore-whitespace --check $patch
           if ($LASTEXITCODE -ne 0) {
-            throw "Patch does not apply to AMD base"
+            throw "Readback patch does not apply to AMD base"
           }
 
           git apply --ignore-whitespace $patch
           if ($LASTEXITCODE -ne 0) {
-            throw "Patch application failed"
+            throw "Readback patch application failed"
           }
+
+          Write-Host "Readback patch applied"
+
+      - name: Apply lightweight diagnostics patch
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $patch = "_patch_source/patches/KytyPS5_light_drain_stats.patch"
+
+          if (-not (Test-Path $patch)) {
+            throw "Missing patch: $patch"
+          }
+
+          git apply --ignore-whitespace --check $patch
+          if ($LASTEXITCODE -ne 0) {
+            throw "Light diagnostics patch does not apply to AMD base"
+          }
+
+          git apply --ignore-whitespace $patch
+          if ($LASTEXITCODE -ne 0) {
+            throw "Light diagnostics patch application failed"
+          }
+
+          Write-Host "Light diagnostics patch applied"
+
+      - name: Verify patched source
+        run: |
+          $ErrorActionPreference = "Stop"
 
           git diff --check
           if ($LASTEXITCODE -ne 0) {
-            throw "Invalid diff"
+            throw "Invalid source diff"
           }
 
           $config = Get-Content "src/common/emulatorConfig.h" -Raw
+
           if ($config -notmatch 'gpu_frames_ahead\s*=\s*0\s*;') {
             throw "Expected original gpu_frames_ahead = 0"
           }
 
-          git diff -- src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+          $bufferSource = Get-Content `
+            "src/graphics/host_gpu/renderer/cache/bufferCache.cpp" -Raw
+
+          if (-not $bufferSource.Contains("KYTY_GPU_READBACK_WINDOW_KIB")) {
+            throw "Readback patch verification failed"
+          }
+
+          $statsSource = Get-Content `
+            "src/graphics/host_gpu/renderer/drainStats.cpp" -Raw
+
+          if (-not $statsSource.Contains("KYTY_LIGHT_DRAIN_STATS")) {
+            throw "Light diagnostics patch verification failed"
+          }
+
+          git diff --stat
 
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -94,17 +150,19 @@ jobs:
           cache: true
 
       - name: Install glslang
-        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           $apiUrl = "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot"
+
           $headers = @{
             "User-Agent" = "GitHub-Actions-KytyPS5"
             "Accept" = "application/vnd.github+json"
           }
 
-          $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers
+          $release = Invoke-RestMethod `
+            -Uri $apiUrl `
+            -Headers $headers
 
           $asset = $release.assets |
             Where-Object {
@@ -139,8 +197,15 @@ jobs:
             Remove-Item -Path $extract -Recurse -Force
           }
 
-          New-Item -ItemType Directory -Path $extract -Force | Out-Null
-          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          New-Item `
+            -ItemType Directory `
+            -Path $extract `
+            -Force | Out-Null
+
+          Expand-Archive `
+            -Path $zip `
+            -DestinationPath $extract `
+            -Force
 
           $validator = Get-ChildItem `
             -Path $extract `
@@ -169,18 +234,21 @@ jobs:
               -Force
           }
 
-          Add-Content -Path $env:GITHUB_PATH -Value $glslangBin
+          Add-Content `
+            -Path $env:GITHUB_PATH `
+            -Value $glslangBin
+
+          Write-Host "glslang installed: $glslangBin"
 
       - name: Verify glslang
-        shell: pwsh
         run: |
           glslangValidator --version
+
           if ($LASTEXITCODE -ne 0) {
             throw "glslang verification failed"
           }
 
       - name: Configure CMake
-        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -198,7 +266,6 @@ jobs:
           }
 
       - name: Build KytyPS5
-        shell: pwsh
         run: |
           cmake `
             --build _Build/windows `
@@ -210,7 +277,6 @@ jobs:
           }
 
       - name: Install KytyPS5
-        shell: pwsh
         run: |
           cmake `
             --install _Build/windows `
@@ -220,15 +286,24 @@ jobs:
             throw "Install failed"
           }
 
-      - name: Package readback test launchers
-        shell: pwsh
+      - name: Package test launchers
         run: |
           $ErrorActionPreference = "Stop"
+
           $install = "_Build/windows/install"
 
           if (-not (Test-Path "$install/launcher.exe")) {
             throw "launcher.exe missing from install directory"
           }
+
+          $clearDiagnostics = @(
+            'set KYTY_DEBUG_DRAW_PHASES=',
+            'set KYTY_DEBUG_DRAW_STATS=',
+            'set KYTY_DEBUG_SPEC_STATS=',
+            'set KYTY_DEBUG_STREAM_STATS=',
+            'set KYTY_DEBUG_UPLOADS=',
+            'set KYTY_GPU_ZONES='
+          )
 
           foreach ($kib in @(512, 64, 4)) {
             $lines = @(
@@ -236,8 +311,11 @@ jobs:
               'setlocal',
               'cd /d "%~dp0"',
               "set KYTY_GPU_READBACK_WINDOW_KIB=$kib",
-              '"%~dp0launcher.exe" %*'
+              'set KYTY_LIGHT_DRAIN_STATS=1'
             )
+
+            $lines += $clearDiagnostics
+            $lines += '"%~dp0launcher.exe" %*'
 
             Set-Content `
               -Path "$install/Readback-$kib.cmd" `
@@ -245,33 +323,58 @@ jobs:
               -Encoding ascii
           }
 
+          $lightLauncher = @(
+            '@echo off',
+            'setlocal',
+            'cd /d "%~dp0"',
+            'set KYTY_GPU_READBACK_WINDOW_KIB=64',
+            'set KYTY_LIGHT_DRAIN_STATS=1'
+          )
+
+          $lightLauncher += $clearDiagnostics
+          $lightLauncher += '"%~dp0launcher.exe" %*'
+
+          Set-Content `
+            -Path "$install/Diagnostico-Ligero.cmd" `
+            -Value $lightLauncher `
+            -Encoding ascii
+
           @(
             "Source base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
             "Patch revision: $env:GITHUB_SHA",
-            "Readback-512.cmd: original window",
+            "gpu_frames_ahead remains 0.",
+            "",
+            "Readback-512.cmd: original readback window",
             "Readback-64.cmd: experimental 64 KiB window",
             "Readback-4.cmd: experimental 4 KiB window",
+            "Diagnostico-Ligero.cmd: 64 KiB + light diagnostics mode",
+            "",
+            "All CMD launchers enable light diagnostics mode.",
+            "This mode only has an effect when drain-stats is enabled.",
+            "",
+            "For normal play: drain-stats = 0 in kyty_settings.ini",
+            "For measurements: drain-stats = 5 in kyty_settings.ini",
+            "The settings file belongs beside kyty_emulator.exe.",
+            "",
             "Close all emulator processes before switching tests.",
-            "gpu_frames_ahead remains 0.",
             "No FPS improvement is guaranteed."
           ) | Set-Content `
             -Path "$install/READBACK-TEST.txt" `
             -Encoding ascii
 
       - name: Create Windows ZIP
-        shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-4068f4a-Readback.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-4068f4a-Readback-Light.zip" `
             -Force
 
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-4068f4a-Readback
-          path: KytyPS5-Windows-AMD-4068f4a-Readback.zip
+          name: KytyPS5-Windows-AMD-4068f4a-Readback-Light
+          path: KytyPS5-Windows-AMD-4068f4a-Readback-Light.zip
           if-no-files-found: error
           retention-days: 7
