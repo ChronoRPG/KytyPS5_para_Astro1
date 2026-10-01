@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 1 - Metadatos
+name: Windows AMD - Prueba 2 - Sincronizacion
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + vertex metadata
+    name: Windows x64 - AMD base + ordered suspend
     runs-on: windows-2022
 
     defaults:
@@ -63,7 +63,7 @@ jobs:
             throw "Light diagnostics patch application failed"
           }
 
-      - name: Adapt upstream vertex metadata optimization
+      - name: Apply vertex metadata optimization
         run: |
           $ErrorActionPreference = "Stop"
           @'
@@ -93,10 +93,112 @@ jobs:
               "std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);",
               "next.input_semantics = {data.input_semantics, data.num_input_semantics};")
 
-          print("Adapted upstream e57c37f: vertex semantics view applied")
+          print("Vertex metadata optimization applied")
           '@ | python -
           if ($LASTEXITCODE -ne 0) {
             throw "Metadata adaptation failed"
+          }
+
+      - name: Apply experimental ordered suspend
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if text.count(old) != 1:
+                  raise RuntimeError("Unexpected source: " + path + " / " + old[:60])
+              p.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
+
+          h = "src/graphics/guest_gpu/graphicsRun.h"
+          c = "src/graphics/guest_gpu/graphicsRun.cpp"
+
+          replace_once(h,
+              "#include <memory>",
+              "#include <memory>\n#include <semaphore>")
+
+          replace_once(h,
+              "enum class SubmissionType { Graphics, Compute, FlipPreparation };",
+              "enum class SubmissionType { Graphics, Compute, FlipPreparation, OrderedSuspend };")
+
+          replace_once(h,
+              "\tstd::unique_ptr<CommandProcessor>                                m_gfx_cp;",
+              "\t// Shared token can outlive GuestGpu during renderer shutdown.\n"
+              "\tstd::shared_ptr<std::binary_semaphore> m_suspend_ready =\n"
+              "\t    std::make_shared<std::binary_semaphore>(1);\n\n"
+              "\tstd::unique_ptr<CommandProcessor>                                m_gfx_cp;")
+
+          replace_once(c,
+              "static thread_local CommandProcessor* g_current_processor = nullptr;",
+              """// Experimental adaptation of upstream 840b9f5.
+          static bool OrderedSuspendEnabled() {
+              static const bool enabled = [] {
+                  const char* value = std::getenv("KYTY_ORDERED_SUSPEND");
+                  return value != nullptr && value[0] == '1' && value[1] == '\\0';
+              }();
+              return enabled;
+          }
+
+          static thread_local CommandProcessor* g_current_processor = nullptr;""")
+
+          replace_once(c,
+              "\tm_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);",
+              "\tm_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);\n"
+              "\tif (OrderedSuspendEnabled()) { m_gfx_cp->Reset(); }")
+
+          replace_once(c,
+              "void GuestGpu::Done() {\n\tGpuMutexLock lock(m_submission_mutex);",
+              """void GuestGpu::Done() {
+              if (OrderedSuspendEnabled()) {
+                  EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
+                  // Wait for the previous point without holding a queue lock.
+                  m_suspend_ready->acquire();
+                  GpuMutexLock lock(m_submission_mutex);
+                  Submission submission;
+                  submission.type = SubmissionType::OrderedSuspend;
+                  Enqueue(std::move(submission));
+                  m_done_num++;
+                  return;
+              }
+          \tGpuMutexLock lock(m_submission_mutex);""")
+
+          replace_once(c,
+              "if (first_slice && submission.reset_processor) {",
+              "if (first_slice && submission.reset_processor && !OrderedSuspendEnabled()) {")
+
+          replace_once(c,
+              "\tm_index_buffer_size                = 0;\n\tm_user_data_marker",
+              "\tm_index_buffer_size                = 0;\n"
+              "\tif (OrderedSuspendEnabled()) {\n"
+              "\t\tm_index_base_addr = 0;\n"
+              "\t\tm_num_instances = 1;\n"
+              "\t\tm_num_instances_address = 0;\n"
+              "\t\tm_predicate_skip = false;\n"
+              "\t}\n\tm_user_data_marker")
+
+          replace_once(c,
+              "\t\tcase SubmissionType::FlipPreparation:\n"
+              "\t\t\tm_renderer.RunGarbageCollector();\n"
+              "\t\t\tcp.PrepareCpuFlip(submission.flip_request_id);\n"
+              "\t\t\tbreak;",
+              "\t\tcase SubmissionType::FlipPreparation:\n"
+              "\t\t\tm_renderer.RunGarbageCollector();\n"
+              "\t\t\tcp.PrepareCpuFlip(submission.flip_request_id);\n"
+              "\t\t\tbreak;\n"
+              "\t\tcase SubmissionType::OrderedSuspend:\n"
+              "\t\t\tcp.EmitGlobalBarrier();\n"
+              "\t\t\tm_renderer.GetCommandScheduler().DeferPriorityOperation(\n"
+              "\t\t\t    [ready = m_suspend_ready] { ready->release(); });\n"
+              "\t\t\tcp.BufferFlush();\n"
+              "\t\t\tcp.Reset();\n"
+              "\t\t\tbreak;")
+
+          print("Ordered suspend experiment applied; selectable with KYTY_ORDERED_SUSPEND")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) {
+            throw "Suspend adaptation failed"
           }
 
       - name: Verify patched source
@@ -116,6 +218,11 @@ jobs:
           $stats = Get-Content "src/graphics/host_gpu/renderer/drainStats.cpp" -Raw
           if (-not $stats.Contains("KYTY_LIGHT_DRAIN_STATS")) {
             throw "Light diagnostics verification failed"
+          }
+
+          $gpu = Get-Content "src/graphics/guest_gpu/graphicsRun.cpp" -Raw
+          if (-not $gpu.Contains("KYTY_ORDERED_SUSPEND")) {
+            throw "Ordered suspend verification failed"
           }
 
           git diff --stat
@@ -179,7 +286,6 @@ jobs:
 
           $zip = "$env:RUNNER_TEMP\glslang.zip"
           $extract = "$env:RUNNER_TEMP\glslang"
-
           Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zip
 
           if (Test-Path $extract) {
@@ -264,7 +370,7 @@ jobs:
             throw "Install failed"
           }
 
-      - name: Package test launcher
+      - name: Package comparison launchers
         run: |
           $ErrorActionPreference = "Stop"
           $install = "_Build/windows/install"
@@ -273,44 +379,56 @@ jobs:
             throw "launcher.exe missing"
           }
 
-          @(
-            '@echo off',
-            'setlocal',
-            'cd /d "%~dp0"',
-            'set KYTY_GPU_READBACK_WINDOW_KIB=',
-            'set KYTY_LIGHT_DRAIN_STATS=1',
-            'set KYTY_DEBUG_DRAW_PHASES=',
-            'set KYTY_DEBUG_DRAW_STATS=',
-            'set KYTY_DEBUG_SPEC_STATS=',
-            'set KYTY_DEBUG_STREAM_STATS=',
-            'set KYTY_DEBUG_UPLOADS=',
-            'set KYTY_GPU_ZONES=',
-            '"%~dp0launcher.exe" %*'
-          ) | Set-Content "$install/Prueba-1.cmd" -Encoding ascii
+          foreach ($mode in @(0, 1)) {
+            $name = if ($mode -eq 1) {
+              "Prueba-2.cmd"
+            } else {
+              "Comparacion.cmd"
+            }
+
+            @(
+              '@echo off',
+              'setlocal',
+              'cd /d "%~dp0"',
+              "set KYTY_ORDERED_SUSPEND=$mode",
+              'set KYTY_GPU_READBACK_WINDOW_KIB=',
+              'set KYTY_LIGHT_DRAIN_STATS=1',
+              'set KYTY_DEBUG_DRAW_PHASES=',
+              'set KYTY_DEBUG_DRAW_STATS=',
+              'set KYTY_DEBUG_SPEC_STATS=',
+              'set KYTY_DEBUG_STREAM_STATS=',
+              'set KYTY_DEBUG_UPLOADS=',
+              'set KYTY_GPU_ZONES=',
+              '"%~dp0launcher.exe" %*'
+            ) | Set-Content "$install/$name" -Encoding ascii
+          }
 
           @(
             "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Adapted optimization: upstream e57c37f.",
-            "Original readback; no experimental window patch.",
-            "gpu_frames_ahead default remains 0.",
-            "Launch using Prueba-1.cmd.",
+            "Vertex metadata optimization retained from test 1.",
+            "Experimental suspend-point adaptation from upstream 840b9f5.",
+            "Prueba-2.cmd: ordered suspend enabled.",
+            "Comparacion.cmd: original AMD suspend behavior.",
+            "Close all emulator and launcher processes before changing mode.",
             "Copy your working _Patches folder beside launcher.exe.",
             "Select THIS folder's kyty_emulator.exe in the launcher.",
+            "Keep the same settings in both modes; gpu_frames_ahead = 0.",
+            "Original readback window; light diagnostics retained.",
             "No FPS improvement guaranteed."
-          ) | Set-Content "$install/PRUEBA-1.txt" -Encoding ascii
+          ) | Set-Content "$install/PRUEBA-2.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-1-Metadatos.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-2-Sincronizacion.zip" `
             -Force
 
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-1-Metadatos
-          path: KytyPS5-Windows-AMD-Prueba-1-Metadatos.zip
+          name: KytyPS5-Windows-AMD-Prueba-2-Sincronizacion
+          path: KytyPS5-Windows-AMD-Prueba-2-Sincronizacion.zip
           if-no-files-found: error
           retention-days: 7
