@@ -1,4 +1,4 @@
-name: Windows AMD 4068f4a - Readback experimental
+name: Windows AMD - Prueba 1 - Metadatos
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + readback + light diagnostics
+    name: Windows x64 - AMD base + vertex metadata
     runs-on: windows-2022
 
     defaults:
@@ -35,55 +35,27 @@ jobs:
       - name: Verify AMD base
         run: |
           $ErrorActionPreference = "Stop"
-
           $expected = "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9"
           $actual = git rev-parse HEAD
-
           if ($LASTEXITCODE -ne 0) {
             throw "Could not read source commit"
           }
-
           if ($actual -ne $expected) {
             throw "Unexpected source commit: $actual"
           }
-
           Write-Host "AMD base verified: $actual"
-
-      - name: Apply readback patch
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $patch = "_patch_source/patches/KytyPS5_5900X_readback_experimental.patch"
-
-          if (-not (Test-Path $patch)) {
-            throw "Missing patch: $patch"
-          }
-
-          git apply --ignore-whitespace --check $patch
-          if ($LASTEXITCODE -ne 0) {
-            throw "Readback patch does not apply to AMD base"
-          }
-
-          git apply --ignore-whitespace $patch
-          if ($LASTEXITCODE -ne 0) {
-            throw "Readback patch application failed"
-          }
-
-          Write-Host "Readback patch applied"
 
       - name: Apply lightweight diagnostics patch
         run: |
           $ErrorActionPreference = "Stop"
-
           $patch = "_patch_source/patches/KytyPS5_light_drain_stats.patch"
-
           if (-not (Test-Path $patch)) {
             throw "Missing patch: $patch"
           }
 
           git apply --ignore-whitespace --check $patch
           if ($LASTEXITCODE -ne 0) {
-            throw "Light diagnostics patch does not apply to AMD base"
+            throw "Light diagnostics patch does not apply"
           }
 
           git apply --ignore-whitespace $patch
@@ -91,7 +63,41 @@ jobs:
             throw "Light diagnostics patch application failed"
           }
 
-          Write-Host "Light diagnostics patch applied"
+      - name: Adapt upstream vertex metadata optimization
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if text.count(old) != 1:
+                  raise RuntimeError("Unexpected source: " + path)
+              p.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
+
+          header = "src/graphics/shader/shaderVertexMetadata.h"
+          replace_once(header, "#include <array>", "#include <span>")
+          replace_once(header,
+              "std::array<ShaderSemantic, ShaderVertexInputInfo::RES_MAX> input_semantics {};",
+              "std::span<const ShaderSemantic> input_semantics {};")
+          replace_once(header,
+              "// Copies the small AGC metadata subset used by the vertex path after validating every guest range.",
+              "// Validates vertex metadata and borrows its semantics for immediate draw preparation.")
+
+          source = "src/graphics/shader/shaderVertexMetadata.cpp"
+          replace_once(source,
+              "\tconst auto semantic_size =\n\t    static_cast<uint64_t>(data.num_input_semantics) * sizeof(ShaderSemantic);\n",
+              "")
+          replace_once(source,
+              "std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);",
+              "next.input_semantics = {data.input_semantics, data.num_input_semantics};")
+
+          print("Adapted upstream e57c37f: vertex semantics view applied")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) {
+            throw "Metadata adaptation failed"
+          }
 
       - name: Verify patched source
         run: |
@@ -103,23 +109,13 @@ jobs:
           }
 
           $config = Get-Content "src/common/emulatorConfig.h" -Raw
-
           if ($config -notmatch 'gpu_frames_ahead\s*=\s*0\s*;') {
             throw "Expected original gpu_frames_ahead = 0"
           }
 
-          $bufferSource = Get-Content `
-            "src/graphics/host_gpu/renderer/cache/bufferCache.cpp" -Raw
-
-          if (-not $bufferSource.Contains("KYTY_GPU_READBACK_WINDOW_KIB")) {
-            throw "Readback patch verification failed"
-          }
-
-          $statsSource = Get-Content `
-            "src/graphics/host_gpu/renderer/drainStats.cpp" -Raw
-
-          if (-not $statsSource.Contains("KYTY_LIGHT_DRAIN_STATS")) {
-            throw "Light diagnostics patch verification failed"
+          $stats = Get-Content "src/graphics/host_gpu/renderer/drainStats.cpp" -Raw
+          if (-not $stats.Contains("KYTY_LIGHT_DRAIN_STATS")) {
+            throw "Light diagnostics verification failed"
           }
 
           git diff --stat
@@ -152,17 +148,13 @@ jobs:
       - name: Install glslang
         run: |
           $ErrorActionPreference = "Stop"
-
           $apiUrl = "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot"
-
           $headers = @{
             "User-Agent" = "GitHub-Actions-KytyPS5"
             "Accept" = "application/vnd.github+json"
           }
 
-          $release = Invoke-RestMethod `
-            -Uri $apiUrl `
-            -Headers $headers
+          $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers
 
           $asset = $release.assets |
             Where-Object {
@@ -188,36 +180,20 @@ jobs:
           $zip = "$env:RUNNER_TEMP\glslang.zip"
           $extract = "$env:RUNNER_TEMP\glslang"
 
-          Invoke-WebRequest `
-            -Uri $asset.browser_download_url `
-            -Headers $headers `
-            -OutFile $zip
+          Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zip
 
           if (Test-Path $extract) {
             Remove-Item -Path $extract -Recurse -Force
           }
 
-          New-Item `
-            -ItemType Directory `
-            -Path $extract `
-            -Force | Out-Null
+          New-Item -ItemType Directory -Path $extract -Force | Out-Null
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          Expand-Archive `
-            -Path $zip `
-            -DestinationPath $extract `
-            -Force
-
-          $validator = Get-ChildItem `
-            -Path $extract `
-            -Filter "glslangValidator.exe" `
-            -Recurse |
+          $validator = Get-ChildItem -Path $extract -Filter "glslangValidator.exe" -Recurse |
             Select-Object -First 1
 
           if (-not $validator) {
-            $validator = Get-ChildItem `
-              -Path $extract `
-              -Filter "glslang.exe" `
-              -Recurse |
+            $validator = Get-ChildItem -Path $extract -Filter "glslang.exe" -Recurse |
               Select-Object -First 1
           }
 
@@ -226,24 +202,16 @@ jobs:
           }
 
           $glslangBin = $validator.Directory.FullName
-
           if ($validator.Name -eq "glslang.exe") {
-            Copy-Item `
-              -Path $validator.FullName `
-              -Destination (Join-Path $glslangBin "glslangValidator.exe") `
-              -Force
+            Copy-Item -Path $validator.FullName `
+              -Destination (Join-Path $glslangBin "glslangValidator.exe") -Force
           }
 
-          Add-Content `
-            -Path $env:GITHUB_PATH `
-            -Value $glslangBin
-
-          Write-Host "glslang installed: $glslangBin"
+          Add-Content -Path $env:GITHUB_PATH -Value $glslangBin
 
       - name: Verify glslang
         run: |
           glslangValidator --version
-
           if ($LASTEXITCODE -ne 0) {
             throw "glslang verification failed"
           }
@@ -251,7 +219,6 @@ jobs:
       - name: Configure CMake
         run: |
           $ErrorActionPreference = "Stop"
-
           cmake `
             -S . `
             -B _Build/windows `
@@ -269,11 +236,22 @@ jobs:
         run: |
           cmake `
             --build _Build/windows `
-            --target launcher `
+            --target launcher shader_vertex_metadata_tests `
             --parallel
 
           if ($LASTEXITCODE -ne 0) {
             throw "Build failed"
+          }
+
+      - name: Test vertex metadata
+        run: |
+          ctest --test-dir _Build/windows `
+            -R '^shader_vertex_metadata$' `
+            --output-on-failure `
+            --no-tests=error
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Vertex metadata tests failed"
           }
 
       - name: Install KytyPS5
@@ -286,95 +264,53 @@ jobs:
             throw "Install failed"
           }
 
-      - name: Package test launchers
+      - name: Package test launcher
         run: |
           $ErrorActionPreference = "Stop"
-
           $install = "_Build/windows/install"
 
           if (-not (Test-Path "$install/launcher.exe")) {
-            throw "launcher.exe missing from install directory"
+            throw "launcher.exe missing"
           }
 
-          $clearDiagnostics = @(
+          @(
+            '@echo off',
+            'setlocal',
+            'cd /d "%~dp0"',
+            'set KYTY_GPU_READBACK_WINDOW_KIB=',
+            'set KYTY_LIGHT_DRAIN_STATS=1',
             'set KYTY_DEBUG_DRAW_PHASES=',
             'set KYTY_DEBUG_DRAW_STATS=',
             'set KYTY_DEBUG_SPEC_STATS=',
             'set KYTY_DEBUG_STREAM_STATS=',
             'set KYTY_DEBUG_UPLOADS=',
-            'set KYTY_GPU_ZONES='
-          )
-
-          foreach ($kib in @(512, 64, 4)) {
-            $lines = @(
-              '@echo off',
-              'setlocal',
-              'cd /d "%~dp0"',
-              "set KYTY_GPU_READBACK_WINDOW_KIB=$kib",
-              'set KYTY_LIGHT_DRAIN_STATS=1'
-            )
-
-            $lines += $clearDiagnostics
-            $lines += '"%~dp0launcher.exe" %*'
-
-            Set-Content `
-              -Path "$install/Readback-$kib.cmd" `
-              -Value $lines `
-              -Encoding ascii
-          }
-
-          $lightLauncher = @(
-            '@echo off',
-            'setlocal',
-            'cd /d "%~dp0"',
-            'set KYTY_GPU_READBACK_WINDOW_KIB=64',
-            'set KYTY_LIGHT_DRAIN_STATS=1'
-          )
-
-          $lightLauncher += $clearDiagnostics
-          $lightLauncher += '"%~dp0launcher.exe" %*'
-
-          Set-Content `
-            -Path "$install/Diagnostico-Ligero.cmd" `
-            -Value $lightLauncher `
-            -Encoding ascii
+            'set KYTY_GPU_ZONES=',
+            '"%~dp0launcher.exe" %*'
+          ) | Set-Content "$install/Prueba-1.cmd" -Encoding ascii
 
           @(
-            "Source base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Patch revision: $env:GITHUB_SHA",
-            "gpu_frames_ahead remains 0.",
-            "",
-            "Readback-512.cmd: original readback window",
-            "Readback-64.cmd: experimental 64 KiB window",
-            "Readback-4.cmd: experimental 4 KiB window",
-            "Diagnostico-Ligero.cmd: 64 KiB + light diagnostics mode",
-            "",
-            "All CMD launchers enable light diagnostics mode.",
-            "This mode only has an effect when drain-stats is enabled.",
-            "",
-            "For normal play: drain-stats = 0 in kyty_settings.ini",
-            "For measurements: drain-stats = 5 in kyty_settings.ini",
-            "The settings file belongs beside kyty_emulator.exe.",
-            "",
-            "Close all emulator processes before switching tests.",
-            "No FPS improvement is guaranteed."
-          ) | Set-Content `
-            -Path "$install/READBACK-TEST.txt" `
-            -Encoding ascii
+            "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
+            "Adapted optimization: upstream e57c37f.",
+            "Original readback; no experimental window patch.",
+            "gpu_frames_ahead default remains 0.",
+            "Launch using Prueba-1.cmd.",
+            "Copy your working _Patches folder beside launcher.exe.",
+            "Select THIS folder's kyty_emulator.exe in the launcher.",
+            "No FPS improvement guaranteed."
+          ) | Set-Content "$install/PRUEBA-1.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
-
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-4068f4a-Readback-Light.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-1-Metadatos.zip" `
             -Force
 
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-4068f4a-Readback-Light
-          path: KytyPS5-Windows-AMD-4068f4a-Readback-Light.zip
+          name: KytyPS5-Windows-AMD-Prueba-1-Metadatos
+          path: KytyPS5-Windows-AMD-Prueba-1-Metadatos.zip
           if-no-files-found: error
           retention-days: 7
