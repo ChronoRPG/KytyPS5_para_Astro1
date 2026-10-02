@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 8 - Protecciones
+name: Windows AMD - Prueba 9 - Operaciones de memoria
 
 on:
   workflow_dispatch:
@@ -117,23 +117,34 @@ jobs:
             }
           }
 
-      - name: Add protection diagnostics
+      - name: Add address space diagnostics
         run: |
           $ErrorActionPreference = "Stop"
           @'
           from pathlib import Path
           header = r'''#pragma once
+          #include "common/common.h"
+          #include <array>
+          #include <atomic>
           #include <chrono>
           #include <cstdint>
           #include <cstdio>
           #include <cstdlib>
           #include <cstring>
+          #include <mutex>
+          #include <thread>
+          #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+          #include <windows.h>
+          #undef min
+          #undef max
+          #undef MemoryBarrier
+          #endif
 
-          namespace Libs::Graphics::TrackingDiagnostics {
+          namespace Libs::Graphics::AddressSpaceDiagnostics {
           inline bool Enabled() {
               static const bool enabled = [] {
-                  const char* v = std::getenv("KYTY_TRACKING_DIAGNOSTICS");
-                  return v != nullptr && std::strcmp(v, "1") == 0;
+                  const char* v = std::getenv("KYTY_ADDRESS_SPACE_DIAGNOSTICS");
+                  return v && std::strcmp(v, "1") == 0;
               }();
               return enabled;
           }
@@ -141,133 +152,136 @@ jobs:
               return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now().time_since_epoch()).count());
           }
-
-          enum class Metric { RegionProtection, PageWatcherLock, AddressSpaceLock, AddressSpaceWork, VirtualProtect, Count };
-          struct Counter { uint64_t calls = 0, total = 0, maximum = 0; };
-          inline thread_local Counter counters[static_cast<unsigned>(Metric::Count)] {};
-          class Scope {
-          public:
-              explicit Scope(Metric metric) : metric_(metric), active_(Enabled()), start_(active_ ? Now() : 0) {}
-              ~Scope() { Finish(); }
-              void Finish() {
-                  if (!active_) return;
-                  active_ = false;
-                  const auto elapsed = Now() - start_;
-                  auto& c = counters[static_cast<unsigned>(metric_)];
-                  ++c.calls; c.total += elapsed;
-                  if (elapsed > c.maximum) c.maximum = elapsed;
-              }
-          private:
-              Metric metric_;
-              bool active_;
-              uint64_t start_;
+          inline uint32_t Tid() {
+          #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+              return GetCurrentThreadId();
+          #else
+              return static_cast<uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+          #endif
+          }
+          struct Event {
+              uint64_t time = 0, wait = 0, hold = 0;
+              uint32_t tid = 0;
+              const char* operation = "";
           };
-          // Invoked after releasing the tracking lock.
-          inline void ReportProtection(uint32_t tid) {
-              struct Output { FILE* file = nullptr; uint64_t bucket = 0; bool opened = false; };
-              static thread_local Output o;
-              const auto now = Now();
-              const auto bucket = now / 5000000;
-              if (!o.opened) {
-                  o.opened = true; o.bucket = bucket;
-                  char path[96];
-                  std::snprintf(path, sizeof(path), "protection-times-%u.csv", tid);
-                  o.file = std::fopen(path, "w");
-                  if (o.file) {
-                      std::fputs("steady_us,tid,metric,calls,total_us,max_us\n", o.file);
-                      std::fflush(o.file);
-                  }
-              }
-              if (bucket == o.bucket) return;
-              const char* names[] = {"region_protection", "page_watcher_lock", "address_space_lock",
-                                     "address_space_work", "virtual_protect"};
-              for (unsigned i = 0; i < static_cast<unsigned>(Metric::Count); ++i) {
-                  const auto& c = counters[i];
-                  if (o.file && c.calls != 0) {
-                      std::fprintf(o.file, "%llu,%u,%s,%llu,%llu,%llu\n",
-                          (unsigned long long)now, tid, names[i], (unsigned long long)c.calls,
-                          (unsigned long long)c.total, (unsigned long long)c.maximum);
-                  }
-                  counters[i] = {};
-              }
-              if (o.file) std::fflush(o.file);
-              o.bucket = bucket;
+          struct Queue {
+              std::array<Event, 128> events {};
+              std::atomic<uint64_t> read {0}, write {0}, dropped {0};
+          };
+          inline std::array<Queue, 128> queues {};
+          inline std::atomic<unsigned> assigned {0};
+          inline Queue* LocalQueue() {
+              static thread_local const unsigned index = assigned.fetch_add(1, std::memory_order_relaxed);
+              return index < queues.size() ? &queues[index] : nullptr;
           }
-
-          inline void Record(uint32_t tid, bool contended, uint64_t wait, uint64_t hold,
-                             uint32_t owner, const void* lock) {
-              ReportProtection(tid);
-              struct Totals {
-                  FILE* file = nullptr;
-                  uint64_t bucket = 0, calls = 0, collisions = 0, wait_sum = 0, hold_sum = 0;
-                  uint64_t max_wait = 0, max_hold = 0;
-                  uint32_t max_owner = 0;
-                  const void* max_lock = nullptr;
-                  bool opened = false;
-              };
-              static thread_local Totals t;
-              const auto now = Now();
-              const auto bucket = now / 5000000;
-              if (!t.opened) {
-                  t.opened = true;
-                  char path[96];
-                  std::snprintf(path, sizeof(path), "tracking-waits-%u.csv", tid);
-                  t.file = std::fopen(path, "w");
-                  if (t.file) {
-                      std::fputs("steady_us,tid,calls,contended,wait_us,hold_us,max_wait_us,max_hold_us,observed_owner_tid,lock_address\n", t.file);
-                      std::fflush(t.file);
-                  }
-                  t.bucket = bucket;
+          inline void Publish(Queue* q, const Event& event) {
+              if (!q) return;
+              const auto w = q->write.load(std::memory_order_relaxed);
+              if (w - q->read.load(std::memory_order_acquire) >= q->events.size()) {
+                  q->dropped.fetch_add(1, std::memory_order_relaxed);
+                  return;
               }
-              if (bucket != t.bucket) {
-                  if (t.file) {
-                      std::fprintf(t.file, "%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%u,%p\n",
-                          (unsigned long long)now, tid, (unsigned long long)t.calls,
-                          (unsigned long long)t.collisions, (unsigned long long)t.wait_sum,
-                          (unsigned long long)t.hold_sum, (unsigned long long)t.max_wait,
-                          (unsigned long long)t.max_hold, t.max_owner, t.max_lock);
-                      std::fflush(t.file);
-                  }
-                  t.calls = t.collisions = t.wait_sum = t.hold_sum = t.max_wait = t.max_hold = 0;
-                  t.max_owner = 0; t.max_lock = nullptr; t.bucket = bucket;
-              }
-              ++t.calls;
-              t.collisions += contended ? 1 : 0;
-              t.wait_sum += wait; t.hold_sum += hold;
-              if (wait > t.max_wait) { t.max_wait = wait; t.max_owner = owner; t.max_lock = lock; }
-              if (hold > t.max_hold) { t.max_hold = hold; }
+              q->events[w % q->events.size()] = event;
+              q->write.store(w + 1, std::memory_order_release);
           }
+          inline void Start() {
+              if (!Enabled()) return;
+              static const bool started = [] {
+                  std::thread([] {
+                      FILE* f = std::fopen("address-space-events.csv", "w");
+                      if (!f) return;
+                      std::fputs("steady_us,tid,operation,wait_us,hold_us,dropped\n", f);
+                      std::fflush(f);
+                      for (;;) {
+                          std::this_thread::sleep_for(std::chrono::seconds(1));
+                          for (auto& q : queues) {
+                              auto r = q.read.load(std::memory_order_relaxed);
+                              const auto w = q.write.load(std::memory_order_acquire);
+                              while (r != w) {
+                                  const auto e = q.events[r % q.events.size()];
+                                  std::fprintf(f, "%llu,%u,%s,%llu,%llu,0\n",
+                                      (unsigned long long)e.time, e.tid, e.operation,
+                                      (unsigned long long)e.wait, (unsigned long long)e.hold);
+                                  ++r;
+                                  q.read.store(r, std::memory_order_release);
+                              }
+                              const auto dropped = q.dropped.exchange(0, std::memory_order_relaxed);
+                              if (dropped) {
+                                  std::fprintf(f, "%llu,0,dropped,0,0,%llu\n",
+                                      (unsigned long long)Now(), (unsigned long long)dropped);
+                              }
+                          }
+                          std::fflush(f);
+                      }
+                  }).detach();
+                  return true;
+              }();
+              (void)started;
+          }
+          // Retains the original mutex. A separate thread writes the CSV.
+          class Guard {
+          public:
+              Guard(std::mutex& mutex, const char* operation)
+                  : enabled_(Enabled()), queue_(enabled_ ? LocalQueue() : nullptr),
+                    operation_(operation), tid_(enabled_ ? Tid() : 0),
+                    begin_(enabled_ ? Now() : 0), lock_(mutex),
+                    acquired_(enabled_ ? Now() : 0) {}
+              ~Guard() {
+                  const auto released = enabled_ ? Now() : 0;
+                  lock_.unlock();
+                  if (enabled_) {
+                      const auto wait = acquired_ - begin_;
+                      const auto hold = released - acquired_;
+                      if (wait >= 50000 || hold >= 50000) {
+                          Publish(queue_, {released, wait, hold, tid_, operation_});
+                      }
+                  }
+              }
+              Guard(const Guard&) = delete;
+              Guard& operator=(const Guard&) = delete;
+          private:
+              bool enabled_;
+              Queue* queue_;
+              const char* operation_;
+              uint32_t tid_;
+              uint64_t begin_;
+              std::unique_lock<std::mutex> lock_;
+              uint64_t acquired_;
+          };
           }
           '''
-          Path('src/graphics/host_gpu/trackingDiagnostics.h').write_text(header,encoding='utf-8',newline='\n')
-          changes = [
-              ('src/graphics/host_gpu/regionManager.h', '#include <algorithm>', '#include "graphics/host_gpu/trackingDiagnostics.h"\n\n#include <algorithm>'),
-              ('src/graphics/host_gpu/regionManager.h', '\t\tconst auto thread = CurrentThread();', '\t\tconst auto thread = CurrentThread();\n\t\tconst bool diagnostic = TrackingDiagnostics::Enabled();\n\t\tuint64_t start = 0;\n\t\tuint32_t observed_owner = 0;\n\t\tbool contended = false;'),
-              ('src/graphics/host_gpu/regionManager.h', '\t\twhile (m_lock.test_and_set(std::memory_order_acquire)) {', '\t\twhile (m_lock.test_and_set(std::memory_order_acquire)) {\n\t\t\tif (diagnostic && !contended) {\n\t\t\t\tcontended = true;\n\t\t\t\tstart = TrackingDiagnostics::Now();\n\t\t\t\tobserved_owner = m_owner.load(std::memory_order_relaxed);\n\t\t\t}'),
-              ('src/graphics/host_gpu/regionManager.h', '\t\tm_owner.store(thread, std::memory_order_relaxed);', '\t\tm_owner.store(thread, std::memory_order_relaxed);\n\t\tif (diagnostic) {\n\t\t\tm_diag_start = TrackingDiagnostics::Now();\n\t\t\tm_diag_wait = contended ? m_diag_start - start : 0;\n\t\t\tm_diag_owner = observed_owner;\n\t\t\tm_diag_contended = contended;\n\t\t}'),
-              ('src/graphics/host_gpu/regionManager.h', '\t\tm_owner.store(0, std::memory_order_relaxed);\n\t\tm_lock.clear(std::memory_order_release);', '\t\tconst bool diagnostic = TrackingDiagnostics::Enabled();\n\t\tconst auto wait = diagnostic ? m_diag_wait : 0;\n\t\tconst auto hold = diagnostic ? TrackingDiagnostics::Now() - m_diag_start : 0;\n\t\tconst auto owner = diagnostic ? m_diag_owner : 0;\n\t\tconst auto contended = diagnostic && m_diag_contended;\n\t\tm_owner.store(0, std::memory_order_relaxed);\n\t\tm_lock.clear(std::memory_order_release);\n\t\tif (diagnostic) {\n\t\t\tTrackingDiagnostics::Record(CurrentThread(), contended, wait, hold, owner, this);\n\t\t}'),
-              ('src/graphics/host_gpu/regionManager.h', '\tstd::atomic_flag     m_lock = ATOMIC_FLAG_INIT;', '\tuint64_t m_diag_start = 0, m_diag_wait = 0;\n\tuint32_t m_diag_owner = 0;\n\tbool m_diag_contended = false;\n\tstd::atomic_flag     m_lock = ATOMIC_FLAG_INIT;'),
-              ('src/graphics/host_gpu/renderer/threadSampler.cpp', '\t\tstd::fprintf(file, "# tid=%lu name=%s\\n", id, name.empty() ? "-" : name.c_str());', '\t\tFILETIME created {}, exited {}, kernel {}, user {};\n\t\tuint64_t kernel_us = 0, user_us = 0;\n\t\tHANDLE cpu_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, id);\n\t\tif (cpu_thread) {\n\t\t\tif (GetThreadTimes(cpu_thread, &created, &exited, &kernel, &user)) {\n\t\t\t\tkernel_us = ((uint64_t{kernel.dwHighDateTime} << 32) | kernel.dwLowDateTime) / 10;\n\t\t\t\tuser_us = ((uint64_t{user.dwHighDateTime} << 32) | user.dwLowDateTime) / 10;\n\t\t\t}\n\t\t\tCloseHandle(cpu_thread);\n\t\t}\n\t\tconst auto steady_us = std::chrono::duration_cast<std::chrono::microseconds>(\n\t\t    std::chrono::steady_clock::now().time_since_epoch()).count();\n\t\tstd::fprintf(file, "# tid=%lu name=%s kernel_us=%llu user_us=%llu steady_us=%llu\\n",\n\t\t             id, name.empty() ? "-" : name.c_str(),\n\t\t             (unsigned long long)kernel_us, (unsigned long long)user_us,\n\t\t             (unsigned long long)steady_us);'),
-              ('src/kernel/pthread.cpp', '\tthread->host_thread_id = os_thread_id;', '\tthread->host_thread_id = os_thread_id;\n#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS\n\twchar_t diagnostic_name[96];\n\tstd::swprintf(diagnostic_name, 96, L"Guest-%u", static_cast<unsigned>(thread->unique_id));\n\tSetThreadDescription(GetCurrentThread(), diagnostic_name);\n#endif'),
-              ('src/kernel/pthread.cpp', '#include <cstring>', '#include <cstring>\n#include <cwchar>'),
-              ('src/graphics/host_gpu/regionManager.h', '\tvoid UpdateProtection() {', '\tvoid UpdateProtection() {\n\t\tTrackingDiagnostics::Scope diagnostic_scope(TrackingDiagnostics::Metric::RegionProtection);'),
-              ('src/graphics/host_gpu/pageManager.cpp', '#include "common/alignment.h"', '#include "common/alignment.h"\n#include "graphics/host_gpu/trackingDiagnostics.h"'),
-              ('src/graphics/host_gpu/pageManager.cpp', '\t\tSpinGuard lock(region.lock);\n\t\tauto      perms', '\t\tTrackingDiagnostics::Scope diagnostic_wait(TrackingDiagnostics::Metric::PageWatcherLock);\n\t\tSpinGuard lock(region.lock);\n\t\tdiagnostic_wait.Finish();\n\t\tauto      perms'),
-              ('src/kernel/memory.cpp', '#include "common/assert.h"', '#include "common/assert.h"\n#include "graphics/host_gpu/trackingDiagnostics.h"'),
-              ('src/kernel/memoryAddressSpace.inc', '\tbool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {\n\t\tif (size == 0 || UINT64_MAX - vaddr < size) {\n\t\t\treturn false;\n\t\t}\n\n\t\tstd::lock_guard lock(m_mutex);\n\t\treturn ProtectMappedUnlocked(vaddr, size, mode);\n\t}', '\tbool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {\n\t\tif (size == 0 || UINT64_MAX - vaddr < size) {\n\t\t\treturn false;\n\t\t}\n\t\tLibs::Graphics::TrackingDiagnostics::Scope diagnostic_wait(\n\t\t    Libs::Graphics::TrackingDiagnostics::Metric::AddressSpaceLock);\n\t\tstd::lock_guard lock(m_mutex);\n\t\tdiagnostic_wait.Finish();\n\t\tLibs::Graphics::TrackingDiagnostics::Scope diagnostic_work(\n\t\t    Libs::Graphics::TrackingDiagnostics::Metric::AddressSpaceWork);\n\t\treturn ProtectMappedUnlocked(vaddr, size, mode);\n\t}'),
-              ('src/common/platform/sysWindowsVirtual.cpp', '#include "common/assert.h"', '#include "common/assert.h"\n#include "graphics/host_gpu/trackingDiagnostics.h"'),
-              ('src/common/platform/sysWindowsVirtual.cpp', 'bool Protect(uint64_t address, uint64_t size, Mode mode) {', 'bool Protect(uint64_t address, uint64_t size, Mode mode) {\n\tLibs::Graphics::TrackingDiagnostics::Scope diagnostic_scope(\n\t    Libs::Graphics::TrackingDiagnostics::Metric::VirtualProtect);'),
-          ]
-          for path, old, new in changes:
-              p=Path(path)
-              s=p.read_text(encoding="utf-8")
-              if s.count(old)!=1:
-                  raise RuntimeError("Unexpected diagnostic source: "+path+" / "+old[:70])
-              p.write_text(s.replace(old,new),encoding="utf-8",newline="\n")
-          print("Protection and tracking diagnostics installed")
+          Path("src/graphics/host_gpu/addressSpaceDiagnostics.h").write_text(
+              header,encoding="utf-8",newline="\n")
+          p=Path("src/kernel/memory.cpp")
+          s=p.read_text(encoding="utf-8")
+          old='#include "common/assert.h"'
+          if s.count(old)!=1:
+              raise RuntimeError("Unexpected memory includes")
+          s=s.replace(old,old+'\n#include "graphics/host_gpu/addressSpaceDiagnostics.h"')
+          p.write_text(s,encoding="utf-8",newline="\n")
+
+          p=Path("src/kernel/memoryAddressSpace.inc")
+          s=p.read_text(encoding="utf-8")
+          a=s.index("class GuestAddressSpace {")
+          prefix,body=s[:a],s[a:]
+          old="\t\tstd::lock_guard lock(m_mutex);"
+          count=body.count(old)
+          if count!=13:
+              raise RuntimeError("Unexpected address-space lock count: "+str(count))
+          body=body.replace(
+              old,
+              "\t\tLibs::Graphics::AddressSpaceDiagnostics::Guard lock(m_mutex, __func__);")
+          old="\texplicit GuestAddressSpace(uint64_t backing_size) {"
+          if body.count(old)!=1:
+              raise RuntimeError("Unexpected address-space constructor")
+          body=body.replace(
+              old,
+              old+"\n\t\tLibs::Graphics::AddressSpaceDiagnostics::Start();")
+          p.write_text(prefix+body,encoding="utf-8",newline="\n")
+          print("Instrumented "+str(count)+" address-space operations")
           '@ | python -
           if ($LASTEXITCODE -ne 0) {
-            throw "Protection diagnostics adaptation failed"
+            throw "Address-space diagnostics adaptation failed"
           }
 
       - name: Verify patched source
@@ -379,7 +393,7 @@ jobs:
         run: |
           cmake `
             --build _Build/windows `
-            --target launcher shader_vertex_metadata_tests memory_tracker_tests shader_cfg_tests `
+            --target launcher shader_vertex_metadata_tests memory_tracker_tests shader_cfg_tests virtual_memory_allocation_tests `
             --parallel
           if ($LASTEXITCODE -ne 0) {
             throw "Build failed"
@@ -389,7 +403,7 @@ jobs:
         run: |
           ctest `
             --test-dir _Build/windows `
-            -R '^(shader_vertex_metadata|memory_tracker|shader_cfg)$' `
+            -R '^(shader_vertex_metadata|memory_tracker|shader_cfg|virtual_memory_allocation)$' `
             --output-on-failure `
             --no-tests=error
           if ($LASTEXITCODE -ne 0) {
@@ -413,7 +427,7 @@ jobs:
           }
           foreach ($mode in @(0, 1)) {
             $name = if ($mode -eq 1) {
-              "Diagnostico-8.cmd"
+              "Diagnostico-9.cmd"
             } else {
               "Comparacion.cmd"
             }
@@ -421,7 +435,8 @@ jobs:
               '@echo off',
               'setlocal',
               'cd /d "%~dp0"',
-              "set KYTY_TRACKING_DIAGNOSTICS=$mode",
+              "set KYTY_ADDRESS_SPACE_DIAGNOSTICS=$mode",
+              'set KYTY_TRACKING_DIAGNOSTICS=',
               'set KYTY_TRACKING_PAUSE=',
               'set KYTY_BDA_SLICE_FILTER=',
               'set KYTY_SPECULATE_DRAWS=1',
@@ -455,7 +470,7 @@ jobs:
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Windows-AMD-Prueba-8-Protecciones.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-9-Memoria.zip"
           Compress-Archive `
             -Path "_Build/windows/install/*" `
             -DestinationPath $zip `
@@ -471,7 +486,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-8-Protecciones
-          path: KytyPS5-Windows-AMD-Prueba-8-Protecciones.zip
+          name: KytyPS5-Windows-AMD-Prueba-9-Memoria
+          path: KytyPS5-Windows-AMD-Prueba-9-Memoria.zip
           if-no-files-found: error
           retention-days: 7
