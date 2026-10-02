@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 7 - Diagnostico
+name: Windows AMD - Prueba 8 - Protecciones
 
 on:
   workflow_dispatch:
@@ -8,7 +8,6 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + targeted diagnostics
     runs-on: windows-2022
 
     defaults:
@@ -23,7 +22,7 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Checkout patches from workflow revision
+      - name: Checkout existing patches
         uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -35,15 +34,13 @@ jobs:
       - name: Verify AMD base
         run: |
           $ErrorActionPreference = "Stop"
-          $expected = "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9"
           $actual = git rev-parse HEAD
           if ($LASTEXITCODE -ne 0) {
             throw "Could not read source commit"
           }
-          if ($actual -ne $expected) {
-            throw "Unexpected source commit: $actual"
+          if ($actual -ne "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9") {
+            throw "Unexpected AMD source: $actual"
           }
-          Write-Host "AMD base verified: $actual"
 
       - name: Apply lightweight diagnostics patch
         run: |
@@ -58,38 +55,35 @@ jobs:
           }
           git apply --ignore-whitespace $patch
           if ($LASTEXITCODE -ne 0) {
-            throw "Light diagnostics patch application failed"
+            throw "Light diagnostics patch failed"
           }
 
-      - name: Adapt upstream vertex metadata optimization
+      - name: Adapt vertex metadata optimization
         run: |
           $ErrorActionPreference = "Stop"
           @'
           from pathlib import Path
-
           def replace_once(path, old, new):
-              p = Path(path)
-              text = p.read_text(encoding="utf-8")
-              if text.count(old) != 1:
-                  raise RuntimeError("Unexpected source: " + path)
-              p.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
-
-          header = "src/graphics/shader/shaderVertexMetadata.h"
-          replace_once(header, "#include <array>", "#include <span>")
-          replace_once(header,
+              p=Path(path)
+              s=p.read_text(encoding="utf-8")
+              if s.count(old)!=1:
+                  raise RuntimeError("Unexpected source: "+path)
+              p.write_text(s.replace(old,new),encoding="utf-8",newline="\n")
+          h="src/graphics/shader/shaderVertexMetadata.h"
+          replace_once(h,"#include <array>","#include <span>")
+          replace_once(h,
               "std::array<ShaderSemantic, ShaderVertexInputInfo::RES_MAX> input_semantics {};",
               "std::span<const ShaderSemantic> input_semantics {};")
-          replace_once(header,
+          replace_once(h,
               "// Copies the small AGC metadata subset used by the vertex path after validating every guest range.",
               "// Validates vertex metadata and borrows its semantics for immediate draw preparation.")
-          source = "src/graphics/shader/shaderVertexMetadata.cpp"
-          replace_once(source,
+          c="src/graphics/shader/shaderVertexMetadata.cpp"
+          replace_once(c,
               "\tconst auto semantic_size =\n\t    static_cast<uint64_t>(data.num_input_semantics) * sizeof(ShaderSemantic);\n",
               "")
-          replace_once(source,
+          replace_once(c,
               "std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);",
               "next.input_semantics = {data.input_semantics, data.num_input_semantics};")
-          print("Vertex metadata optimization applied")
           '@ | python -
           if ($LASTEXITCODE -ne 0) {
             throw "Metadata adaptation failed"
@@ -119,16 +113,15 @@ jobs:
             }
             git apply $patch
             if ($LASTEXITCODE -ne 0) {
-              throw "Patch application failed: $commit"
+              throw "Patch failed: $commit"
             }
           }
 
-      - name: Add targeted diagnostics
+      - name: Add protection diagnostics
         run: |
           $ErrorActionPreference = "Stop"
           @'
           from pathlib import Path
-
           header = r'''#pragma once
           #include <chrono>
           #include <cstdint>
@@ -148,9 +141,62 @@ jobs:
               return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now().time_since_epoch()).count());
           }
-          // Called after releasing this tracking lock. Each thread owns its file.
+
+          enum class Metric { RegionProtection, PageWatcherLock, AddressSpaceLock, AddressSpaceWork, VirtualProtect, Count };
+          struct Counter { uint64_t calls = 0, total = 0, maximum = 0; };
+          inline thread_local Counter counters[static_cast<unsigned>(Metric::Count)] {};
+          class Scope {
+          public:
+              explicit Scope(Metric metric) : metric_(metric), active_(Enabled()), start_(active_ ? Now() : 0) {}
+              ~Scope() { Finish(); }
+              void Finish() {
+                  if (!active_) return;
+                  active_ = false;
+                  const auto elapsed = Now() - start_;
+                  auto& c = counters[static_cast<unsigned>(metric_)];
+                  ++c.calls; c.total += elapsed;
+                  if (elapsed > c.maximum) c.maximum = elapsed;
+              }
+          private:
+              Metric metric_;
+              bool active_;
+              uint64_t start_;
+          };
+          // Invoked after releasing the tracking lock.
+          inline void ReportProtection(uint32_t tid) {
+              struct Output { FILE* file = nullptr; uint64_t bucket = 0; bool opened = false; };
+              static thread_local Output o;
+              const auto now = Now();
+              const auto bucket = now / 5000000;
+              if (!o.opened) {
+                  o.opened = true; o.bucket = bucket;
+                  char path[96];
+                  std::snprintf(path, sizeof(path), "protection-times-%u.csv", tid);
+                  o.file = std::fopen(path, "w");
+                  if (o.file) {
+                      std::fputs("steady_us,tid,metric,calls,total_us,max_us\n", o.file);
+                      std::fflush(o.file);
+                  }
+              }
+              if (bucket == o.bucket) return;
+              const char* names[] = {"region_protection", "page_watcher_lock", "address_space_lock",
+                                     "address_space_work", "virtual_protect"};
+              for (unsigned i = 0; i < static_cast<unsigned>(Metric::Count); ++i) {
+                  const auto& c = counters[i];
+                  if (o.file && c.calls != 0) {
+                      std::fprintf(o.file, "%llu,%u,%s,%llu,%llu,%llu\n",
+                          (unsigned long long)now, tid, names[i], (unsigned long long)c.calls,
+                          (unsigned long long)c.total, (unsigned long long)c.maximum);
+                  }
+                  counters[i] = {};
+              }
+              if (o.file) std::fflush(o.file);
+              o.bucket = bucket;
+          }
+
           inline void Record(uint32_t tid, bool contended, uint64_t wait, uint64_t hold,
                              uint32_t owner, const void* lock) {
+              ReportProtection(tid);
               struct Totals {
                   FILE* file = nullptr;
                   uint64_t bucket = 0, calls = 0, collisions = 0, wait_sum = 0, hold_sum = 0;
@@ -193,97 +239,39 @@ jobs:
           }
           }
           '''
-          Path("src/graphics/host_gpu/trackingDiagnostics.h").write_text(
-              header, encoding="utf-8", newline="\n")
-
-          def replace_once(path, old, new):
-              p = Path(path)
-              s = p.read_text(encoding="utf-8")
-              if s.count(old) != 1:
-                  raise RuntimeError("Unexpected diagnostic source: " + path + " / " + old[:70])
-              p.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
-
-          reg = "src/graphics/host_gpu/regionManager.h"
-          replace_once(reg, "#include <algorithm>",
-              '#include "graphics/host_gpu/trackingDiagnostics.h"\n\n#include <algorithm>')
-          replace_once(reg, "\t\tconst auto thread = CurrentThread();",
-              "\t\tconst auto thread = CurrentThread();\n"
-              "\t\tconst bool diagnostic = TrackingDiagnostics::Enabled();\n"
-              "\t\tuint64_t start = 0;\n"
-              "\t\tuint32_t observed_owner = 0;\n"
-              "\t\tbool contended = false;")
-          replace_once(reg, "\t\twhile (m_lock.test_and_set(std::memory_order_acquire)) {",
-              "\t\twhile (m_lock.test_and_set(std::memory_order_acquire)) {\n"
-              "\t\t\tif (diagnostic && !contended) {\n"
-              "\t\t\t\tcontended = true;\n"
-              "\t\t\t\tstart = TrackingDiagnostics::Now();\n"
-              "\t\t\t\tobserved_owner = m_owner.load(std::memory_order_relaxed);\n"
-              "\t\t\t}")
-          replace_once(reg, "\t\tm_owner.store(thread, std::memory_order_relaxed);",
-              "\t\tm_owner.store(thread, std::memory_order_relaxed);\n"
-              "\t\tif (diagnostic) {\n"
-              "\t\t\tm_diag_start = TrackingDiagnostics::Now();\n"
-              "\t\t\tm_diag_wait = contended ? m_diag_start - start : 0;\n"
-              "\t\t\tm_diag_owner = observed_owner;\n"
-              "\t\t\tm_diag_contended = contended;\n"
-              "\t\t}")
-          replace_once(reg,
-              "\t\tm_owner.store(0, std::memory_order_relaxed);\n"
-              "\t\tm_lock.clear(std::memory_order_release);",
-              "\t\tconst bool diagnostic = TrackingDiagnostics::Enabled();\n"
-              "\t\tconst auto wait = diagnostic ? m_diag_wait : 0;\n"
-              "\t\tconst auto hold = diagnostic ? TrackingDiagnostics::Now() - m_diag_start : 0;\n"
-              "\t\tconst auto owner = diagnostic ? m_diag_owner : 0;\n"
-              "\t\tconst auto contended = diagnostic && m_diag_contended;\n"
-              "\t\tm_owner.store(0, std::memory_order_relaxed);\n"
-              "\t\tm_lock.clear(std::memory_order_release);\n"
-              "\t\tif (diagnostic) {\n"
-              "\t\t\tTrackingDiagnostics::Record(CurrentThread(), contended, wait, hold, owner, this);\n"
-              "\t\t}")
-          replace_once(reg, "\tstd::atomic_flag     m_lock = ATOMIC_FLAG_INIT;",
-              "\tuint64_t m_diag_start = 0, m_diag_wait = 0;\n"
-              "\tuint32_t m_diag_owner = 0;\n"
-              "\tbool m_diag_contended = false;\n"
-              "\tstd::atomic_flag     m_lock = ATOMIC_FLAG_INIT;")
-
-          sampler = "src/graphics/host_gpu/renderer/threadSampler.cpp"
-          replace_once(sampler,
-              '\t\tstd::fprintf(file, "# tid=%lu name=%s\\n", id, name.empty() ? "-" : name.c_str());',
-              "\t\tFILETIME created {}, exited {}, kernel {}, user {};\n"
-              "\t\tuint64_t kernel_us = 0, user_us = 0;\n"
-              "\t\tHANDLE cpu_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, id);\n"
-              "\t\tif (cpu_thread) {\n"
-              "\t\t\tif (GetThreadTimes(cpu_thread, &created, &exited, &kernel, &user)) {\n"
-              "\t\t\t\tkernel_us = ((uint64_t{kernel.dwHighDateTime} << 32) | kernel.dwLowDateTime) / 10;\n"
-              "\t\t\t\tuser_us = ((uint64_t{user.dwHighDateTime} << 32) | user.dwLowDateTime) / 10;\n"
-              "\t\t\t}\n"
-              "\t\t\tCloseHandle(cpu_thread);\n"
-              "\t\t}\n"
-              "\t\tconst auto steady_us = std::chrono::duration_cast<std::chrono::microseconds>(\n"
-              "\t\t    std::chrono::steady_clock::now().time_since_epoch()).count();\n"
-              '\t\tstd::fprintf(file, "# tid=%lu name=%s kernel_us=%llu user_us=%llu steady_us=%llu\\n",\n'
-              '\t\t             id, name.empty() ? "-" : name.c_str(),\n'
-              "\t\t             (unsigned long long)kernel_us, (unsigned long long)user_us,\n"
-              "\t\t             (unsigned long long)steady_us);")
-
-          pthread = "src/kernel/pthread.cpp"
-          replace_once(pthread, "#include <cstring>", "#include <cstring>\n#include <cwchar>")
-          replace_once(pthread, "\tthread->host_thread_id = os_thread_id;",
-              "\tthread->host_thread_id = os_thread_id;\n"
-              "#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS\n"
-              "\twchar_t diagnostic_name[96];\n"
-              '\tstd::swprintf(diagnostic_name, 96, L"Guest-%u", static_cast<unsigned>(thread->unique_id));\n'
-              "\tSetThreadDescription(GetCurrentThread(), diagnostic_name);\n"
-              "#endif")
-          print("Tracking timings, CPU counters and guest worker names installed")
+          Path('src/graphics/host_gpu/trackingDiagnostics.h').write_text(header,encoding='utf-8',newline='\n')
+          changes = [
+              ('src/graphics/host_gpu/regionManager.h', '#include <algorithm>', '#include "graphics/host_gpu/trackingDiagnostics.h"\n\n#include <algorithm>'),
+              ('src/graphics/host_gpu/regionManager.h', '\t\tconst auto thread = CurrentThread();', '\t\tconst auto thread = CurrentThread();\n\t\tconst bool diagnostic = TrackingDiagnostics::Enabled();\n\t\tuint64_t start = 0;\n\t\tuint32_t observed_owner = 0;\n\t\tbool contended = false;'),
+              ('src/graphics/host_gpu/regionManager.h', '\t\twhile (m_lock.test_and_set(std::memory_order_acquire)) {', '\t\twhile (m_lock.test_and_set(std::memory_order_acquire)) {\n\t\t\tif (diagnostic && !contended) {\n\t\t\t\tcontended = true;\n\t\t\t\tstart = TrackingDiagnostics::Now();\n\t\t\t\tobserved_owner = m_owner.load(std::memory_order_relaxed);\n\t\t\t}'),
+              ('src/graphics/host_gpu/regionManager.h', '\t\tm_owner.store(thread, std::memory_order_relaxed);', '\t\tm_owner.store(thread, std::memory_order_relaxed);\n\t\tif (diagnostic) {\n\t\t\tm_diag_start = TrackingDiagnostics::Now();\n\t\t\tm_diag_wait = contended ? m_diag_start - start : 0;\n\t\t\tm_diag_owner = observed_owner;\n\t\t\tm_diag_contended = contended;\n\t\t}'),
+              ('src/graphics/host_gpu/regionManager.h', '\t\tm_owner.store(0, std::memory_order_relaxed);\n\t\tm_lock.clear(std::memory_order_release);', '\t\tconst bool diagnostic = TrackingDiagnostics::Enabled();\n\t\tconst auto wait = diagnostic ? m_diag_wait : 0;\n\t\tconst auto hold = diagnostic ? TrackingDiagnostics::Now() - m_diag_start : 0;\n\t\tconst auto owner = diagnostic ? m_diag_owner : 0;\n\t\tconst auto contended = diagnostic && m_diag_contended;\n\t\tm_owner.store(0, std::memory_order_relaxed);\n\t\tm_lock.clear(std::memory_order_release);\n\t\tif (diagnostic) {\n\t\t\tTrackingDiagnostics::Record(CurrentThread(), contended, wait, hold, owner, this);\n\t\t}'),
+              ('src/graphics/host_gpu/regionManager.h', '\tstd::atomic_flag     m_lock = ATOMIC_FLAG_INIT;', '\tuint64_t m_diag_start = 0, m_diag_wait = 0;\n\tuint32_t m_diag_owner = 0;\n\tbool m_diag_contended = false;\n\tstd::atomic_flag     m_lock = ATOMIC_FLAG_INIT;'),
+              ('src/graphics/host_gpu/renderer/threadSampler.cpp', '\t\tstd::fprintf(file, "# tid=%lu name=%s\\n", id, name.empty() ? "-" : name.c_str());', '\t\tFILETIME created {}, exited {}, kernel {}, user {};\n\t\tuint64_t kernel_us = 0, user_us = 0;\n\t\tHANDLE cpu_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, id);\n\t\tif (cpu_thread) {\n\t\t\tif (GetThreadTimes(cpu_thread, &created, &exited, &kernel, &user)) {\n\t\t\t\tkernel_us = ((uint64_t{kernel.dwHighDateTime} << 32) | kernel.dwLowDateTime) / 10;\n\t\t\t\tuser_us = ((uint64_t{user.dwHighDateTime} << 32) | user.dwLowDateTime) / 10;\n\t\t\t}\n\t\t\tCloseHandle(cpu_thread);\n\t\t}\n\t\tconst auto steady_us = std::chrono::duration_cast<std::chrono::microseconds>(\n\t\t    std::chrono::steady_clock::now().time_since_epoch()).count();\n\t\tstd::fprintf(file, "# tid=%lu name=%s kernel_us=%llu user_us=%llu steady_us=%llu\\n",\n\t\t             id, name.empty() ? "-" : name.c_str(),\n\t\t             (unsigned long long)kernel_us, (unsigned long long)user_us,\n\t\t             (unsigned long long)steady_us);'),
+              ('src/kernel/pthread.cpp', '\tthread->host_thread_id = os_thread_id;', '\tthread->host_thread_id = os_thread_id;\n#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS\n\twchar_t diagnostic_name[96];\n\tstd::swprintf(diagnostic_name, 96, L"Guest-%u", static_cast<unsigned>(thread->unique_id));\n\tSetThreadDescription(GetCurrentThread(), diagnostic_name);\n#endif'),
+              ('src/kernel/pthread.cpp', '#include <cstring>', '#include <cstring>\n#include <cwchar>'),
+              ('src/graphics/host_gpu/regionManager.h', '\tvoid UpdateProtection() {', '\tvoid UpdateProtection() {\n\t\tTrackingDiagnostics::Scope diagnostic_scope(TrackingDiagnostics::Metric::RegionProtection);'),
+              ('src/graphics/host_gpu/pageManager.cpp', '#include "common/alignment.h"', '#include "common/alignment.h"\n#include "graphics/host_gpu/trackingDiagnostics.h"'),
+              ('src/graphics/host_gpu/pageManager.cpp', '\t\tSpinGuard lock(region.lock);\n\t\tauto      perms', '\t\tTrackingDiagnostics::Scope diagnostic_wait(TrackingDiagnostics::Metric::PageWatcherLock);\n\t\tSpinGuard lock(region.lock);\n\t\tdiagnostic_wait.Finish();\n\t\tauto      perms'),
+              ('src/kernel/memory.cpp', '#include "common/assert.h"', '#include "common/assert.h"\n#include "graphics/host_gpu/trackingDiagnostics.h"'),
+              ('src/kernel/memoryAddressSpace.inc', '\tbool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {\n\t\tif (size == 0 || UINT64_MAX - vaddr < size) {\n\t\t\treturn false;\n\t\t}\n\n\t\tstd::lock_guard lock(m_mutex);\n\t\treturn ProtectMappedUnlocked(vaddr, size, mode);\n\t}', '\tbool ProtectTransient(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {\n\t\tif (size == 0 || UINT64_MAX - vaddr < size) {\n\t\t\treturn false;\n\t\t}\n\t\tLibs::Graphics::TrackingDiagnostics::Scope diagnostic_wait(\n\t\t    Libs::Graphics::TrackingDiagnostics::Metric::AddressSpaceLock);\n\t\tstd::lock_guard lock(m_mutex);\n\t\tdiagnostic_wait.Finish();\n\t\tLibs::Graphics::TrackingDiagnostics::Scope diagnostic_work(\n\t\t    Libs::Graphics::TrackingDiagnostics::Metric::AddressSpaceWork);\n\t\treturn ProtectMappedUnlocked(vaddr, size, mode);\n\t}'),
+              ('src/common/platform/sysWindowsVirtual.cpp', '#include "common/assert.h"', '#include "common/assert.h"\n#include "graphics/host_gpu/trackingDiagnostics.h"'),
+              ('src/common/platform/sysWindowsVirtual.cpp', 'bool Protect(uint64_t address, uint64_t size, Mode mode) {', 'bool Protect(uint64_t address, uint64_t size, Mode mode) {\n\tLibs::Graphics::TrackingDiagnostics::Scope diagnostic_scope(\n\t    Libs::Graphics::TrackingDiagnostics::Metric::VirtualProtect);'),
+          ]
+          for path, old, new in changes:
+              p=Path(path)
+              s=p.read_text(encoding="utf-8")
+              if s.count(old)!=1:
+                  raise RuntimeError("Unexpected diagnostic source: "+path+" / "+old[:70])
+              p.write_text(s.replace(old,new),encoding="utf-8",newline="\n")
+          print("Protection and tracking diagnostics installed")
           '@ | python -
           if ($LASTEXITCODE -ne 0) {
-            throw "Diagnostics adaptation failed"
+            throw "Protection diagnostics adaptation failed"
           }
 
       - name: Verify patched source
         run: |
-          $ErrorActionPreference = "Stop"
           git diff --check
           if ($LASTEXITCODE -ne 0) {
             throw "Invalid source diff"
@@ -291,10 +279,6 @@ jobs:
           $config = Get-Content "src/common/emulatorConfig.h" -Raw
           if ($config -notmatch 'gpu_frames_ahead\s*=\s*0\s*;') {
             throw "Expected original gpu_frames_ahead = 0"
-          }
-          $stats = Get-Content "src/graphics/host_gpu/renderer/drainStats.cpp" -Raw
-          if (-not $stats.Contains("KYTY_LIGHT_DRAIN_STATS")) {
-            throw "Light diagnostics patch missing"
           }
           git diff --stat
 
@@ -349,10 +333,8 @@ jobs:
           }
           $zip = "$env:RUNNER_TEMP/glslang.zip"
           $extract = "$env:RUNNER_TEMP/glslang"
-          Invoke-WebRequest `
-            -Uri $asset.browser_download_url `
-            -Headers $headers `
-            -OutFile $zip
+          Invoke-WebRequest -Uri $asset.browser_download_url `
+            -Headers $headers -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $extract -Force
           $validator = Get-ChildItem $extract `
             -Filter "glslangValidator.exe" -Recurse |
@@ -416,8 +398,7 @@ jobs:
 
       - name: Install KytyPS5
         run: |
-          cmake `
-            --install _Build/windows `
+          cmake --install _Build/windows `
             --prefix _Build/windows/install
           if ($LASTEXITCODE -ne 0) {
             throw "Install failed"
@@ -432,7 +413,7 @@ jobs:
           }
           foreach ($mode in @(0, 1)) {
             $name = if ($mode -eq 1) {
-              "Diagnostico-7.cmd"
+              "Diagnostico-8.cmd"
             } else {
               "Comparacion.cmd"
             }
@@ -440,26 +421,14 @@ jobs:
               '@echo off',
               'setlocal',
               'cd /d "%~dp0"',
+              "set KYTY_TRACKING_DIAGNOSTICS=$mode",
               'set KYTY_TRACKING_PAUSE=',
               'set KYTY_BDA_SLICE_FILTER=',
-              "set KYTY_TRACKING_DIAGNOSTICS=$mode",
-              $(if ($mode -eq 1) {
-                'set KYTY_DEBUG_QUEUES=1'
-              } else {
-                'set KYTY_DEBUG_QUEUES='
-              }),
               'set KYTY_SPECULATE_DRAWS=1',
               'set KYTY_LIGHT_DRAIN_STATS=1',
-              $(if ($mode -eq 1) {
-                'set KYTY_DEBUG_SAMPLE_GPU=20000'
-              } else {
-                'set KYTY_DEBUG_SAMPLE_GPU='
-              }),
-              $(if ($mode -eq 1) {
-                'set KYTY_DEBUG_DUMP_THREADS=5'
-              } else {
-                'set KYTY_DEBUG_DUMP_THREADS='
-              }),
+              'set KYTY_DEBUG_QUEUES=',
+              'set KYTY_DEBUG_SAMPLE_GPU=',
+              'set KYTY_DEBUG_DUMP_THREADS=',
               'set KYTY_DEBUG_DRAW_PHASES=',
               'set KYTY_DEBUG_DRAW_STATS=',
               'set KYTY_DEBUG_SPEC_STATS=',
@@ -482,19 +451,11 @@ jobs:
             throw "Emulator PDB missing"
           }
           Copy-Item $pdb $install -Force
-          @(
-            "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Comparacion.cmd: diagnostics disabled.",
-            "Diagnostico-7.cmd: tracking timings, queues and CPU counters.",
-            "Copy your working _Patches; select THIS interpreter.",
-            "Close all emulator processes before changing modes.",
-            "Profiling affects timing."
-          ) | Set-Content "$install/PRUEBA-7.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Windows-AMD-Prueba-7-Diagnostico.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-8-Protecciones.zip"
           Compress-Archive `
             -Path "_Build/windows/install/*" `
             -DestinationPath $zip `
@@ -510,7 +471,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-7-Diagnostico
-          path: KytyPS5-Windows-AMD-Prueba-7-Diagnostico.zip
+          name: KytyPS5-Windows-AMD-Prueba-8-Protecciones
+          path: KytyPS5-Windows-AMD-Prueba-8-Protecciones.zip
           if-no-files-found: error
           retention-days: 7
