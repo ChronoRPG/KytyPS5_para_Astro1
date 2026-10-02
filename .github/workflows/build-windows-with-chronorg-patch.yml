@@ -37,12 +37,16 @@ jobs:
           $ErrorActionPreference = "Stop"
           $expected = "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9"
           $actual = git rev-parse HEAD
+
           if ($LASTEXITCODE -ne 0) {
             throw "Could not read source commit"
           }
+
           if ($actual -ne $expected) {
             throw "Unexpected source commit: $actual"
           }
+
+          Write-Host "AMD base verified: $actual"
 
       - name: Apply lightweight diagnostics patch
         run: |
@@ -95,6 +99,7 @@ jobs:
 
           print("Vertex metadata optimization applied")
           '@ | python -
+
           if ($LASTEXITCODE -ne 0) {
             throw "Metadata adaptation failed"
           }
@@ -130,6 +135,8 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               throw "Patch application failed: $commit"
             }
+
+            Write-Host "Applied upstream commit: $commit"
           }
 
       - name: Apply tracking pause experiment
@@ -163,6 +170,7 @@ jobs:
           p.write_text(s, encoding='utf-8', newline='\n')
           print('Tracking pause patch applied; default off')
           '@ | python -
+
           if ($LASTEXITCODE -ne 0) {
             throw "Tracking pause adaptation failed"
           }
@@ -170,6 +178,7 @@ jobs:
       - name: Verify patched source
         run: |
           $ErrorActionPreference = "Stop"
+
           git diff --check
           if ($LASTEXITCODE -ne 0) {
             throw "Invalid source diff"
@@ -238,8 +247,16 @@ jobs:
 
           $zip = "$env:RUNNER_TEMP/glslang.zip"
           $extract = "$env:RUNNER_TEMP/glslang"
-          Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zip
-          Expand-Archive -Path $zip -DestinationPath $extract -Force
+
+          Invoke-WebRequest `
+            -Uri $asset.browser_download_url `
+            -Headers $headers `
+            -OutFile $zip
+
+          Expand-Archive `
+            -Path $zip `
+            -DestinationPath $extract `
+            -Force
 
           $validator = Get-ChildItem $extract -Filter "glslangValidator.exe" -Recurse |
             Select-Object -First 1
@@ -255,7 +272,8 @@ jobs:
 
           if ($validator.Name -eq "glslang.exe") {
             Copy-Item $validator.FullName `
-              (Join-Path $validator.Directory.FullName "glslangValidator.exe") -Force
+              (Join-Path $validator.Directory.FullName "glslangValidator.exe") `
+              -Force
           }
 
           Add-Content $env:GITHUB_PATH $validator.Directory.FullName
@@ -269,6 +287,8 @@ jobs:
 
       - name: Configure CMake
         run: |
+          $ErrorActionPreference = "Stop"
+
           cmake `
             -S . `
             -B _Build/windows `
@@ -353,6 +373,7 @@ jobs:
           if (-not $maps) {
             throw "Emulator map missing"
           }
+
           foreach ($map in $maps) {
             Copy-Item $map.FullName $install -Force
           }
@@ -361,6 +382,7 @@ jobs:
           if (-not (Test-Path $pdb)) {
             throw "Emulator PDB missing"
           }
+
           Copy-Item $pdb $install -Force
 
           @(
@@ -373,26 +395,26 @@ jobs:
             "Symbols included for this exact executable."
           ) | Set-Content "$install/PRUEBA-5.txt" -Encoding ascii
 
-          - name: Create Windows ZIP
-            run: |
-             $ErrorActionPreference = "Stop"
-             $zip = "KytyPS5-Windows-AMD-Prueba-5-Bloqueo.zip"
+      - name: Create Windows ZIP
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "KytyPS5-Windows-AMD-Prueba-5-Bloqueo.zip"
 
-             Compress-Archive `
-               -Path "_Build/windows/install/*" `
-               -DestinationPath $zip `
-               -Force `
-               -ErrorAction Stop
+          Compress-Archive `
+            -Path "_Build/windows/install/*" `
+            -DestinationPath $zip `
+            -Force `
+            -ErrorAction Stop
 
-             if (-not (Test-Path $zip)) {
-               throw "ZIP file was not created"
-             }
+          if (-not (Test-Path $zip)) {
+            throw "ZIP file was not created"
+          }
 
-             if ((Get-Item $zip).Length -eq 0) {
-               throw "ZIP file is empty"
-             }
+          if ((Get-Item $zip).Length -eq 0) {
+            throw "ZIP file is empty"
+          }
 
-             Write-Host "ZIP created successfully"
+          Write-Host "ZIP created successfully"
 
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
