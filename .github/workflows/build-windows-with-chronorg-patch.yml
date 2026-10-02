@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 2 - Sincronizacion
+name: Windows AMD - Prueba 3 - Memoria
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + ordered suspend
+    name: Windows x64 - AMD base + BDA dirty bounds
     runs-on: windows-2022
 
     defaults:
@@ -49,6 +49,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $patch = "_patch_source/patches/KytyPS5_light_drain_stats.patch"
+
           if (-not (Test-Path $patch)) {
             throw "Missing patch: $patch"
           }
@@ -99,106 +100,119 @@ jobs:
             throw "Metadata adaptation failed"
           }
 
-      - name: Apply experimental ordered suspend
+      - name: Apply BDA dirty bounds experiment
         run: |
           $ErrorActionPreference = "Stop"
           @'
           from pathlib import Path
 
-          def replace_once(path, old, new):
-              p = Path(path)
-              text = p.read_text(encoding="utf-8")
-              if text.count(old) != 1:
-                  raise RuntimeError("Unexpected source: " + path + " / " + old[:60])
-              p.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
+          p = Path('src/graphics/host_gpu/renderer/cache/bufferCache.cpp')
+          s = p.read_text(encoding='utf-8')
 
-          h = "src/graphics/guest_gpu/graphicsRun.h"
-          c = "src/graphics/guest_gpu/graphicsRun.cpp"
+          old = '\t\t\t(void)SynchronizeBuffer(*buffer, owner_begin, owner_end - owner_begin, false, false);'
+          new = '''\t\t\tstatic const bool narrow = [] {
+          \t\t\t\tconst char* value = std::getenv("KYTY_BDA_DIRTY_BOUNDS");
+          \t\t\t\treturn value != nullptr && std::strcmp(value, "1") == 0;
+          \t\t\t}();
+          \t\t\tconst auto bounds = narrow
+          \t\t\t    ? BdaDirtyBounds(dirty, region_begin, cursor, owner_end, TRACKER_PAGE_SIZE)
+          \t\t\t    : std::pair<uint64_t, uint64_t> {owner_begin, owner_end};
+          \t\t\t(void)SynchronizeBuffer(*buffer, bounds.first, bounds.second - bounds.first, false, false);'''
 
-          replace_once(h,
-              "#include <memory>",
-              "#include <memory>\n#include <semaphore>")
+          if s.count(old) != 1:
+              raise RuntimeError('Unexpected SynchronizeDirtyOwners source')
 
-          replace_once(h,
-              "enum class SubmissionType { Graphics, Compute, FlipPreparation };",
-              "enum class SubmissionType { Graphics, Compute, FlipPreparation, OrderedSuspend };")
+          s = s.replace(old, new)
+          include = '#include "common/alignment.h"'
+          if s.count(include) != 1:
+              raise RuntimeError('Unexpected includes')
 
-          replace_once(h,
-              "\tstd::unique_ptr<CommandProcessor>                                m_gfx_cp;",
-              "\t// Shared token can outlive GuestGpu during renderer shutdown.\n"
-              "\tstd::shared_ptr<std::binary_semaphore> m_suspend_ready =\n"
-              "\t    std::make_shared<std::binary_semaphore>(1);\n\n"
-              "\tstd::unique_ptr<CommandProcessor>                                m_gfx_cp;")
+          s = s.replace(include,
+              include + '\n#include "graphics/host_gpu/renderer/cache/bdaDirtyBounds.h"')
+          p.write_text(s, encoding='utf-8', newline='\n')
 
-          replace_once(c,
-              "static thread_local CommandProcessor* g_current_processor = nullptr;",
-              """// Experimental adaptation of upstream 840b9f5.
-          static bool OrderedSuspendEnabled() {
-              static const bool enabled = [] {
-                  const char* value = std::getenv("KYTY_ORDERED_SUSPEND");
-                  return value != nullptr && value[0] == '1' && value[1] == '\\0';
-              }();
-              return enabled;
+          header = '''#pragma once
+          #include <algorithm>
+          #include <cstddef>
+          #include <cstdint>
+          #include <utility>
+
+          namespace Libs::Graphics {
+          // Trim clean boundary pages while preserving one scan per owner.
+          template <typename Bits>
+          std::pair<uint64_t, uint64_t> BdaDirtyBounds(const Bits& dirty, uint64_t region,
+                                                    uint64_t cursor, uint64_t owner_end,
+                                                    uint64_t page_size) {
+              const auto limit = static_cast<size_t>((owner_end - region + page_size - 1) / page_size);
+              const auto last = dirty.LastRangeFrom(limit).second;
+              const auto end = std::min(owner_end, region + last * page_size);
+              return {cursor, end > cursor ? end : owner_end};
           }
+          }
+          '''
+          Path('src/graphics/host_gpu/renderer/cache/bdaDirtyBounds.h').write_text(
+              header, encoding='utf-8')
 
-          static thread_local CommandProcessor* g_current_processor = nullptr;""")
+          test = '''#include "common/bitArray.h"
+          #include "graphics/host_gpu/renderer/cache/bdaDirtyBounds.h"
+          #include <algorithm>
+          #include <cstdio>
+          #include <cstdlib>
 
-          replace_once(c,
-              "\tm_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);",
-              "\tm_gfx_cp = std::make_unique<CommandProcessor>(renderer, 0);\n"
-              "\tif (OrderedSuspendEnabled()) { m_gfx_cp->Reset(); }")
+          int main() {
+              unsigned long long state = 17;
+              auto random = [&] {
+                  state = state * 6364136223846793005ULL + 1;
+                  return state;
+              };
+              constexpr uint64_t page = 16, region = 4096;
 
-          replace_once(c,
-              "void GuestGpu::Done() {\n\tGpuMutexLock lock(m_submission_mutex);",
-              """void GuestGpu::Done() {
-              if (OrderedSuspendEnabled()) {
-                  EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
-                  // Wait for the previous point without holding a queue lock.
-                  m_suspend_ready->acquire();
-                  GpuMutexLock lock(m_submission_mutex);
-                  Submission submission;
-                  submission.type = SubmissionType::OrderedSuspend;
-                  Enqueue(std::move(submission));
-                  m_done_num++;
-                  return;
+              for (int trial = 0; trial < 20000; ++trial) {
+                  Common::BitArray<128> bits;
+                  for (size_t i = 0; i < 128; ++i) {
+                      if (random() % 7 == 0) bits.Set(i);
+                  }
+
+                  const uint64_t begin = region + random() % (128 * page);
+                  const uint64_t end = begin + 1 + random() % (region + 128 * page - begin);
+                  uint64_t cursor = end;
+
+                  for (size_t i = 0; i < 128; ++i) {
+                      const auto lo = region + i * page;
+                      const auto hi = lo + page;
+                      if (bits.Get(i) && lo < end && hi > begin) {
+                          cursor = std::max(begin, lo);
+                          break;
+                      }
+                  }
+
+                  if (cursor == end) continue;
+                  const auto bounds = Libs::Graphics::BdaDirtyBounds(
+                      bits, region, cursor, end, page);
+
+                  if (bounds.first < begin || bounds.second > end ||
+                      bounds.first >= bounds.second) {
+                      std::abort();
+                  }
+
+                  for (size_t i = 0; i < 128; ++i) {
+                      const auto lo = std::max(begin, region + i * page);
+                      const auto hi = std::min(end, region + (i + 1) * page);
+                      if (bits.Get(i) && lo < hi &&
+                          (bounds.first > lo || bounds.second < hi)) {
+                          std::abort();
+                      }
+                  }
               }
-          \tGpuMutexLock lock(m_submission_mutex);""")
 
-          replace_once(c,
-              "if (first_slice && submission.reset_processor) {",
-              "if (first_slice && submission.reset_processor && !OrderedSuspendEnabled()) {")
-
-          replace_once(c,
-              "\tm_index_buffer_size                = 0;\n\tm_user_data_marker",
-              "\tm_index_buffer_size                = 0;\n"
-              "\tif (OrderedSuspendEnabled()) {\n"
-              "\t\tm_index_base_addr = 0;\n"
-              "\t\tm_num_instances = 1;\n"
-              "\t\tm_num_instances_address = 0;\n"
-              "\t\tm_predicate_skip = false;\n"
-              "\t}\n\tm_user_data_marker")
-
-          replace_once(c,
-              "\t\tcase SubmissionType::FlipPreparation:\n"
-              "\t\t\tm_renderer.RunGarbageCollector();\n"
-              "\t\t\tcp.PrepareCpuFlip(submission.flip_request_id);\n"
-              "\t\t\tbreak;",
-              "\t\tcase SubmissionType::FlipPreparation:\n"
-              "\t\t\tm_renderer.RunGarbageCollector();\n"
-              "\t\t\tcp.PrepareCpuFlip(submission.flip_request_id);\n"
-              "\t\t\tbreak;\n"
-              "\t\tcase SubmissionType::OrderedSuspend:\n"
-              "\t\t\tcp.EmitGlobalBarrier();\n"
-              "\t\t\tm_renderer.GetCommandScheduler().DeferPriorityOperation(\n"
-              "\t\t\t    [ready = m_suspend_ready] { ready->release(); });\n"
-              "\t\t\tcp.BufferFlush();\n"
-              "\t\t\tcp.Reset();\n"
-              "\t\t\tbreak;")
-
-          print("Ordered suspend experiment applied; selectable with KYTY_ORDERED_SUSPEND")
+              std::puts("BDA dirty bounds: 20000 randomized coverage cases passed");
+          }
+          '''
+          Path('tests/BdaDirtyBoundsTests.cpp').write_text(test, encoding='utf-8')
+          print('BDA bounds experiment applied; default off')
           '@ | python -
           if ($LASTEXITCODE -ne 0) {
-            throw "Suspend adaptation failed"
+            throw "BDA adaptation failed"
           }
 
       - name: Verify patched source
@@ -218,11 +232,6 @@ jobs:
           $stats = Get-Content "src/graphics/host_gpu/renderer/drainStats.cpp" -Raw
           if (-not $stats.Contains("KYTY_LIGHT_DRAIN_STATS")) {
             throw "Light diagnostics verification failed"
-          }
-
-          $gpu = Get-Content "src/graphics/guest_gpu/graphicsRun.cpp" -Raw
-          if (-not $gpu.Contains("KYTY_ORDERED_SUSPEND")) {
-            throw "Ordered suspend verification failed"
           }
 
           git diff --stat
@@ -255,65 +264,55 @@ jobs:
       - name: Install glslang
         run: |
           $ErrorActionPreference = "Stop"
-          $apiUrl = "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot"
           $headers = @{
             "User-Agent" = "GitHub-Actions-KytyPS5"
             "Accept" = "application/vnd.github+json"
           }
 
-          $release = Invoke-RestMethod -Uri $apiUrl -Headers $headers
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" `
+            -Headers $headers
 
-          $asset = $release.assets |
-            Where-Object {
-              $_.name -match "(?i)windows" -and
-              $_.name -match "(?i)(x64|x86_64|amd64)" -and
-              $_.name -match "(?i)\.zip$"
-            } |
-            Select-Object -First 1
+          $asset = $release.assets | Where-Object {
+            $_.name -match "(?i)windows" -and
+            $_.name -match "(?i)(x64|x86_64|amd64)" -and
+            $_.name -match "(?i)\.zip$"
+          } | Select-Object -First 1
 
           if (-not $asset) {
-            $asset = $release.assets |
-              Where-Object {
-                $_.name -match "(?i)windows" -and
-                $_.name -match "(?i)\.zip$"
-              } |
-              Select-Object -First 1
+            $asset = $release.assets | Where-Object {
+              $_.name -match "(?i)windows" -and
+              $_.name -match "(?i)\.zip$"
+            } | Select-Object -First 1
           }
 
           if (-not $asset) {
             throw "No Windows glslang ZIP found"
           }
 
-          $zip = "$env:RUNNER_TEMP\glslang.zip"
-          $extract = "$env:RUNNER_TEMP\glslang"
+          $zip = "$env:RUNNER_TEMP/glslang.zip"
+          $extract = "$env:RUNNER_TEMP/glslang"
           Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zip
-
-          if (Test-Path $extract) {
-            Remove-Item -Path $extract -Recurse -Force
-          }
-
-          New-Item -ItemType Directory -Path $extract -Force | Out-Null
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          $validator = Get-ChildItem -Path $extract -Filter "glslangValidator.exe" -Recurse |
+          $validator = Get-ChildItem $extract -Filter "glslangValidator.exe" -Recurse |
             Select-Object -First 1
 
           if (-not $validator) {
-            $validator = Get-ChildItem -Path $extract -Filter "glslang.exe" -Recurse |
+            $validator = Get-ChildItem $extract -Filter "glslang.exe" -Recurse |
               Select-Object -First 1
           }
 
           if (-not $validator) {
-            throw "glslang executable not found"
+            throw "glslang executable missing"
           }
 
-          $glslangBin = $validator.Directory.FullName
           if ($validator.Name -eq "glslang.exe") {
-            Copy-Item -Path $validator.FullName `
-              -Destination (Join-Path $glslangBin "glslangValidator.exe") -Force
+            Copy-Item $validator.FullName `
+              (Join-Path $validator.Directory.FullName "glslangValidator.exe") -Force
           }
 
-          Add-Content -Path $env:GITHUB_PATH -Value $glslangBin
+          Add-Content $env:GITHUB_PATH $validator.Directory.FullName
 
       - name: Verify glslang
         run: |
@@ -360,6 +359,21 @@ jobs:
             throw "Vertex metadata tests failed"
           }
 
+      - name: Test BDA dirty bounds
+        run: |
+          clang-cl /nologo /std:c++20 /EHsc /Isrc `
+            tests/BdaDirtyBoundsTests.cpp `
+            /Fe:_Build/windows/bda_bounds_tests.exe
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Bounds test compilation failed"
+          }
+
+          & "_Build/windows/bda_bounds_tests.exe"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Bounds coverage tests failed"
+          }
+
       - name: Install KytyPS5
         run: |
           cmake `
@@ -374,14 +388,13 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $install = "_Build/windows/install"
-
           if (-not (Test-Path "$install/launcher.exe")) {
             throw "launcher.exe missing"
           }
 
           foreach ($mode in @(0, 1)) {
             $name = if ($mode -eq 1) {
-              "Prueba-2.cmd"
+              "Prueba-3.cmd"
             } else {
               "Comparacion.cmd"
             }
@@ -390,7 +403,8 @@ jobs:
               '@echo off',
               'setlocal',
               'cd /d "%~dp0"',
-              "set KYTY_ORDERED_SUSPEND=$mode",
+              "set KYTY_BDA_DIRTY_BOUNDS=$mode",
+              'set KYTY_ORDERED_SUSPEND=0',
               'set KYTY_GPU_READBACK_WINDOW_KIB=',
               'set KYTY_LIGHT_DRAIN_STATS=1',
               'set KYTY_DEBUG_DRAW_PHASES=',
@@ -404,31 +418,27 @@ jobs:
           }
 
           @(
-            "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Vertex metadata optimization retained from test 1.",
-            "Experimental suspend-point adaptation from upstream 840b9f5.",
-            "Prueba-2.cmd: ordered suspend enabled.",
-            "Comparacion.cmd: original AMD suspend behavior.",
-            "Close all emulator and launcher processes before changing mode.",
-            "Copy your working _Patches folder beside launcher.exe.",
-            "Select THIS folder's kyty_emulator.exe in the launcher.",
-            "Keep the same settings in both modes; gpu_frames_ahead = 0.",
-            "Original readback window; light diagnostics retained.",
-            "No FPS improvement guaranteed."
-          ) | Set-Content "$install/PRUEBA-2.txt" -Encoding ascii
+            "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
+            "Metadata optimization retained; original suspend and readback.",
+            "Prueba-3.cmd: trim clean BDA owner boundary pages.",
+            "Comparacion.cmd: original BDA owner range.",
+            "Copy _Patches from the working build; select THIS interpreter.",
+            "Close emulator and launcher completely before switching mode.",
+            "Keep identical settings in both modes; no guaranteed FPS gain."
+          ) | Set-Content "$install/PRUEBA-3.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-2-Sincronizacion.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-3-Memoria.zip" `
             -Force
 
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-2-Sincronizacion
-          path: KytyPS5-Windows-AMD-Prueba-2-Sincronizacion.zip
+          name: KytyPS5-Windows-AMD-Prueba-3-Memoria
+          path: KytyPS5-Windows-AMD-Prueba-3-Memoria.zip
           if-no-files-found: error
           retention-days: 7
