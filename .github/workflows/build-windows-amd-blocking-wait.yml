@@ -1,0 +1,429 @@
+name: Windows AMD - Prueba 10 - Espera de memoria
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 - AMD base + optional blocking wait
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout fixed AMD base
+        uses: actions/checkout@v4
+        with:
+          ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout patches from workflow revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: _patch_source
+          sparse-checkout: patches
+          fetch-depth: 1
+          submodules: false
+
+      - name: Verify AMD base
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $expected = "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9"
+          $actual = git rev-parse HEAD
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not read source commit"
+          }
+
+          if ($actual -ne $expected) {
+            throw "Unexpected source commit: $actual"
+          }
+
+          Write-Host "AMD base verified: $actual"
+
+      - name: Apply lightweight diagnostics patch
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $patch = "_patch_source/patches/KytyPS5_light_drain_stats.patch"
+
+          if (-not (Test-Path $patch)) {
+            throw "Missing patch: $patch"
+          }
+
+          git apply --ignore-whitespace --check $patch
+          if ($LASTEXITCODE -ne 0) {
+            throw "Light diagnostics patch does not apply to AMD base"
+          }
+
+          git apply --ignore-whitespace $patch
+          if ($LASTEXITCODE -ne 0) {
+            throw "Light diagnostics patch application failed"
+          }
+
+          Write-Host "Light diagnostics patch applied"
+
+      - name: Adapt upstream vertex metadata optimization
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding="utf-8")
+              if text.count(old) != 1:
+                  raise RuntimeError("Unexpected source: " + path)
+              p.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
+
+          header = "src/graphics/shader/shaderVertexMetadata.h"
+          replace_once(header, "#include <array>", "#include <span>")
+          replace_once(header,
+              "std::array<ShaderSemantic, ShaderVertexInputInfo::RES_MAX> input_semantics {};",
+              "std::span<const ShaderSemantic> input_semantics {};")
+          replace_once(header,
+              "// Copies the small AGC metadata subset used by the vertex path after validating every guest range.",
+              "// Validates vertex metadata and borrows its semantics for immediate draw preparation.")
+          source = "src/graphics/shader/shaderVertexMetadata.cpp"
+          replace_once(source,
+              "\tconst auto semantic_size =\n\t    static_cast<uint64_t>(data.num_input_semantics) * sizeof(ShaderSemantic);\n",
+              "")
+          replace_once(source,
+              "std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);",
+              "next.input_semantics = {data.input_semantics, data.num_input_semantics};")
+          # Keep the existing count and call interface used by this AMD fork.
+          # Existing tests still cover range checks and unchanged output on rejection.
+          print("Adapted upstream e57c37f: vertex semantics view applied")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw "Metadata adaptation failed" }
+
+      - name: Apply pinned upstream optimizations
+        run: |
+          $ErrorActionPreference = "Stop"
+          $repo = "https://github.com/KytyPS5/KytyPS5.git"
+          $commits = @(
+            "a67a033ff88406707f47492a7cdcfef736973d66",
+            "f3dc5ee4a9e0725b17bd3e0a4ad1bdbeb0afc8a9"
+          )
+          foreach ($commit in $commits) {
+            git fetch --no-tags --depth=2 $repo $commit
+            if ($LASTEXITCODE -ne 0) { throw "Could not fetch $commit" }
+            $patch = Join-Path $env:RUNNER_TEMP "$commit.patch"
+            git diff --output=$patch "$commit^" $commit -- src
+            if ($LASTEXITCODE -ne 0) { throw "Could not generate $commit patch" }
+            git apply --check $patch
+            if ($LASTEXITCODE -ne 0) { throw "Patch does not apply: $commit" }
+            git apply $patch
+            if ($LASTEXITCODE -ne 0) { throw "Patch application failed: $commit" }
+          }
+
+      - name: Add optional blocking tracking wait
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          p = Path("src/graphics/host_gpu/regionManager.h")
+          s = p.read_text(encoding="utf-8")
+          def replace_once(old, new):
+              global s
+              if s.count(old) != 1:
+                  raise RuntimeError("Unexpected tracking lock source: " + repr(old))
+              s = s.replace(old, new)
+
+          replace_once("#include <atomic>", "#include <atomic>\n#include <cstdlib>\n#include <cstring>")
+          replace_once("\t\t\tstd::atomic_signal_fence(std::memory_order_seq_cst);", """\t\t\tif (BlockingWait()) {
+          \t\t\t\t// Recheck after waking; test_and_set still acquires ownership.
+          \t\t\t\tm_lock.wait(true, std::memory_order_relaxed);
+          \t\t\t} else {
+          \t\t\t\tstd::atomic_signal_fence(std::memory_order_seq_cst);
+          \t\t\t}""")
+          replace_once("\t\tm_lock.clear(std::memory_order_release);", """\t\tm_lock.clear(std::memory_order_release);
+          \t\tif (BlockingWait()) {
+          \t\t\tm_lock.notify_one();
+          \t\t}""")
+          replace_once("private:\n\tstatic uint32_t CurrentThread() noexcept {", """private:
+          \tstatic bool BlockingWait() noexcept {
+          \t\tstatic const bool enabled = [] {
+          \t\t\tconst char* v = std::getenv("KYTY_TRACKING_BLOCKING_WAIT");
+          \t\t\treturn v && std::strcmp(v, "1") == 0;
+          \t\t}();
+          \t\treturn enabled;
+          \t}
+          \tstatic uint32_t CurrentThread() noexcept {""")
+          p.write_text(s, encoding="utf-8", newline="\n")
+          start = s.index("class TrackingSpinLock final")
+          end = s.index("\nstatic_assert", start)
+          fixture = r'''#include <atomic>
+          #include <chrono>
+          #include <cstdlib>
+          #include <cstring>
+          #include <cstdio>
+          #include <cstdint>
+          #include <thread>
+          #include <vector>
+          #if defined(_WIN32)
+          #define KYTY_PLATFORM 1
+          #define KYTY_PLATFORM_WINDOWS 1
+          #include <windows.h>
+          #else
+          #define KYTY_PLATFORM 0
+          #define KYTY_PLATFORM_WINDOWS 1
+          #include <unistd.h>
+          #include <sys/syscall.h>
+          #endif
+          #define EXIT(...) std::abort()
+          #define EXIT_NOT_IMPLEMENTED(x) do { if (x) std::abort(); } while (0)
+          ''' + s[start:end] + r'''
+          int main() {
+              TrackingSpinLock lock;
+              uint64_t count = 0;
+              std::atomic_bool go = false;
+              std::vector<std::thread> threads;
+              for (int i = 0; i < 8; ++i) threads.emplace_back([&] {
+                  while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+                  for (int j = 0; j < 10000; ++j) {
+                      lock.lock();
+                      ++count;
+                      if (j % 1000 == 0) std::this_thread::sleep_for(std::chrono::microseconds(100));
+                      lock.unlock();
+                  }
+              });
+              go.store(true, std::memory_order_release);
+              for (auto& t : threads) t.join();
+              if (count != 80000) std::abort();
+              // A fresh set of waiters checks progress across repeated contention waves.
+              for (int wave = 0; wave < 20; ++wave) {
+                  threads.clear();
+                  lock.lock();
+                  for (int i = 0; i < 8; ++i) threads.emplace_back([&] {
+                      lock.lock(); ++count; lock.unlock();
+                  });
+                  std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                  lock.unlock();
+                  for (auto& t : threads) t.join();
+              }
+              if (count != 80160) std::abort();
+              std::puts("Tracking lock: mutual exclusion and all contention waves passed");
+          }
+          '''
+          Path("tests/TrackingBlockingStandalone.cpp").write_text(fixture, encoding="utf-8", newline="\n")
+          print("Prueba 10: optional atomic wait/notify; ownership and memory ordering retained")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw "Blocking wait adaptation failed" }
+
+      - name: Verify patched source
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          git diff --check
+          if ($LASTEXITCODE -ne 0) {
+            throw "Invalid source diff"
+          }
+
+          $config = Get-Content "src/common/emulatorConfig.h" -Raw
+
+          if ($config -notmatch 'gpu_frames_ahead\s*=\s*0\s*;') {
+            throw "Expected original gpu_frames_ahead = 0"
+          }
+
+          $statsSource = Get-Content `
+            "src/graphics/host_gpu/renderer/drainStats.cpp" -Raw
+
+          if (-not $statsSource.Contains("KYTY_LIGHT_DRAIN_STATS")) {
+            throw "Light diagnostics patch verification failed"
+          }
+
+          git diff --stat
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: 18
+          platform: x64
+          cygwin: 0
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qt5compat
+          cache: true
+
+      - name: Install glslang
+        run: |
+          $ErrorActionPreference = "Stop"
+          $headers = @{ "User-Agent" = "GitHub-Actions-KytyPS5"; "Accept" = "application/vnd.github+json" }
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers
+          $asset = $release.assets | Where-Object {
+            $_.name -match "(?i)windows" -and $_.name -match "(?i)(x64|x86_64|amd64)" -and $_.name -match "(?i)\.zip$"
+          } | Select-Object -First 1
+          if (-not $asset) {
+            $asset = $release.assets | Where-Object {
+              $_.name -match "(?i)windows" -and $_.name -match "(?i)\.zip$"
+            } | Select-Object -First 1
+          }
+          if (-not $asset) { throw "No Windows glslang ZIP found" }
+          $zip = "$env:RUNNER_TEMP/glslang.zip"
+          $extract = "$env:RUNNER_TEMP/glslang"
+          Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $extract -Force
+          $validator = Get-ChildItem $extract -Filter "glslangValidator.exe" -Recurse | Select-Object -First 1
+          if (-not $validator) {
+            $validator = Get-ChildItem $extract -Filter "glslang.exe" -Recurse | Select-Object -First 1
+          }
+          if (-not $validator) { throw "glslang executable missing" }
+          if ($validator.Name -eq "glslang.exe") {
+            Copy-Item $validator.FullName (Join-Path $validator.Directory.FullName "glslangValidator.exe") -Force
+          }
+          Add-Content $env:GITHUB_PATH $validator.Directory.FullName
+
+      - name: Verify glslang
+        run: |
+          glslangValidator --version
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "glslang verification failed"
+          }
+
+      - name: Test tracking lock in both modes
+        timeout-minutes: 2
+        run: |
+          clang-cl /nologo /std:c++20 /EHsc /O2 tests/TrackingBlockingStandalone.cpp /Fe:TrackingBlockingStandalone.exe
+          if ($LASTEXITCODE -ne 0) { throw "Standalone tracking lock build failed" }
+          foreach ($mode in @(0, 1)) {
+            $env:KYTY_TRACKING_BLOCKING_WAIT = "$mode"
+            ./TrackingBlockingStandalone.exe
+            if ($LASTEXITCODE -ne 0) { throw "Tracking lock test failed in mode $mode" }
+          }
+          Remove-Item Env:KYTY_TRACKING_BLOCKING_WAIT
+
+      - name: Configure CMake
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake `
+            -S . `
+            -B _Build/windows `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed"
+          }
+
+      - name: Build KytyPS5
+        run: |
+          cmake `
+            --build _Build/windows `
+            --target launcher shader_vertex_metadata_tests memory_tracker_tests shader_cfg_tests virtual_memory_allocation_tests `
+            --parallel
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed"
+          }
+
+      - name: Test memory and shader paths
+        run: |
+          ctest --test-dir _Build/windows -R '^(shader_vertex_metadata|memory_tracker|shader_cfg|virtual_memory_allocation)$' --output-on-failure --no-tests=error
+          if ($LASTEXITCODE -ne 0) { throw "Memory or shader tests failed" }
+
+      - name: Install KytyPS5
+        run: |
+          cmake `
+            --install _Build/windows `
+            --prefix _Build/windows/install
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Install failed"
+          }
+
+      - name: Package launchers and symbols
+        run: |
+          $ErrorActionPreference = "Stop"
+          $install = "_Build/windows/install"
+          if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
+          foreach ($mode in @(0, 1)) {
+            $name = if ($mode -eq 1) { "Prueba-10.cmd" } else { "Comparacion.cmd" }
+            @(
+              '@echo off',
+              'setlocal',
+              'cd /d "%~dp0"',
+              'set KYTY_TRACKING_PAUSE=',
+              'set KYTY_BDA_SLICE_FILTER=',
+              'set KYTY_TRACKING_DIAGNOSTICS=',
+              'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
+              "set KYTY_TRACKING_BLOCKING_WAIT=$mode",
+              'set KYTY_DEBUG_QUEUES=',
+              'set KYTY_SPECULATE_DRAWS=1',
+              'set KYTY_LIGHT_DRAIN_STATS=1',
+              'set KYTY_DEBUG_SAMPLE_GPU=',
+              'set KYTY_DEBUG_DUMP_THREADS=',
+              'set KYTY_DEBUG_DRAW_PHASES=',
+              'set KYTY_DEBUG_DRAW_STATS=',
+              'set KYTY_DEBUG_SPEC_STATS=',
+              'set KYTY_DEBUG_STREAM_STATS=',
+              'set KYTY_DEBUG_UPLOADS=',
+              'set KYTY_GPU_ZONES=',
+              '"%~dp0launcher.exe" %*'
+            ) | Set-Content "$install/$name" -Encoding ascii
+          }
+          $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
+          if (-not $maps) { throw "Emulator map missing" }
+          foreach ($map in $maps) { Copy-Item $map.FullName $install -Force }
+          $pdb = "_Build/windows/kyty_emulator.pdb"
+          if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
+          Copy-Item $pdb $install -Force
+          @(
+            "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
+            "Upstream a67a033 and f3dc5ee retained.",
+            "Comparacion.cmd: original tracking spin wait.",
+            "Prueba-10.cmd: blocked tracking wait instead of repeated atomic exchanges.",
+            "Copy your working _Patches; select THIS interpreter.",
+            "Close all emulator and launcher processes before switching mode.",
+            "No capture required: compare FPS, CPU, freezes and graphics."
+          ) | Set-Content "$install/PRUEBA-10.txt" -Encoding ascii
+
+      - name: Create Windows ZIP
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Compress-Archive `
+            -Path "_Build/windows/install/*" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-10-Espera.zip" `
+            -Force -ErrorAction Stop
+
+          $zip = "KytyPS5-Windows-AMD-Prueba-10-Espera.zip"
+          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+            throw "Packaging failed: missing or empty ZIP"
+          }
+
+      - name: Upload KytyPS5
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Windows-AMD-Prueba-10-Espera
+          path: KytyPS5-Windows-AMD-Prueba-10-Espera.zip
+          if-no-files-found: error
+          retention-days: 7
