@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 6 - Filtro de memoria
+name: Windows AMD - Prueba 7 - Diagnostico
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + BDA slice filter
+    name: Windows x64 - AMD base + targeted diagnostics
     runs-on: windows-2022
 
     defaults:
@@ -76,22 +76,17 @@ jobs:
 
           header = "src/graphics/shader/shaderVertexMetadata.h"
           replace_once(header, "#include <array>", "#include <span>")
-          replace_once(
-              header,
+          replace_once(header,
               "std::array<ShaderSemantic, ShaderVertexInputInfo::RES_MAX> input_semantics {};",
               "std::span<const ShaderSemantic> input_semantics {};")
-          replace_once(
-              header,
+          replace_once(header,
               "// Copies the small AGC metadata subset used by the vertex path after validating every guest range.",
               "// Validates vertex metadata and borrows its semantics for immediate draw preparation.")
-
           source = "src/graphics/shader/shaderVertexMetadata.cpp"
-          replace_once(
-              source,
+          replace_once(source,
               "\tconst auto semantic_size =\n\t    static_cast<uint64_t>(data.num_input_semantics) * sizeof(ShaderSemantic);\n",
               "")
-          replace_once(
-              source,
+          replace_once(source,
               "std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);",
               "next.input_semantics = {data.input_semantics, data.num_input_semantics};")
           print("Vertex metadata optimization applied")
@@ -128,53 +123,162 @@ jobs:
             }
           }
 
-      - name: Apply conservative BDA slice filter
+      - name: Add targeted diagnostics
         run: |
           $ErrorActionPreference = "Stop"
           @'
           from pathlib import Path
 
-          p = Path("src/graphics/host_gpu/renderer/cache/bufferCache.cpp")
-          s = p.read_text(encoding="utf-8")
+          header = r'''#pragma once
+          #include <chrono>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
 
-          old = "\tconst auto dirty = m_memory_tracker.SnapshotCpuDirty(*manager);"
+          namespace Libs::Graphics::TrackingDiagnostics {
+          inline bool Enabled() {
+              static const bool enabled = [] {
+                  const char* v = std::getenv("KYTY_TRACKING_DIAGNOSTICS");
+                  return v != nullptr && std::strcmp(v, "1") == 0;
+              }();
+              return enabled;
+          }
+          inline uint64_t Now() {
+              return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                  std::chrono::steady_clock::now().time_since_epoch()).count());
+          }
+          // Called after releasing this tracking lock. Each thread owns its file.
+          inline void Record(uint32_t tid, bool contended, uint64_t wait, uint64_t hold,
+                             uint32_t owner, const void* lock) {
+              struct Totals {
+                  FILE* file = nullptr;
+                  uint64_t bucket = 0, calls = 0, collisions = 0, wait_sum = 0, hold_sum = 0;
+                  uint64_t max_wait = 0, max_hold = 0;
+                  uint32_t max_owner = 0;
+                  const void* max_lock = nullptr;
+                  bool opened = false;
+              };
+              static thread_local Totals t;
+              const auto now = Now();
+              const auto bucket = now / 5000000;
+              if (!t.opened) {
+                  t.opened = true;
+                  char path[96];
+                  std::snprintf(path, sizeof(path), "tracking-waits-%u.csv", tid);
+                  t.file = std::fopen(path, "w");
+                  if (t.file) {
+                      std::fputs("steady_us,tid,calls,contended,wait_us,hold_us,max_wait_us,max_hold_us,observed_owner_tid,lock_address\n", t.file);
+                      std::fflush(t.file);
+                  }
+                  t.bucket = bucket;
+              }
+              if (bucket != t.bucket) {
+                  if (t.file) {
+                      std::fprintf(t.file, "%llu,%u,%llu,%llu,%llu,%llu,%llu,%llu,%u,%p\n",
+                          (unsigned long long)now, tid, (unsigned long long)t.calls,
+                          (unsigned long long)t.collisions, (unsigned long long)t.wait_sum,
+                          (unsigned long long)t.hold_sum, (unsigned long long)t.max_wait,
+                          (unsigned long long)t.max_hold, t.max_owner, t.max_lock);
+                      std::fflush(t.file);
+                  }
+                  t.calls = t.collisions = t.wait_sum = t.hold_sum = t.max_wait = t.max_hold = 0;
+                  t.max_owner = 0; t.max_lock = nullptr; t.bucket = bucket;
+              }
+              ++t.calls;
+              t.collisions += contended ? 1 : 0;
+              t.wait_sum += wait; t.hold_sum += hold;
+              if (wait > t.max_wait) { t.max_wait = wait; t.max_owner = owner; t.max_lock = lock; }
+              if (hold > t.max_hold) { t.max_hold = hold; }
+          }
+          }
+          '''
+          Path("src/graphics/host_gpu/trackingDiagnostics.h").write_text(
+              header, encoding="utf-8", newline="\n")
 
-          new = """\tstatic const bool filter_dirty_slices = [] {
-          \t\tconst char* value = std::getenv("KYTY_BDA_SLICE_FILTER");
-          \t\treturn value != nullptr && std::strcmp(value, "1") == 0;
-          \t}();
-          \tif (filter_dirty_slices) {
-          \t\t// The acquire-loaded summary conservatively identifies dirty slices.
-          \t\t// Preserve the locked snapshot whenever mapped bytes may be dirty.
-          \t\tconst auto slices = manager->CpuDirtySlices();
-          \t\tbool intersects = false;
-          \t\tif (slices != 0) {
-          \t\t\tconstexpr uint64_t slice_bytes =
-          \t\t\t    RegionManager::CPU_DIRTY_SLICE_PAGES * TRACKER_PAGE_SIZE;
-          \t\t\tmapped.ForEachInRange(region_begin, TRACKER_REGION_SIZE,
-          \t\t\t                      [&](uint64_t begin, uint64_t end) {
-          \t\t\t\t                      if (begin >= end) { return; }
-          \t\t\t\t                      const auto first = (begin - region_begin) / slice_bytes;
-          \t\t\t\t                      const auto last = (end - 1 - region_begin) / slice_bytes;
-          \t\t\t\t                      const auto mask = (~uint64_t{0} << first) &
-          \t\t\t\t                                        (~uint64_t{0} >> (63 - last));
-          \t\t\t\t                      intersects = intersects || (slices & mask) != 0;
-          \t\t\t                      });
-          \t\t}
-          \t\tif (!intersects) { return true; }
-          \t}
-          \tconst auto dirty = m_memory_tracker.SnapshotCpuDirty(*manager);"""
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text(encoding="utf-8")
+              if s.count(old) != 1:
+                  raise RuntimeError("Unexpected diagnostic source: " + path + " / " + old[:70])
+              p.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
 
-          if s.count(old) != 1:
-              raise RuntimeError("Unexpected BDA snapshot source")
-          if "#include <cstdlib>" not in s or "#include <cstring>" not in s:
-              raise RuntimeError("Required includes missing")
+          reg = "src/graphics/host_gpu/regionManager.h"
+          replace_once(reg, "#include <algorithm>",
+              '#include "graphics/host_gpu/trackingDiagnostics.h"\n\n#include <algorithm>')
+          replace_once(reg, "\t\tconst auto thread = CurrentThread();",
+              "\t\tconst auto thread = CurrentThread();\n"
+              "\t\tconst bool diagnostic = TrackingDiagnostics::Enabled();\n"
+              "\t\tuint64_t start = 0;\n"
+              "\t\tuint32_t observed_owner = 0;\n"
+              "\t\tbool contended = false;")
+          replace_once(reg, "\t\twhile (m_lock.test_and_set(std::memory_order_acquire)) {",
+              "\t\twhile (m_lock.test_and_set(std::memory_order_acquire)) {\n"
+              "\t\t\tif (diagnostic && !contended) {\n"
+              "\t\t\t\tcontended = true;\n"
+              "\t\t\t\tstart = TrackingDiagnostics::Now();\n"
+              "\t\t\t\tobserved_owner = m_owner.load(std::memory_order_relaxed);\n"
+              "\t\t\t}")
+          replace_once(reg, "\t\tm_owner.store(thread, std::memory_order_relaxed);",
+              "\t\tm_owner.store(thread, std::memory_order_relaxed);\n"
+              "\t\tif (diagnostic) {\n"
+              "\t\t\tm_diag_start = TrackingDiagnostics::Now();\n"
+              "\t\t\tm_diag_wait = contended ? m_diag_start - start : 0;\n"
+              "\t\t\tm_diag_owner = observed_owner;\n"
+              "\t\t\tm_diag_contended = contended;\n"
+              "\t\t}")
+          replace_once(reg,
+              "\t\tm_owner.store(0, std::memory_order_relaxed);\n"
+              "\t\tm_lock.clear(std::memory_order_release);",
+              "\t\tconst bool diagnostic = TrackingDiagnostics::Enabled();\n"
+              "\t\tconst auto wait = diagnostic ? m_diag_wait : 0;\n"
+              "\t\tconst auto hold = diagnostic ? TrackingDiagnostics::Now() - m_diag_start : 0;\n"
+              "\t\tconst auto owner = diagnostic ? m_diag_owner : 0;\n"
+              "\t\tconst auto contended = diagnostic && m_diag_contended;\n"
+              "\t\tm_owner.store(0, std::memory_order_relaxed);\n"
+              "\t\tm_lock.clear(std::memory_order_release);\n"
+              "\t\tif (diagnostic) {\n"
+              "\t\t\tTrackingDiagnostics::Record(CurrentThread(), contended, wait, hold, owner, this);\n"
+              "\t\t}")
+          replace_once(reg, "\tstd::atomic_flag     m_lock = ATOMIC_FLAG_INIT;",
+              "\tuint64_t m_diag_start = 0, m_diag_wait = 0;\n"
+              "\tuint32_t m_diag_owner = 0;\n"
+              "\tbool m_diag_contended = false;\n"
+              "\tstd::atomic_flag     m_lock = ATOMIC_FLAG_INIT;")
 
-          p.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
-          print("BDA slice filter applied; disabled unless explicitly enabled")
+          sampler = "src/graphics/host_gpu/renderer/threadSampler.cpp"
+          replace_once(sampler,
+              '\t\tstd::fprintf(file, "# tid=%lu name=%s\\n", id, name.empty() ? "-" : name.c_str());',
+              "\t\tFILETIME created {}, exited {}, kernel {}, user {};\n"
+              "\t\tuint64_t kernel_us = 0, user_us = 0;\n"
+              "\t\tHANDLE cpu_thread = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, id);\n"
+              "\t\tif (cpu_thread) {\n"
+              "\t\t\tif (GetThreadTimes(cpu_thread, &created, &exited, &kernel, &user)) {\n"
+              "\t\t\t\tkernel_us = ((uint64_t{kernel.dwHighDateTime} << 32) | kernel.dwLowDateTime) / 10;\n"
+              "\t\t\t\tuser_us = ((uint64_t{user.dwHighDateTime} << 32) | user.dwLowDateTime) / 10;\n"
+              "\t\t\t}\n"
+              "\t\t\tCloseHandle(cpu_thread);\n"
+              "\t\t}\n"
+              "\t\tconst auto steady_us = std::chrono::duration_cast<std::chrono::microseconds>(\n"
+              "\t\t    std::chrono::steady_clock::now().time_since_epoch()).count();\n"
+              '\t\tstd::fprintf(file, "# tid=%lu name=%s kernel_us=%llu user_us=%llu steady_us=%llu\\n",\n'
+              '\t\t             id, name.empty() ? "-" : name.c_str(),\n'
+              "\t\t             (unsigned long long)kernel_us, (unsigned long long)user_us,\n"
+              "\t\t             (unsigned long long)steady_us);")
+
+          pthread = "src/kernel/pthread.cpp"
+          replace_once(pthread, "#include <cstring>", "#include <cstring>\n#include <cwchar>")
+          replace_once(pthread, "\tthread->host_thread_id = os_thread_id;",
+              "\tthread->host_thread_id = os_thread_id;\n"
+              "#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS\n"
+              "\twchar_t diagnostic_name[96];\n"
+              '\tstd::swprintf(diagnostic_name, 96, L"Guest-%u", static_cast<unsigned>(thread->unique_id));\n'
+              "\tSetThreadDescription(GetCurrentThread(), diagnostic_name);\n"
+              "#endif")
+          print("Tracking timings, CPU counters and guest worker names installed")
           '@ | python -
           if ($LASTEXITCODE -ne 0) {
-            throw "BDA slice filter adaptation failed"
+            throw "Diagnostics adaptation failed"
           }
 
       - name: Verify patched source
@@ -328,7 +432,7 @@ jobs:
           }
           foreach ($mode in @(0, 1)) {
             $name = if ($mode -eq 1) {
-              "Prueba-6.cmd"
+              "Diagnostico-7.cmd"
             } else {
               "Comparacion.cmd"
             }
@@ -337,11 +441,25 @@ jobs:
               'setlocal',
               'cd /d "%~dp0"',
               'set KYTY_TRACKING_PAUSE=',
-              "set KYTY_BDA_SLICE_FILTER=$mode",
+              'set KYTY_BDA_SLICE_FILTER=',
+              "set KYTY_TRACKING_DIAGNOSTICS=$mode",
+              $(if ($mode -eq 1) {
+                'set KYTY_DEBUG_QUEUES=1'
+              } else {
+                'set KYTY_DEBUG_QUEUES='
+              }),
               'set KYTY_SPECULATE_DRAWS=1',
               'set KYTY_LIGHT_DRAIN_STATS=1',
-              'set KYTY_DEBUG_SAMPLE_GPU=',
-              'set KYTY_DEBUG_DUMP_THREADS=',
+              $(if ($mode -eq 1) {
+                'set KYTY_DEBUG_SAMPLE_GPU=20000'
+              } else {
+                'set KYTY_DEBUG_SAMPLE_GPU='
+              }),
+              $(if ($mode -eq 1) {
+                'set KYTY_DEBUG_DUMP_THREADS=5'
+              } else {
+                'set KYTY_DEBUG_DUMP_THREADS='
+              }),
               'set KYTY_DEBUG_DRAW_PHASES=',
               'set KYTY_DEBUG_DRAW_STATS=',
               'set KYTY_DEBUG_SPEC_STATS=',
@@ -366,18 +484,17 @@ jobs:
           Copy-Item $pdb $install -Force
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Comparacion.cmd: original BDA snapshot.",
-            "Prueba-6.cmd: conservative dirty slice filter.",
-            "Copy your working _Patches.",
-            "Select the interpreter from THIS build.",
-            "Close all emulator processes before switching mode.",
-            "Profiling disabled for performance comparison."
-          ) | Set-Content "$install/PRUEBA-6.txt" -Encoding ascii
+            "Comparacion.cmd: diagnostics disabled.",
+            "Diagnostico-7.cmd: tracking timings, queues and CPU counters.",
+            "Copy your working _Patches; select THIS interpreter.",
+            "Close all emulator processes before changing modes.",
+            "Profiling affects timing."
+          ) | Set-Content "$install/PRUEBA-7.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Windows-AMD-Prueba-6-Filtro.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-7-Diagnostico.zip"
           Compress-Archive `
             -Path "_Build/windows/install/*" `
             -DestinationPath $zip `
@@ -389,12 +506,11 @@ jobs:
           if ((Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: ZIP empty"
           }
-          Write-Host "ZIP created successfully"
 
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-6-Filtro
-          path: KytyPS5-Windows-AMD-Prueba-6-Filtro.zip
+          name: KytyPS5-Windows-AMD-Prueba-7-Diagnostico
+          path: KytyPS5-Windows-AMD-Prueba-7-Diagnostico.zip
           if-no-files-found: error
           retention-days: 7
