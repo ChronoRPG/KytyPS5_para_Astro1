@@ -373,16 +373,26 @@ jobs:
             "Symbols included for this exact executable."
           ) | Set-Content "$install/PRUEBA-5.txt" -Encoding ascii
 
-      - name: Create Windows ZIP
-        run: |
-          Compress-Archive `
-            -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-5-Bloqueo.zip" `
-            -Force
+          - name: Create Windows ZIP
+            run: |
+             $ErrorActionPreference = "Stop"
+             $zip = "KytyPS5-Windows-AMD-Prueba-5-Bloqueo.zip"
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Packaging failed"
-          }
+             Compress-Archive `
+               -Path "_Build/windows/install/*" `
+               -DestinationPath $zip `
+               -Force `
+               -ErrorAction Stop
+
+             if (-not (Test-Path $zip)) {
+               throw "ZIP file was not created"
+             }
+
+             if ((Get-Item $zip).Length -eq 0) {
+               throw "ZIP file is empty"
+             }
+
+             Write-Host "ZIP created successfully"
 
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
