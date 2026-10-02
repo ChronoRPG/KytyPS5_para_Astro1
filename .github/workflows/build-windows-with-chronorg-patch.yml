@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 3 - Memoria
+name: Windows AMD - Prueba 4 - Commits upstream
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + BDA dirty bounds
+    name: Windows x64 - AMD base + upstream optimizations
     runs-on: windows-2022
 
     defaults:
@@ -37,12 +37,14 @@ jobs:
           $ErrorActionPreference = "Stop"
           $expected = "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9"
           $actual = git rev-parse HEAD
+
           if ($LASTEXITCODE -ne 0) {
             throw "Could not read source commit"
           }
           if ($actual -ne $expected) {
             throw "Unexpected source commit: $actual"
           }
+
           Write-Host "AMD base verified: $actual"
 
       - name: Apply lightweight diagnostics patch
@@ -100,119 +102,39 @@ jobs:
             throw "Metadata adaptation failed"
           }
 
-      - name: Apply BDA dirty bounds experiment
+      - name: Apply pinned upstream optimizations
         run: |
           $ErrorActionPreference = "Stop"
-          @'
-          from pathlib import Path
+          $repo = "https://github.com/KytyPS5/KytyPS5.git"
 
-          p = Path('src/graphics/host_gpu/renderer/cache/bufferCache.cpp')
-          s = p.read_text(encoding='utf-8')
+          $commits = @(
+            "a67a033ff88406707f47492a7cdcfef736973d66",
+            "f3dc5ee4a9e0725b17bd3e0a4ad1bdbeb0afc8a9"
+          )
 
-          old = '\t\t\t(void)SynchronizeBuffer(*buffer, owner_begin, owner_end - owner_begin, false, false);'
-          new = '''\t\t\tstatic const bool narrow = [] {
-          \t\t\t\tconst char* value = std::getenv("KYTY_BDA_DIRTY_BOUNDS");
-          \t\t\t\treturn value != nullptr && std::strcmp(value, "1") == 0;
-          \t\t\t}();
-          \t\t\tconst auto bounds = narrow
-          \t\t\t    ? BdaDirtyBounds(dirty, region_begin, cursor, owner_end, TRACKER_PAGE_SIZE)
-          \t\t\t    : std::pair<uint64_t, uint64_t> {owner_begin, owner_end};
-          \t\t\t(void)SynchronizeBuffer(*buffer, bounds.first, bounds.second - bounds.first, false, false);'''
+          foreach ($commit in $commits) {
+            git fetch --no-tags --depth=2 $repo $commit
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not fetch $commit"
+            }
 
-          if s.count(old) != 1:
-              raise RuntimeError('Unexpected SynchronizeDirtyOwners source')
+            $patch = Join-Path $env:RUNNER_TEMP "$commit.patch"
+            git diff --output=$patch "$commit^" $commit -- src
+            if ($LASTEXITCODE -ne 0) {
+              throw "Could not generate $commit patch"
+            }
 
-          s = s.replace(old, new)
-          include = '#include "common/alignment.h"'
-          if s.count(include) != 1:
-              raise RuntimeError('Unexpected includes')
+            git apply --check $patch
+            if ($LASTEXITCODE -ne 0) {
+              throw "Patch does not apply: $commit"
+            }
 
-          s = s.replace(include,
-              include + '\n#include "graphics/host_gpu/renderer/cache/bdaDirtyBounds.h"')
-          p.write_text(s, encoding='utf-8', newline='\n')
+            git apply $patch
+            if ($LASTEXITCODE -ne 0) {
+              throw "Patch application failed: $commit"
+            }
 
-          header = '''#pragma once
-          #include <algorithm>
-          #include <cstddef>
-          #include <cstdint>
-          #include <utility>
-
-          namespace Libs::Graphics {
-          // Trim clean boundary pages while preserving one scan per owner.
-          template <typename Bits>
-          std::pair<uint64_t, uint64_t> BdaDirtyBounds(const Bits& dirty, uint64_t region,
-                                                    uint64_t cursor, uint64_t owner_end,
-                                                    uint64_t page_size) {
-              const auto limit = static_cast<size_t>((owner_end - region + page_size - 1) / page_size);
-              const auto last = dirty.LastRangeFrom(limit).second;
-              const auto end = std::min(owner_end, region + last * page_size);
-              return {cursor, end > cursor ? end : owner_end};
-          }
-          }
-          '''
-          Path('src/graphics/host_gpu/renderer/cache/bdaDirtyBounds.h').write_text(
-              header, encoding='utf-8')
-
-          test = '''#include "common/bitArray.h"
-          #include "graphics/host_gpu/renderer/cache/bdaDirtyBounds.h"
-          #include <algorithm>
-          #include <cstdio>
-          #include <cstdlib>
-
-          int main() {
-              unsigned long long state = 17;
-              auto random = [&] {
-                  state = state * 6364136223846793005ULL + 1;
-                  return state;
-              };
-              constexpr uint64_t page = 16, region = 4096;
-
-              for (int trial = 0; trial < 20000; ++trial) {
-                  Common::BitArray<128> bits;
-                  for (size_t i = 0; i < 128; ++i) {
-                      if (random() % 7 == 0) bits.Set(i);
-                  }
-
-                  const uint64_t begin = region + random() % (128 * page);
-                  const uint64_t end = begin + 1 + random() % (region + 128 * page - begin);
-                  uint64_t cursor = end;
-
-                  for (size_t i = 0; i < 128; ++i) {
-                      const auto lo = region + i * page;
-                      const auto hi = lo + page;
-                      if (bits.Get(i) && lo < end && hi > begin) {
-                          cursor = std::max(begin, lo);
-                          break;
-                      }
-                  }
-
-                  if (cursor == end) continue;
-                  const auto bounds = Libs::Graphics::BdaDirtyBounds(
-                      bits, region, cursor, end, page);
-
-                  if (bounds.first < begin || bounds.second > end ||
-                      bounds.first >= bounds.second) {
-                      std::abort();
-                  }
-
-                  for (size_t i = 0; i < 128; ++i) {
-                      const auto lo = std::max(begin, region + i * page);
-                      const auto hi = std::min(end, region + (i + 1) * page);
-                      if (bits.Get(i) && lo < hi &&
-                          (bounds.first > lo || bounds.second < hi)) {
-                          std::abort();
-                      }
-                  }
-              }
-
-              std::puts("BDA dirty bounds: 20000 randomized coverage cases passed");
-          }
-          '''
-          Path('tests/BdaDirtyBoundsTests.cpp').write_text(test, encoding='utf-8')
-          print('BDA bounds experiment applied; default off')
-          '@ | python -
-          if ($LASTEXITCODE -ne 0) {
-            throw "BDA adaptation failed"
+            Write-Host "Applied upstream commit: $commit"
           }
 
       - name: Verify patched source
@@ -292,6 +214,7 @@ jobs:
 
           $zip = "$env:RUNNER_TEMP/glslang.zip"
           $extract = "$env:RUNNER_TEMP/glslang"
+
           Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
@@ -324,6 +247,7 @@ jobs:
       - name: Configure CMake
         run: |
           $ErrorActionPreference = "Stop"
+
           cmake `
             -S . `
             -B _Build/windows `
@@ -337,41 +261,26 @@ jobs:
             throw "CMake configure failed"
           }
 
-      - name: Build KytyPS5
+      - name: Build KytyPS5 and tests
         run: |
           cmake `
             --build _Build/windows `
-            --target launcher shader_vertex_metadata_tests `
+            --target launcher shader_vertex_metadata_tests memory_tracker_tests shader_cfg_tests `
             --parallel
 
           if ($LASTEXITCODE -ne 0) {
             throw "Build failed"
           }
 
-      - name: Test vertex metadata
+      - name: Test memory and shader paths
         run: |
           ctest --test-dir _Build/windows `
-            -R '^shader_vertex_metadata$' `
+            -R '^(shader_vertex_metadata|memory_tracker|shader_cfg)$' `
             --output-on-failure `
             --no-tests=error
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Vertex metadata tests failed"
-          }
-
-      - name: Test BDA dirty bounds
-        run: |
-          clang-cl /nologo /std:c++20 /EHsc /Isrc `
-            tests/BdaDirtyBoundsTests.cpp `
-            /Fe:_Build/windows/bda_bounds_tests.exe
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Bounds test compilation failed"
-          }
-
-          & "_Build/windows/bda_bounds_tests.exe"
-          if ($LASTEXITCODE -ne 0) {
-            throw "Bounds coverage tests failed"
+            throw "Memory or shader tests failed"
           }
 
       - name: Install KytyPS5
@@ -384,61 +293,58 @@ jobs:
             throw "Install failed"
           }
 
-      - name: Package comparison launchers
+      - name: Package launcher and build identity
         run: |
           $ErrorActionPreference = "Stop"
           $install = "_Build/windows/install"
+
           if (-not (Test-Path "$install/launcher.exe")) {
             throw "launcher.exe missing"
           }
 
-          foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) {
-              "Prueba-3.cmd"
-            } else {
-              "Comparacion.cmd"
-            }
-
-            @(
-              '@echo off',
-              'setlocal',
-              'cd /d "%~dp0"',
-              "set KYTY_BDA_DIRTY_BOUNDS=$mode",
-              'set KYTY_ORDERED_SUSPEND=0',
-              'set KYTY_GPU_READBACK_WINDOW_KIB=',
-              'set KYTY_LIGHT_DRAIN_STATS=1',
-              'set KYTY_DEBUG_DRAW_PHASES=',
-              'set KYTY_DEBUG_DRAW_STATS=',
-              'set KYTY_DEBUG_SPEC_STATS=',
-              'set KYTY_DEBUG_STREAM_STATS=',
-              'set KYTY_DEBUG_UPLOADS=',
-              'set KYTY_GPU_ZONES=',
-              '"%~dp0launcher.exe" %*'
-            ) | Set-Content "$install/$name" -Encoding ascii
-          }
+          @(
+            '@echo off',
+            'setlocal',
+            'cd /d "%~dp0"',
+            'set KYTY_SPECULATE_DRAWS=1',
+            'set KYTY_BDA_DIRTY_BOUNDS=0',
+            'set KYTY_ORDERED_SUSPEND=0',
+            'set KYTY_GPU_READBACK_WINDOW_KIB=',
+            'set KYTY_LIGHT_DRAIN_STATS=1',
+            'set KYTY_DEBUG_DRAW_PHASES=',
+            'set KYTY_DEBUG_DRAW_STATS=',
+            'set KYTY_DEBUG_SPEC_STATS=',
+            'set KYTY_DEBUG_STREAM_STATS=',
+            'set KYTY_DEBUG_UPLOADS=',
+            'set KYTY_GPU_ZONES=',
+            '"%~dp0launcher.exe" %*'
+          ) | Set-Content "$install/Prueba-4.cmd" -Encoding ascii
 
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Metadata optimization retained; original suspend and readback.",
-            "Prueba-3.cmd: trim clean BDA owner boundary pages.",
-            "Comparacion.cmd: original BDA owner range.",
-            "Copy _Patches from the working build; select THIS interpreter.",
-            "Close emulator and launcher completely before switching mode.",
-            "Keep identical settings in both modes; no guaranteed FPS gain."
-          ) | Set-Content "$install/PRUEBA-3.txt" -Encoding ascii
+            "Upstream: a67a033ff88406707f47492a7cdcfef736973d66",
+            "Upstream: f3dc5ee4a9e0725b17bd3e0a4ad1bdbeb0afc8a9",
+            "Vertex metadata adaptation e57c37f retained.",
+            "Original readback and suspend; speculative draws enabled.",
+            "Copy your working _Patches folder beside launcher.exe.",
+            "Select THIS folder's kyty_emulator.exe in the launcher.",
+            "Compare against the previous build with speculation enabled.",
+            "No FPS improvement guaranteed."
+          ) | Set-Content "$install/PRUEBA-4.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
+
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-3-Memoria.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-4-Upstream.zip" `
             -Force
 
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-3-Memoria
-          path: KytyPS5-Windows-AMD-Prueba-3-Memoria.zip
+          name: KytyPS5-Windows-AMD-Prueba-4-Upstream
+          path: KytyPS5-Windows-AMD-Prueba-4-Upstream.zip
           if-no-files-found: error
           retention-days: 7
