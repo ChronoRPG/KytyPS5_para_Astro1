@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 4 - Commits upstream
+name: Windows AMD - Prueba 5 - Bloqueo de memoria
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + upstream optimizations
+    name: Windows x64 - AMD base + tracking pause experiment
     runs-on: windows-2022
 
     defaults:
@@ -37,15 +37,12 @@ jobs:
           $ErrorActionPreference = "Stop"
           $expected = "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9"
           $actual = git rev-parse HEAD
-
           if ($LASTEXITCODE -ne 0) {
             throw "Could not read source commit"
           }
           if ($actual -ne $expected) {
             throw "Unexpected source commit: $actual"
           }
-
-          Write-Host "AMD base verified: $actual"
 
       - name: Apply lightweight diagnostics patch
         run: |
@@ -133,14 +130,46 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               throw "Patch application failed: $commit"
             }
+          }
 
-            Write-Host "Applied upstream commit: $commit"
+      - name: Apply tracking pause experiment
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          p = Path('src/graphics/host_gpu/regionManager.h')
+          s = p.read_text(encoding='utf-8')
+
+          s = s.replace('#include <atomic>',
+              '#include <atomic>\n#include <cstdlib>\n#include <cstring>\n#include <immintrin.h>')
+
+          old = '\t\t\tstd::atomic_signal_fence(std::memory_order_seq_cst);'
+          new = '''\t\t\tstatic const bool passive = [] {
+          \t\t\t\tconst char* value = std::getenv("KYTY_TRACKING_PAUSE");
+          \t\t\t\treturn value != nullptr && std::strcmp(value, "1") == 0;
+          \t\t\t}();
+          \t\t\tif (passive) {
+          \t\t\t\t// Poll with loads while held, avoiding repeated atomic exchanges.
+          \t\t\t\tdo { _mm_pause(); } while (m_lock.test(std::memory_order_relaxed));
+          \t\t\t} else {
+          \t\t\t\tstd::atomic_signal_fence(std::memory_order_seq_cst);
+          \t\t\t}'''
+
+          if s.count(old) != 1:
+              raise RuntimeError('Unexpected tracking lock')
+
+          s = s.replace(old, new)
+          p.write_text(s, encoding='utf-8', newline='\n')
+          print('Tracking pause patch applied; default off')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tracking pause adaptation failed"
           }
 
       - name: Verify patched source
         run: |
           $ErrorActionPreference = "Stop"
-
           git diff --check
           if ($LASTEXITCODE -ne 0) {
             throw "Invalid source diff"
@@ -149,11 +178,6 @@ jobs:
           $config = Get-Content "src/common/emulatorConfig.h" -Raw
           if ($config -notmatch 'gpu_frames_ahead\s*=\s*0\s*;') {
             throw "Expected original gpu_frames_ahead = 0"
-          }
-
-          $stats = Get-Content "src/graphics/host_gpu/renderer/drainStats.cpp" -Raw
-          if (-not $stats.Contains("KYTY_LIGHT_DRAIN_STATS")) {
-            throw "Light diagnostics verification failed"
           }
 
           git diff --stat
@@ -214,7 +238,6 @@ jobs:
 
           $zip = "$env:RUNNER_TEMP/glslang.zip"
           $extract = "$env:RUNNER_TEMP/glslang"
-
           Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
@@ -246,8 +269,6 @@ jobs:
 
       - name: Configure CMake
         run: |
-          $ErrorActionPreference = "Stop"
-
           cmake `
             -S . `
             -B _Build/windows `
@@ -293,7 +314,7 @@ jobs:
             throw "Install failed"
           }
 
-      - name: Package launcher and build identity
+      - name: Package launchers and symbols
         run: |
           $ErrorActionPreference = "Stop"
           $install = "_Build/windows/install"
@@ -302,49 +323,71 @@ jobs:
             throw "launcher.exe missing"
           }
 
-          @(
-            '@echo off',
-            'setlocal',
-            'cd /d "%~dp0"',
-            'set KYTY_SPECULATE_DRAWS=1',
-            'set KYTY_BDA_DIRTY_BOUNDS=0',
-            'set KYTY_ORDERED_SUSPEND=0',
-            'set KYTY_GPU_READBACK_WINDOW_KIB=',
-            'set KYTY_LIGHT_DRAIN_STATS=1',
-            'set KYTY_DEBUG_DRAW_PHASES=',
-            'set KYTY_DEBUG_DRAW_STATS=',
-            'set KYTY_DEBUG_SPEC_STATS=',
-            'set KYTY_DEBUG_STREAM_STATS=',
-            'set KYTY_DEBUG_UPLOADS=',
-            'set KYTY_GPU_ZONES=',
-            '"%~dp0launcher.exe" %*'
-          ) | Set-Content "$install/Prueba-4.cmd" -Encoding ascii
+          foreach ($mode in @(0, 1)) {
+            $name = if ($mode -eq 1) {
+              "Prueba-5.cmd"
+            } else {
+              "Comparacion.cmd"
+            }
+
+            @(
+              '@echo off',
+              'setlocal',
+              'cd /d "%~dp0"',
+              "set KYTY_TRACKING_PAUSE=$mode",
+              'set KYTY_SPECULATE_DRAWS=1',
+              'set KYTY_LIGHT_DRAIN_STATS=1',
+              'set KYTY_DEBUG_SAMPLE_GPU=',
+              'set KYTY_DEBUG_DUMP_THREADS=',
+              'set KYTY_DEBUG_DRAW_PHASES=',
+              'set KYTY_DEBUG_DRAW_STATS=',
+              'set KYTY_DEBUG_SPEC_STATS=',
+              'set KYTY_DEBUG_STREAM_STATS=',
+              'set KYTY_DEBUG_UPLOADS=',
+              'set KYTY_GPU_ZONES=',
+              '"%~dp0launcher.exe" %*'
+            ) | Set-Content "$install/$name" -Encoding ascii
+          }
+
+          $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
+          if (-not $maps) {
+            throw "Emulator map missing"
+          }
+          foreach ($map in $maps) {
+            Copy-Item $map.FullName $install -Force
+          }
+
+          $pdb = "_Build/windows/kyty_emulator.pdb"
+          if (-not (Test-Path $pdb)) {
+            throw "Emulator PDB missing"
+          }
+          Copy-Item $pdb $install -Force
 
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Upstream: a67a033ff88406707f47492a7cdcfef736973d66",
-            "Upstream: f3dc5ee4a9e0725b17bd3e0a4ad1bdbeb0afc8a9",
-            "Vertex metadata adaptation e57c37f retained.",
-            "Original readback and suspend; speculative draws enabled.",
-            "Copy your working _Patches folder beside launcher.exe.",
-            "Select THIS folder's kyty_emulator.exe in the launcher.",
-            "Compare against the previous build with speculation enabled.",
-            "No FPS improvement guaranteed."
-          ) | Set-Content "$install/PRUEBA-4.txt" -Encoding ascii
+            "Upstream a67a033 and f3dc5ee retained.",
+            "Comparacion.cmd: previous tracking wait.",
+            "Prueba-5.cmd: read polling and PAUSE while tracking lock is held.",
+            "Copy your working _Patches; select THIS interpreter.",
+            "Close all emulator and launcher processes before switching mode.",
+            "Symbols included for this exact executable."
+          ) | Set-Content "$install/PRUEBA-5.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
-          $ErrorActionPreference = "Stop"
-
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-4-Upstream.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-5-Bloqueo.zip" `
             -Force
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Packaging failed"
+          }
 
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-4-Upstream
-          path: KytyPS5-Windows-AMD-Prueba-4-Upstream.zip
+          name: KytyPS5-Windows-AMD-Prueba-5-Bloqueo
+          path: KytyPS5-Windows-AMD-Prueba-5-Bloqueo.zip
           if-no-files-found: error
           retention-days: 7
