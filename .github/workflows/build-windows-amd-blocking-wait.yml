@@ -99,8 +99,6 @@ jobs:
           replace_once(source,
               "std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);",
               "next.input_semantics = {data.input_semantics, data.num_input_semantics};")
-          # Keep the existing count and call interface used by this AMD fork.
-          # Existing tests still cover range checks and unchanged output on rejection.
           print("Adapted upstream e57c37f: vertex semantics view applied")
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw "Metadata adaptation failed" }
@@ -133,6 +131,7 @@ jobs:
 
           p = Path("src/graphics/host_gpu/regionManager.h")
           s = p.read_text(encoding="utf-8")
+
           def replace_once(old, new):
               global s
               if s.count(old) != 1:
@@ -188,7 +187,7 @@ jobs:
           }
 
           enum class ResourceKind {''')
-          replace(header, 'struct SamplerResource {\n', 'struct SamplerResource {\n\tuint32_t snapshot_index = 0;\n')
+          replace(header, 'struct SamplerResource {\n\tuint32_t source                = 0;\n\tuint32_t first_use_pc          = 0;\n\tbool     force_point_filtering = false;\n\tbool     depth_compare         = false;', 'struct SamplerResource {\n\tuint32_t source                = 0;\n\tuint32_t first_use_pc          = 0;\n\tbool     force_point_filtering = false;\n\tbool     depth_compare         = false;\n\tuint32_t snapshot_index        = 0;')
           source = 'src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp'
           replace(source, '\tfor (uint32_t index = 0; index < program.info.samplers.size(); index++) {\n\t\tconst auto target = sampler_plan.point_sampler[index];\n\t\tif (target != UINT32_MAX', '\tfor (uint32_t index = 0; !SharedSamplerSnapshotsEnabled() && index < program.info.samplers.size(); index++) {\n\t\tconst auto target = sampler_plan.point_sampler[index];\n\t\tif (target != UINT32_MAX')
           replace(source, '\tsamplers.reserve(sampler_plan.sampler_count);', '''\tsamplers.reserve(sampler_plan.sampler_count);
@@ -201,6 +200,7 @@ jobs:
           replace('src/graphics/host_gpu/renderer/pipeline/descriptors.cpp', 'NativeSampler(m_context, program, i, snapshot.samplers[i])', 'NativeSampler(m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index])')
           replace('src/graphics/host_gpu/renderer/renderCompute.cpp', 'DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[i])', 'DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[program.info.samplers[i].snapshot_index])')
           tests = 'tests/ResourceMaterializationTests.cpp'
+          replace(tests, 'void TestMixedSamplerDuplicatesTheCorrectSnapshot() {', 'void TestMixedSamplerDuplicatesTheCorrectSnapshot() {\n  using Libs::Graphics::ShaderRecompiler::IR::SamplerResource;\n  const SamplerResource positional {17u, 29u, true, true};\n  Check(positional.source == 17u && positional.first_use_pc == 29u &&\n            positional.force_point_filtering && positional.depth_compare &&\n            positional.snapshot_index == 0u,\n        "sampler sharing changed positional aggregate initialization");')
           replace(tests, '''  Check(snapshot.samplers.size() == 3,
                   "mixed sampler materialization appended unrelated samplers");
             Check(snapshot.samplers[2] == snapshot.samplers[1] &&
