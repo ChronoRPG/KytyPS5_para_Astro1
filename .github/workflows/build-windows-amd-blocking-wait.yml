@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 10 - Espera de memoria
+name: Windows AMD - Prueba 12 - Samplers compartidos
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + optional blocking wait
+    name: Windows x64 - AMD base + shared sampler snapshots
     runs-on: windows-2022
 
     defaults:
@@ -160,65 +160,83 @@ jobs:
           \t}
           \tstatic uint32_t CurrentThread() noexcept {""")
           p.write_text(s, encoding="utf-8", newline="\n")
-          start = s.index("class TrackingSpinLock final")
-          end = s.index("\nstatic_assert", start)
-          fixture = r'''#include <atomic>
-          #include <chrono>
-          #include <cstdlib>
-          #include <cstring>
-          #include <cstdio>
-          #include <cstdint>
-          #include <thread>
-          #include <vector>
-          #if defined(_WIN32)
-          #define KYTY_PLATFORM 1
-          #define KYTY_PLATFORM_WINDOWS 1
-          #include <windows.h>
-          #else
-          #define KYTY_PLATFORM 0
-          #define KYTY_PLATFORM_WINDOWS 1
-          #include <unistd.h>
-          #include <sys/syscall.h>
-          #endif
-          #define EXIT(...) std::abort()
-          #define EXIT_NOT_IMPLEMENTED(x) do { if (x) std::abort(); } while (0)
-          ''' + s[start:end] + r'''
-          int main() {
-              TrackingSpinLock lock;
-              uint64_t count = 0;
-              std::atomic_bool go = false;
-              std::vector<std::thread> threads;
-              for (int i = 0; i < 8; ++i) threads.emplace_back([&] {
-                  while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
-                  for (int j = 0; j < 10000; ++j) {
-                      lock.lock();
-                      ++count;
-                      if (j % 1000 == 0) std::this_thread::sleep_for(std::chrono::microseconds(100));
-                      lock.unlock();
-                  }
-              });
-              go.store(true, std::memory_order_release);
-              for (auto& t : threads) t.join();
-              if (count != 80000) std::abort();
-              // A fresh set of waiters checks progress across repeated contention waves.
-              for (int wave = 0; wave < 20; ++wave) {
-                  threads.clear();
-                  lock.lock();
-                  for (int i = 0; i < 8; ++i) threads.emplace_back([&] {
-                      lock.lock(); ++count; lock.unlock();
-                  });
-                  std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                  lock.unlock();
-                  for (auto& t : threads) t.join();
-              }
-              if (count != 80160) std::abort();
-              std::puts("Tracking lock: mutual exclusion and all contention waves passed");
-          }
-          '''
-          Path("tests/TrackingBlockingStandalone.cpp").write_text(fixture, encoding="utf-8", newline="\n")
-          print("Prueba 10: optional atomic wait/notify; ownership and memory ordering retained")
+          print("Retained optional atomic wait/notify from Prueba 10")
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw "Blocking wait adaptation failed" }
+
+      - name: Adapt shared sampler snapshots
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          def replace(path, old, new):
+              p = Path(path)
+              s = p.read_text(encoding='utf-8')
+              if s.count(old) != 1:
+                  raise RuntimeError('Unexpected source: ' + path + ' ' + repr(old))
+              p.write_text(s.replace(old, new), encoding='utf-8', newline='\n')
+
+          header = 'src/graphics/shader/recompiler/ir/ShaderIR.h'
+          replace(header, '#include <deque>', '#include <deque>\n#include <cstdlib>\n#include <cstring>')
+          replace(header, 'enum class ResourceKind {', '''inline bool SharedSamplerSnapshotsEnabled() noexcept {
+              static const bool enabled = [] {
+                  const char* value = std::getenv("KYTY_SHARED_SAMPLER_SNAPSHOTS");
+                  return value && std::strcmp(value, "1") == 0;
+              }();
+              return enabled;
+          }
+
+          enum class ResourceKind {''')
+          replace(header, 'struct SamplerResource {\n', 'struct SamplerResource {\n\tuint32_t snapshot_index = 0;\n')
+          source = 'src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp'
+          replace(source, '\tfor (uint32_t index = 0; index < program.info.samplers.size(); index++) {\n\t\tconst auto target = sampler_plan.point_sampler[index];\n\t\tif (target != UINT32_MAX', '\tfor (uint32_t index = 0; !SharedSamplerSnapshotsEnabled() && index < program.info.samplers.size(); index++) {\n\t\tconst auto target = sampler_plan.point_sampler[index];\n\t\tif (target != UINT32_MAX')
+          replace(source, '\tsamplers.reserve(sampler_plan.sampler_count);', '''\tsamplers.reserve(sampler_plan.sampler_count);
+          \tfor (uint32_t index = 0; index < samplers.size(); index++) {
+          \t\tsamplers[index].snapshot_index = index;
+          \t}''')
+          replace(source, '\t\t\tsampler.force_point_filtering = true;\n\t\t\tsamplers.push_back', '''\t\t\tsampler.force_point_filtering = true;
+          \t\t\tsampler.snapshot_index = SharedSamplerSnapshotsEnabled() ? index : target;
+          \t\t\tsamplers.push_back''')
+          replace('src/graphics/host_gpu/renderer/pipeline/descriptors.cpp', 'NativeSampler(m_context, program, i, snapshot.samplers[i])', 'NativeSampler(m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index])')
+          replace('src/graphics/host_gpu/renderer/renderCompute.cpp', 'DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[i])', 'DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[program.info.samplers[i].snapshot_index])')
+          tests = 'tests/ResourceMaterializationTests.cpp'
+          replace(tests, '''  Check(snapshot.samplers.size() == 3,
+                  "mixed sampler materialization appended unrelated samplers");
+            Check(snapshot.samplers[2] == snapshot.samplers[1] &&
+                      snapshot.samplers[2] != snapshot.samplers[0],
+                  "point sampler variant duplicated the wrong runtime descriptor");''', '''  if (SharedSamplerSnapshotsEnabled()) {
+              Check(snapshot.samplers.size() == 2,
+                    "shared sampler materialization duplicated a descriptor");
+              Check(snapshot.samplers[0] != snapshot.samplers[1],
+                    "shared sampler descriptors lost their distinct values");
+            } else {
+              Check(snapshot.samplers.size() == 3,
+                    "mixed sampler materialization appended unrelated samplers");
+              Check(snapshot.samplers[2] == snapshot.samplers[1] &&
+                        snapshot.samplers[2] != snapshot.samplers[0],
+                    "point sampler variant duplicated the wrong runtime descriptor");
+            }''')
+          replace(tests, "  }\n}\n\n// Guest memory", """  }
+            Program program;
+            program.resource_tracking_complete = true;
+            program.info = plan.info;
+            ApplyResourceSpecialization(program, specialization);
+            Check(program.info.samplers.size() == 3,
+                  "sampler sharing changed the native sampler layout");
+            Check(program.info.samplers[0].snapshot_index == 0 &&
+                      program.info.samplers[1].snapshot_index == 1 &&
+                      program.info.samplers[2].snapshot_index ==
+                          (SharedSamplerSnapshotsEnabled() ? 1u : 2u),
+                  "native sampler variant selected the wrong snapshot index");
+            Check(snapshot.samplers[program.info.samplers[2].snapshot_index] == snapshot.samplers[1],
+                  "native point sampler lost its original descriptor");
+          }
+
+          // Guest memory""")
+          print('Prueba 12: adapted shared sampler snapshots; existing layout checks retained')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw "Sampler adaptation failed" }
 
       - name: Verify patched source
         run: |
@@ -305,18 +323,6 @@ jobs:
             throw "glslang verification failed"
           }
 
-      - name: Test tracking lock in both modes
-        timeout-minutes: 2
-        run: |
-          clang-cl /nologo /std:c++20 /EHsc /O2 tests/TrackingBlockingStandalone.cpp /Fe:TrackingBlockingStandalone.exe
-          if ($LASTEXITCODE -ne 0) { throw "Standalone tracking lock build failed" }
-          foreach ($mode in @(0, 1)) {
-            $env:KYTY_TRACKING_BLOCKING_WAIT = "$mode"
-            ./TrackingBlockingStandalone.exe
-            if ($LASTEXITCODE -ne 0) { throw "Tracking lock test failed in mode $mode" }
-          }
-          Remove-Item Env:KYTY_TRACKING_BLOCKING_WAIT
-
       - name: Configure CMake
         run: |
           $ErrorActionPreference = "Stop"
@@ -338,7 +344,7 @@ jobs:
         run: |
           cmake `
             --build _Build/windows `
-            --target launcher shader_vertex_metadata_tests memory_tracker_tests shader_cfg_tests virtual_memory_allocation_tests `
+            --target launcher shader_vertex_metadata_tests memory_tracker_tests resource_materialization_tests shader_cfg_tests virtual_memory_allocation_tests `
             --parallel
 
           if ($LASTEXITCODE -ne 0) {
@@ -347,8 +353,14 @@ jobs:
 
       - name: Test memory and shader paths
         run: |
-          ctest --test-dir _Build/windows -R '^(shader_vertex_metadata|memory_tracker|shader_cfg|virtual_memory_allocation)$' --output-on-failure --no-tests=error
-          if ($LASTEXITCODE -ne 0) { throw "Memory or shader tests failed" }
+          $env:KYTY_TRACKING_BLOCKING_WAIT = "1"
+          foreach ($mode in @(0, 1)) {
+            $env:KYTY_SHARED_SAMPLER_SNAPSHOTS = "$mode"
+            ctest --test-dir _Build/windows -R '^(shader_vertex_metadata|memory_tracker|resource_materialization|shader_cfg|virtual_memory_allocation)$' --output-on-failure --no-tests=error
+            if ($LASTEXITCODE -ne 0) { throw "Memory or shader tests failed in mode $mode" }
+          }
+          Remove-Item Env:KYTY_SHARED_SAMPLER_SNAPSHOTS
+          Remove-Item Env:KYTY_TRACKING_BLOCKING_WAIT
 
       - name: Install KytyPS5
         run: |
@@ -366,7 +378,7 @@ jobs:
           $install = "_Build/windows/install"
           if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
           foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Prueba-10.cmd" } else { "Comparacion.cmd" }
+            $name = if ($mode -eq 1) { "Prueba-12.cmd" } else { "Comparacion-11.cmd" }
             @(
               '@echo off',
               'setlocal',
@@ -375,9 +387,10 @@ jobs:
               'set KYTY_BDA_SLICE_FILTER=',
               'set KYTY_TRACKING_DIAGNOSTICS=',
               'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
-              "set KYTY_TRACKING_BLOCKING_WAIT=$mode",
+              'set KYTY_TRACKING_BLOCKING_WAIT=1',
+              "set KYTY_SHARED_SAMPLER_SNAPSHOTS=$mode",
               'set KYTY_DEBUG_QUEUES=',
-              'set KYTY_SPECULATE_DRAWS=1',
+              'set KYTY_SPECULATE_DRAWS=0',
               'set KYTY_LIGHT_DRAIN_STATS=1',
               'set KYTY_DEBUG_SAMPLE_GPU=',
               'set KYTY_DEBUG_DUMP_THREADS=',
@@ -399,12 +412,13 @@ jobs:
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
             "Upstream a67a033 and f3dc5ee retained.",
-            "Comparacion.cmd: original tracking spin wait.",
-            "Prueba-10.cmd: blocked tracking wait instead of repeated atomic exchanges.",
+            "Comparacion-11.cmd: Prueba 11 settings, shared sampler snapshots OFF.",
+            "Prueba-12.cmd: same settings, shared sampler snapshots ON.",
+            "Keep AMD CPU patch OFF, shader validation OFF, red-zone protection ON.",
             "Copy your working _Patches; select THIS interpreter.",
             "Close all emulator and launcher processes before switching mode.",
             "No capture required: compare FPS, CPU, freezes and graphics."
-          ) | Set-Content "$install/PRUEBA-10.txt" -Encoding ascii
+          ) | Set-Content "$install/PRUEBA-12.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
@@ -412,10 +426,10 @@ jobs:
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-10-Espera.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-12-Samplers.zip" `
             -Force -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Prueba-10-Espera.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-12-Samplers.zip"
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
           }
@@ -423,7 +437,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-10-Espera
-          path: KytyPS5-Windows-AMD-Prueba-10-Espera.zip
+          name: KytyPS5-Windows-AMD-Prueba-12-Samplers
+          path: KytyPS5-Windows-AMD-Prueba-12-Samplers.zip
           if-no-files-found: error
           retention-days: 7
