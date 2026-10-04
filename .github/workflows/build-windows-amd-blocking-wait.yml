@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 12 - Samplers compartidos
+name: Windows AMD - Prueba 13 - Metadatos de color
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + shared sampler snapshots
+    name: Windows x64 - AMD base + direct color metadata
     runs-on: windows-2022
 
     defaults:
@@ -99,6 +99,8 @@ jobs:
           replace_once(source,
               "std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);",
               "next.input_semantics = {data.input_semantics, data.num_input_semantics};")
+          # Keep the existing count and call interface used by this AMD fork.
+          # Existing tests still cover range checks and unchanged output on rejection.
           print("Adapted upstream e57c37f: vertex semantics view applied")
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw "Metadata adaptation failed" }
@@ -201,6 +203,7 @@ jobs:
           replace('src/graphics/host_gpu/renderer/renderCompute.cpp', 'DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[i])', 'DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[program.info.samplers[i].snapshot_index])')
           tests = 'tests/ResourceMaterializationTests.cpp'
           replace(tests, 'void TestMixedSamplerDuplicatesTheCorrectSnapshot() {', 'void TestMixedSamplerDuplicatesTheCorrectSnapshot() {\n  using Libs::Graphics::ShaderRecompiler::IR::SamplerResource;\n  const SamplerResource positional {17u, 29u, true, true};\n  Check(positional.source == 17u && positional.first_use_pc == 29u &&\n            positional.force_point_filtering && positional.depth_compare &&\n            positional.snapshot_index == 0u,\n        "sampler sharing changed positional aggregate initialization");')
+
           replace(tests, '''  Check(snapshot.samplers.size() == 3,
                   "mixed sampler materialization appended unrelated samplers");
             Check(snapshot.samplers[2] == snapshot.samplers[1] &&
@@ -237,6 +240,39 @@ jobs:
           print('Prueba 12: adapted shared sampler snapshots; existing layout checks retained')
           '@ | python -
           if ($LASTEXITCODE -ne 0) { throw "Sampler adaptation failed" }
+
+      - name: Adapt color metadata publication
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          p = Path("src/graphics/host_gpu/renderer/cache/textureCache.cpp")
+          s = p.read_text(encoding="utf-8")
+          old = "\t\t\tm_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);"
+          new = """\t\t\tstatic const bool direct_metadata = [] {
+          \t\t\t\tconst char* value = std::getenv("KYTY_DIRECT_COLOR_METADATA");
+          \t\t\t\treturn value && std::strcmp(value, "1") == 0;
+          \t\t\t}();
+          \t\t\tif (direct_metadata) {
+          \t\t\t\tstd::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+          \t\t\t\tm_buffer_cache.InvalidateMemory(address, slice_size);
+          \t\t\t\tLibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+          \t\t\t\t// Retain this AMD base's descriptor-read epoch invalidation.
+          \t\t\t\tm_scheduler.Context().AdvanceBdaEpochForGpuWrite();
+          \t\t\t} else {
+          \t\t\t\tm_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
+          \t\t\t}"""
+          if s.count(old) != 1:
+              raise RuntimeError("Unexpected color metadata source")
+          if "#include <cstring>" not in s:
+              s = s.replace("#include <cstdlib>", "#include <cstdlib>\n#include <cstring>", 1)
+              if "#include <cstring>" not in s:
+                  raise RuntimeError("Expected standard includes missing")
+          p.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
+          print("Prueba 13: adapted upstream 190608a; metadata A/B switch installed")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw "Metadata publication adaptation failed" }
 
       - name: Verify patched source
         run: |
@@ -355,10 +391,12 @@ jobs:
         run: |
           $env:KYTY_TRACKING_BLOCKING_WAIT = "1"
           foreach ($mode in @(0, 1)) {
-            $env:KYTY_SHARED_SAMPLER_SNAPSHOTS = "$mode"
+            $env:KYTY_DIRECT_COLOR_METADATA = "$mode"
+            $env:KYTY_SHARED_SAMPLER_SNAPSHOTS = "1"
             ctest --test-dir _Build/windows -R '^(shader_vertex_metadata|memory_tracker|resource_materialization|shader_cfg|virtual_memory_allocation)$' --output-on-failure --no-tests=error
             if ($LASTEXITCODE -ne 0) { throw "Memory or shader tests failed in mode $mode" }
           }
+          Remove-Item Env:KYTY_DIRECT_COLOR_METADATA
           Remove-Item Env:KYTY_SHARED_SAMPLER_SNAPSHOTS
           Remove-Item Env:KYTY_TRACKING_BLOCKING_WAIT
 
@@ -378,7 +416,7 @@ jobs:
           $install = "_Build/windows/install"
           if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
           foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Prueba-12.cmd" } else { "Comparacion-11.cmd" }
+            $name = if ($mode -eq 1) { "Prueba-13.cmd" } else { "Comparacion-12.cmd" }
             @(
               '@echo off',
               'setlocal',
@@ -388,7 +426,8 @@ jobs:
               'set KYTY_TRACKING_DIAGNOSTICS=',
               'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
               'set KYTY_TRACKING_BLOCKING_WAIT=1',
-              "set KYTY_SHARED_SAMPLER_SNAPSHOTS=$mode",
+              'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
+              "set KYTY_DIRECT_COLOR_METADATA=$mode",
               'set KYTY_DEBUG_QUEUES=',
               'set KYTY_SPECULATE_DRAWS=0',
               'set KYTY_LIGHT_DRAIN_STATS=1',
@@ -412,13 +451,13 @@ jobs:
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
             "Upstream a67a033 and f3dc5ee retained.",
-            "Comparacion-11.cmd: Prueba 11 settings, shared sampler snapshots OFF.",
-            "Prueba-12.cmd: same settings, shared sampler snapshots ON.",
+            "Comparacion-12.cmd: Prueba 12 settings, direct metadata OFF.",
+            "Prueba-13.cmd: same settings, direct metadata ON.",
             "Keep AMD CPU patch OFF, shader validation OFF, red-zone protection ON.",
             "Copy your working _Patches; select THIS interpreter.",
             "Close all emulator and launcher processes before switching mode.",
             "No capture required: compare FPS, CPU, freezes and graphics."
-          ) | Set-Content "$install/PRUEBA-12.txt" -Encoding ascii
+          ) | Set-Content "$install/PRUEBA-13.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
@@ -426,10 +465,10 @@ jobs:
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-12-Samplers.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-13-Metadatos.zip" `
             -Force -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Prueba-12-Samplers.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-13-Metadatos.zip"
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
           }
@@ -437,7 +476,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-12-Samplers
-          path: KytyPS5-Windows-AMD-Prueba-12-Samplers.zip
+          name: KytyPS5-Windows-AMD-Prueba-13-Metadatos
+          path: KytyPS5-Windows-AMD-Prueba-13-Metadatos.zip
           if-no-files-found: error
           retention-days: 7
