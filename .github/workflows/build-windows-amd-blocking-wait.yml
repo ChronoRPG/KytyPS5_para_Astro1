@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 13 - Metadatos de color
+name: Windows AMD - Prueba 16 - Clasificacion de texturas
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - AMD base + direct color metadata
+    name: Windows x64 - AMD base + image specialization cache
     runs-on: windows-2022
 
     defaults:
@@ -133,7 +133,6 @@ jobs:
 
           p = Path("src/graphics/host_gpu/regionManager.h")
           s = p.read_text(encoding="utf-8")
-
           def replace_once(old, new):
               global s
               if s.count(old) != 1:
@@ -246,7 +245,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           @'
           from pathlib import Path
-
           p = Path("src/graphics/host_gpu/renderer/cache/textureCache.cpp")
           s = p.read_text(encoding="utf-8")
           old = "\t\t\tm_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);"
@@ -297,6 +295,152 @@ jobs:
           }
 
           git diff --stat
+
+      - name: Add exact descriptor image classification cache
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          def replace(path, old, new):
+              p = Path(path)
+              text = p.read_text(encoding='utf-8')
+              if text.count(old) != 1:
+                  raise RuntimeError('Unexpected source: ' + path + ' ' + repr(old))
+              p.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+
+          header = 'src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.h'
+          replace(header, '\tstd::vector<uint32_t> key;', '''\t// Same plan ownership as key. Inputs saved before FMASK descriptor remapping.
+          \tstd::vector<DescriptorValue> image_inputs;
+          \tstd::vector<ResourceSpecialization::Image> image_results;
+          \tbool image_cache_initialized = false;
+          \tbool image_cache_allowed = false;
+          \tuint32_t image_cache_hits = 0;
+          \tstd::vector<uint32_t> key;''')
+          source = 'src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp'
+          replace(source, '#include <cstring>', '#include <cstring>\n#include <cstdlib>')
+          replace(source, '''static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                                  ResourceSpecialization& specialization) {''', '''static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                                  ResourceSpecialization& specialization,
+                                                  MaterializationMemo* memo) {
+          \tstatic const bool enabled = [] {
+          \t\tconst auto* value = std::getenv("KYTY_IMAGE_SPECIALIZATION_CACHE");
+          \t\treturn value != nullptr && std::strcmp(value, "1") == 0;
+          \t}();
+          \tif (memo != nullptr) memo->image_cache_hits = 0;
+          \tif (enabled && memo != nullptr && !memo->image_cache_initialized) {
+          \t\t// Indirect tables have cross-image dependencies; retain their original path.
+          \t\tmemo->image_cache_allowed = !program.info.images.empty() &&
+          \t\t    std::ranges::none_of(program.descriptor_sources, [](const auto& source) {
+          \t\t        return source.indirect_image.has_value();
+          \t\t    });
+          \t\tmemo->image_cache_initialized = true;
+          \t}
+          \tconst bool cache_images = enabled && memo != nullptr && memo->image_cache_allowed &&
+          \t    snapshot.images.size() == program.info.images.size() &&
+          \t    specialization.images.size() == program.info.images.size();
+          \tbool image_cache_changed = false;''')
+          replace(source, '''\t\tconst auto& descriptor = snapshot.images[i];
+          \t\tauto&       image      = specialization.images[i];''', '''\t\tconst auto& descriptor = snapshot.images[i];
+          \t\tauto&       image      = specialization.images[i];
+          \t\t// Descriptors are freshly evaluated each refresh. Reuse only their pure
+          \t\t// classification, when every descriptor word and width match.
+          \t\tif (cache_images && i < memo->image_inputs.size() &&
+          \t\t    i < memo->image_results.size() && descriptor == memo->image_inputs[i]) {
+          \t\t\timage = memo->image_results[i];
+          \t\t\tmemo->image_cache_hits++;
+          \t\t\tcontinue;
+          \t\t}
+          \t\timage_cache_changed = true;''')
+          replace(source, '\tImageRemap(specialization).Apply(snapshot.images);', '''\tif (cache_images && image_cache_changed) {
+          \t\tmemo->image_inputs = snapshot.images;
+          \t\tmemo->image_results = specialization.images;
+          \t}
+          \tImageRemap(specialization).Apply(snapshot.images);''')
+          replace(source, 'BuildResourceSpecialization(program, snapshot, specialization)',
+                  'BuildResourceSpecialization(program, snapshot, specialization, memo)')
+          print('Prueba 16: exact-descriptor image classification cache; indirect tables unchanged')
+          tests = 'tests/ResourceMaterializationTests.cpp'
+          new_test = r'''
+          void TestImageCacheTracksDescriptorChanges() {
+            using namespace Libs::Graphics::ShaderRecompiler::IR;
+            using Libs::Graphics::Prospero::BufferFormat;
+            using Libs::Graphics::Prospero::ImageType;
+            Program program;
+            program.stage = Libs::Graphics::ShaderType::Pixel;
+            program.srt_plan_complete = true;
+            program.resource_tracking_complete = true;
+            auto& block = AddValueBlock(program);
+            const auto add_source = [&](uint32_t first, uint32_t count) {
+              DescriptorSource source;
+              source.dword_count = count;
+              for (uint32_t i = 0; i < count; ++i) {
+                auto& value = block.AppendNewInst(ValueOpcode::GetUserData,
+                    {Value(static_cast<ScalarReg>(first + i))});
+                source.dwords[i] = Value(&value);
+              }
+              program.descriptor_sources.push_back(source);
+              return static_cast<uint32_t>(program.descriptor_sources.size() - 1);
+            };
+            const auto buffer = add_source(0, 4);
+            const auto image = add_source(4, 8);
+            program.info.buffers.push_back({.source = buffer});
+            program.info.images.push_back({.source = image,
+                .resource_class = ImageResourceClass::Sampled,
+                .numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float,
+                .dimension = Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension::Dim2D});
+            auto plan = ExtractResourcePlan(program);
+            std::array<uint32_t, 12> data {};
+            data[4] = 0x1234u;
+            data[5] = static_cast<uint32_t>(BufferFormat::k32Float) << 20u;
+            data[7] = static_cast<uint32_t>(ImageType::kColor2D) << 28u;
+            ResourceSnapshot cached, reference;
+            ResourceSpecialization cached_spec, reference_spec;
+            MaterializationMemo memo;
+            const auto refresh = [&] {
+              const SrtRuntime runtime {.user_data = data};
+              Check(MaterializeResources(plan, runtime, cached, cached_spec, &memo),
+                  "cached image refresh failed");
+              Check(MaterializeResources(plan, runtime, reference, reference_spec),
+                  "reference image refresh failed");
+              Check(cached.buffers == reference.buffers && cached.images == reference.images &&
+                  cached.samplers == reference.samplers && cached.flattened_srt == reference.flattened_srt &&
+                  cached.user_data == reference.user_data && cached_spec == reference_spec,
+                  "image cache changed materialization results");
+            };
+            refresh();
+            data[0]++;
+            refresh();
+            const auto* env = std::getenv("KYTY_IMAGE_SPECIALIZATION_CACHE");
+            const bool enabled = env != nullptr && std::string_view(env) == "1";
+            Check(!memo.reused && memo.image_cache_hits == (enabled ? 1u : 0u),
+                "unchanged image was not reused independently of the buffer");
+            data[5] = static_cast<uint32_t>(BufferFormat::k32UInt) << 20u;
+            refresh();
+            Check(memo.image_cache_hits == 0u && cached_spec.images[0].numeric_class ==
+                Libs::Graphics::Prospero::TextureNumericClass::Uint,
+                "image format change was hidden by the cache");
+            data[4]++;
+            refresh();
+            Check(memo.image_cache_hits == 0u, "image address change was hidden");
+            data[5] |= 0x20000000u; // Reserved bit: must retain original null sanitization.
+            refresh();
+            Check(cached.images[0].dwords[0] == 0u, "invalid image was not sanitized");
+            data[0]++;
+            refresh();
+            data[5] = static_cast<uint32_t>(BufferFormat::k32Float) << 20u;
+            refresh();
+            Check(cached_spec.images[0].numeric_class ==
+                Libs::Graphics::Prospero::TextureNumericClass::Float,
+                "valid image did not recover after invalid descriptor");
+            data[0]++;
+            refresh();
+          }
+
+          '''
+          replace(tests, 'int main() {', new_test + 'int main() {\n  TestImageCacheTracksDescriptorChanges();')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw "Image specialization cache adaptation failed" }
 
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -391,11 +535,13 @@ jobs:
         run: |
           $env:KYTY_TRACKING_BLOCKING_WAIT = "1"
           foreach ($mode in @(0, 1)) {
-            $env:KYTY_DIRECT_COLOR_METADATA = "$mode"
+            $env:KYTY_DIRECT_COLOR_METADATA = "1"
+            $env:KYTY_IMAGE_SPECIALIZATION_CACHE = "$mode"
             $env:KYTY_SHARED_SAMPLER_SNAPSHOTS = "1"
             ctest --test-dir _Build/windows -R '^(shader_vertex_metadata|memory_tracker|resource_materialization|shader_cfg|virtual_memory_allocation)$' --output-on-failure --no-tests=error
             if ($LASTEXITCODE -ne 0) { throw "Memory or shader tests failed in mode $mode" }
           }
+          Remove-Item Env:KYTY_IMAGE_SPECIALIZATION_CACHE
           Remove-Item Env:KYTY_DIRECT_COLOR_METADATA
           Remove-Item Env:KYTY_SHARED_SAMPLER_SNAPSHOTS
           Remove-Item Env:KYTY_TRACKING_BLOCKING_WAIT
@@ -416,7 +562,7 @@ jobs:
           $install = "_Build/windows/install"
           if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
           foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Prueba-13.cmd" } else { "Comparacion-12.cmd" }
+            $name = if ($mode -eq 1) { "Prueba-16.cmd" } else { "Comparacion-14.cmd" }
             @(
               '@echo off',
               'setlocal',
@@ -427,7 +573,9 @@ jobs:
               'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
               'set KYTY_TRACKING_BLOCKING_WAIT=1',
               'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
-              "set KYTY_DIRECT_COLOR_METADATA=$mode",
+              'set KYTY_DIRECT_COLOR_METADATA=1',
+              'set KYTY_RECORD_THREAD=0',
+              "set KYTY_IMAGE_SPECIALIZATION_CACHE=$mode",
               'set KYTY_DEBUG_QUEUES=',
               'set KYTY_SPECULATE_DRAWS=0',
               'set KYTY_LIGHT_DRAIN_STATS=1',
@@ -442,6 +590,9 @@ jobs:
               '"%~dp0launcher.exe" %*'
             ) | Set-Content "$install/$name" -Encoding ascii
           }
+          $diagnostic = Get-Content "$install/Prueba-16.cmd"
+          $diagnostic = $diagnostic -replace '^set KYTY_DEBUG_DRAW_PHASES=$', 'set KYTY_DEBUG_DRAW_PHASES=all'
+          $diagnostic | Set-Content "$install/Diagnostico-16.cmd" -Encoding ascii
           $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
           if (-not $maps) { throw "Emulator map missing" }
           foreach ($map in $maps) { Copy-Item $map.FullName $install -Force }
@@ -451,13 +602,13 @@ jobs:
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
             "Upstream a67a033 and f3dc5ee retained.",
-            "Comparacion-12.cmd: Prueba 12 settings, direct metadata OFF.",
-            "Prueba-13.cmd: same settings, direct metadata ON.",
+            "Comparacion-14.cmd: Prueba 14 settings, image classification cache OFF.",
+            "Prueba-16.cmd: same settings, image classification cache ON.",
             "Keep AMD CPU patch OFF, shader validation OFF, red-zone protection ON.",
             "Copy your working _Patches; select THIS interpreter.",
             "Close all emulator and launcher processes before switching mode.",
             "No capture required: compare FPS, CPU, freezes and graphics."
-          ) | Set-Content "$install/PRUEBA-13.txt" -Encoding ascii
+          ) | Set-Content "$install/PRUEBA-16.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
@@ -465,10 +616,10 @@ jobs:
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-13-Metadatos.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-16-Texturas.zip" `
             -Force -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Prueba-13-Metadatos.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-16-Texturas.zip"
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
           }
@@ -476,7 +627,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-13-Metadatos
-          path: KytyPS5-Windows-AMD-Prueba-13-Metadatos.zip
+          name: KytyPS5-Windows-AMD-Prueba-16-Texturas
+          path: KytyPS5-Windows-AMD-Prueba-16-Texturas.zip
           if-no-files-found: error
           retention-days: 7
