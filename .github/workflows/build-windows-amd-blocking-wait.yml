@@ -1,4 +1,4 @@
-name: Windows AMD - Diagnostico 22 - Coste CPU por shader
+name: Windows AMD - Prueba 23 - Lecturas de recursos
 
 on:
   workflow_dispatch:
@@ -36,8 +36,11 @@ jobs:
       - name: Reproduce working AMD source and retained optimizations
         run: |
           $ErrorActionPreference = "Stop"
+
           python -m pip install PyYAML==6.0.2
-          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "YAML parser installation failed"
+          }
 
           @'
           from pathlib import Path
@@ -60,7 +63,7 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
 
-              script = Path(f"_prepare22_{index}.ps1")
+              script = Path(f"_prepare23_{index}.ps1")
               script.write_text(
                   '$ErrorActionPreference = "Stop"\n' + step["run"],
                   encoding="utf-8"
@@ -75,82 +78,121 @@ jobs:
               raise RuntimeError("Baseline preparation boundaries missing")
           '@ | python -
 
-          if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Baseline preparation failed"
+          }
 
-      - name: Add shader CPU ranking
+      - name: Add optional 32 block resource cache
         run: |
           $ErrorActionPreference = "Stop"
 
           @'
           from pathlib import Path
 
-          p = Path("src/graphics/host_gpu/renderer/debug.cpp")
+          p = Path("src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp")
           s = p.read_text(encoding="utf-8")
 
-          def replace(old, new):
-              global s
-              if s.count(old) != 1:
-                  raise RuntimeError("Unexpected diagnostic source: " + repr(old))
-              s = s.replace(old, new)
+          old = "class OrdinaryBlockCache {"
+          if s.count(old) != 1:
+              raise RuntimeError("Unexpected cache source")
+          s = s.replace(old, "template <uint32_t Capacity = 8>\n" + old)
 
-          replace("\t// DRAW_INDEX_AUTO draws, also on their own (see Begin).", r"""
-              struct ShaderCpuRow {
-                  uint64_t draws = 0;
-                  uint64_t ticks = 0;
-                  std::array<uint64_t, Count> phases {};
-                  std::array<uint64_t, ProbeCount> probes {};
-              };
-              static const bool rank_enabled = [] {
-                  const char* v = std::getenv("KYTY_DEBUG_SHADER_CPU");
-                  return v && std::strcmp(v, "1") == 0;
-              }();
-              static std::unordered_map<uint64_t, ShaderCpuRow> shader_cpu;
-              if (rank_enabled) {
-                  auto& row = shader_cpu[pixel_hash];
-                  row.draws++;
-                  row.ticks += sum;
-                  for (uint32_t i = 0; i < Count; i++) row.phases[i] += current[i];
-                  for (uint32_t i = 0; i < ProbeCount; i++) row.probes[i] += probes[i];
-              }
-              // DRAW_INDEX_AUTO draws, also on their own (see Begin).""")
+          a = s.index("template <uint32_t Capacity = 8>\nclass OrdinaryBlockCache {")
+          b = s.index("\nSrtRuntime ObservedRuntime", a)
+          section = s[a:b]
+          old = "\tstatic constexpr uint32_t Capacity   = 8;\n"
+          if section.count(old) != 1:
+              raise RuntimeError("Capacity missing")
+          s = s[:a] + section.replace(old, "") + s[b:]
 
-          replace("\tconst auto   gpu_ns  = g_gpu_busy_ns.load(std::memory_order_relaxed);", r"""
-              if (rank_enabled) {
-                  std::vector<std::pair<uint64_t, ShaderCpuRow>> ranked(shader_cpu.begin(), shader_cpu.end());
-                  std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
-                      return a.second.ticks > b.second.ticks;
-                  });
-                  uint64_t total_ticks = 0;
-                  for (const auto& entry: ranked) total_ticks += entry.second.ticks;
-                  std::printf("shader-cpu: %.1fs groups=%zu total-ms/s=%.2f unit=CPU-preparation\n",
-                              seconds, ranked.size(), total_ticks * to_us / 1000.0 / seconds);
-                  for (size_t n = 0; n < ranked.size() && n < 16; n++) {
-                      const auto& entry = ranked[n];
-                      const auto& row = entry.second;
-                      std::printf("shader-cpu ps=%016llx draws/s=%.0f us/draw=%.2f ms/s=%.2f share=%.1f%%",
-                                  static_cast<unsigned long long>(entry.first), row.draws / seconds,
-                                  row.draws ? row.ticks * to_us / row.draws : 0.0,
-                                  row.ticks * to_us / 1000.0 / seconds,
-                                  total_ticks ? 100.0 * row.ticks / total_ticks : 0.0);
-                      for (uint32_t i = 0; i < Count; i++)
-                          std::printf(" %s=%.2f", Names[i], row.phases[i] * to_us / row.draws);
-                      std::printf(" | probes:");
-                      for (uint32_t i = 0; i < ProbeCount; i++)
-                          std::printf(" %s=%.2f", ProbeNames[i], row.probes[i] * to_us / row.draws);
-                      std::printf("\n");
-                  }
-                  shader_cpu.clear();
-              }
-              const auto   gpu_ns  = g_gpu_busy_ns.load(std::memory_order_relaxed);""")
+          a = s.index("\t\tOrdinaryBlockCache ordinary(clean_source);")
+          b = s.index("\n\t}", a)
+          body = s[a:b]
+          if body.count("result = Materialize(") != 1:
+              raise RuntimeError("Refresh body changed")
 
+          body = body.replace(
+              "OrdinaryBlockCache ordinary",
+              "OrdinaryBlockCache<Capacity> ordinary"
+          )
+          body = body.replace("result = Materialize(", "return Materialize(")
+
+          new = "\t\tconst auto execute = [&]<uint32_t Capacity>() {\n"
+          new += "\n".join("\t" + line for line in body.splitlines())
+          new += "\n\t\t};\n"
+          new += """        static const bool larger_blocks = [] {
+                      const char* value = std::getenv("KYTY_RESOURCE_BLOCKS_32");
+                      return value && std::strcmp(value, "1") == 0;
+                  }();
+                  const bool use_larger = larger_blocks && !capture_reads &&
+                      runtime.read_memory != nullptr && runtime.read_memory_block != nullptr;
+                  result = use_larger ? execute.template operator()<32>()
+                                      : execute.template operator()<8>();"""
+
+          s = s[:a] + new + s[b:]
           p.write_text(s, encoding="utf-8", newline="\n")
-          print("Diagnostic 22: top 16 shader groups by CPU preparation time")
+          print("Prueba 23: optional 32-block cache, fresh for every refresh")
+
+          p = Path("tests/ResourceMaterializationTests.cpp")
+          s = p.read_text(encoding="utf-8")
+          old = "int main() {"
+          if s.count(old) != 1:
+              raise RuntimeError("Unexpected test main")
+
+          new = r"""void TestOrdinaryBlocksKeepFreshReads() {
+            using namespace Libs::Graphics::ShaderRecompiler::IR;
+            struct Memory {
+              TableMemory table;
+              bool reject_block = false;
+              uint32_t block_reads = 0;
+              static bool Exact(void* data, uint64_t address, std::span<uint32_t> values) {
+                return TableMemory::Read(&static_cast<Memory*>(data)->table, address, values);
+              }
+              static bool Whole(void* data, uint64_t address, std::span<uint32_t> values) {
+                auto& self = *static_cast<Memory*>(data);
+                self.block_reads++;
+                return !self.reject_block && Exact(data, address, values);
+              }
+            } memory;
+            const auto plan = SrtPlan(TableMemory::Base);
+            const SrtRuntime runtime {
+              .read_memory = Memory::Exact,
+              .userdata = &memory,
+              .read_memory_block = Memory::Whole,
+            };
+            ResourceSnapshot snapshot;
+            ResourceSpecialization specialization;
+            const auto refresh = [&] {
+              Check(MaterializeResources(plan, runtime, snapshot, specialization),
+                    "ordinary block refresh failed");
+              Check(snapshot.flattened_srt[0] == memory.table.words[0],
+                    "ordinary block cache reused data from an earlier refresh");
+            };
+            memory.table.words[0] = 17;
+            refresh();
+            Check(memory.block_reads != 0, "ordinary block reader was bypassed");
+            memory.table.words[0] = 29;
+            refresh();
+            memory.reject_block = true;
+            memory.table.words[0] = 41;
+            refresh();
+          }
+
+          int main() {
+            TestOrdinaryBlocksKeepFreshReads();"""
+
+          s = s.replace(old, new)
+          p.write_text(s, encoding="utf-8", newline="\n")
           '@ | python -
 
-          if ($LASTEXITCODE -ne 0) { throw "Shader CPU instrumentation failed" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Resource block adaptation failed"
+          }
 
           git diff --check
-          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Invalid source diff"
+          }
 
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -184,6 +226,7 @@ jobs:
             "User-Agent" = "GitHub-Actions-KytyPS5"
             "Accept" = "application/vnd.github+json"
           }
+
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers
           $asset = $release.assets | Where-Object {
             $_.name -match "(?i)windows" -and $_.name -match "(?i)(x64|x86_64|amd64)" -and $_.name -match "(?i)\.zip$"
@@ -194,10 +237,14 @@ jobs:
               $_.name -match "(?i)windows" -and $_.name -match "(?i)\.zip$"
             } | Select-Object -First 1
           }
-          if (-not $asset) { throw "No Windows glslang ZIP found" }
+
+          if (-not $asset) {
+            throw "No Windows glslang ZIP found"
+          }
 
           $zip = "$env:RUNNER_TEMP/glslang.zip"
           $extract = "$env:RUNNER_TEMP/glslang"
+
           Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
@@ -205,17 +252,23 @@ jobs:
           if (-not $validator) {
             $validator = Get-ChildItem $extract -Filter "glslang.exe" -Recurse | Select-Object -First 1
           }
-          if (-not $validator) { throw "glslang executable missing" }
+
+          if (-not $validator) {
+            throw "glslang executable missing"
+          }
 
           if ($validator.Name -eq "glslang.exe") {
             Copy-Item $validator.FullName (Join-Path $validator.Directory.FullName "glslangValidator.exe") -Force
           }
+
           Add-Content $env:GITHUB_PATH $validator.Directory.FullName
 
       - name: Verify glslang
         run: |
           glslangValidator --version
-          if ($LASTEXITCODE -ne 0) { throw "glslang verification failed" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "glslang verification failed"
+          }
 
       - name: Configure CMake
         run: |
@@ -230,7 +283,9 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
 
-          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "CMake configure failed"
+          }
 
       - name: Build KytyPS5
         run: |
@@ -239,23 +294,30 @@ jobs:
             --target launcher shader_vertex_metadata_tests memory_tracker_tests resource_materialization_tests shader_cfg_tests virtual_memory_allocation_tests `
             --parallel
 
-          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Build failed"
+          }
 
       - name: Test memory and shader paths
         run: |
           $env:KYTY_TRACKING_BLOCKING_WAIT = "1"
+          $env:KYTY_SHARED_SAMPLER_SNAPSHOTS = "1"
 
-          foreach ($mode in @(0, 1)) {
-            $env:KYTY_DIRECT_COLOR_METADATA = "$mode"
-            $env:KYTY_SHARED_SAMPLER_SNAPSHOTS = "1"
+          foreach ($blocks in @(0, 1)) {
+            $env:KYTY_RESOURCE_BLOCKS_32 = "$blocks"
 
-            ctest --test-dir _Build/windows -R '^(shader_vertex_metadata|memory_tracker|resource_materialization|shader_cfg|virtual_memory_allocation)$' --output-on-failure --no-tests=error
+            foreach ($mode in @(0, 1)) {
+              $env:KYTY_DIRECT_COLOR_METADATA = "$mode"
 
-            if ($LASTEXITCODE -ne 0) {
-              throw "Memory or shader tests failed in mode $mode"
+              ctest --test-dir _Build/windows -R '^(shader_vertex_metadata|memory_tracker|resource_materialization|shader_cfg|virtual_memory_allocation)$' --output-on-failure --no-tests=error
+
+              if ($LASTEXITCODE -ne 0) {
+                throw "Tests failed: blocks=$blocks metadata=$mode"
+              }
             }
           }
 
+          Remove-Item Env:KYTY_RESOURCE_BLOCKS_32
           Remove-Item Env:KYTY_DIRECT_COLOR_METADATA
           Remove-Item Env:KYTY_SHARED_SAMPLER_SNAPSHOTS
           Remove-Item Env:KYTY_TRACKING_BLOCKING_WAIT
@@ -266,7 +328,9 @@ jobs:
             --install _Build/windows `
             --prefix _Build/windows/install
 
-          if ($LASTEXITCODE -ne 0) { throw "Install failed" }
+          if ($LASTEXITCODE -ne 0) {
+            throw "Install failed"
+          }
 
       - name: Package launchers and symbols
         run: |
@@ -278,7 +342,7 @@ jobs:
           }
 
           foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Diagnostico-22.cmd" } else { "Comparacion-14.cmd" }
+            $name = if ($mode -eq 1) { "Prueba-23.cmd" } else { "Comparacion-14.cmd" }
 
             @(
               '@echo off',
@@ -294,7 +358,8 @@ jobs:
               'set KYTY_RECORD_THREAD=0',
               'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
               'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
-              "set KYTY_DEBUG_SHADER_CPU=$mode",
+              'set KYTY_DEBUG_SHADER_CPU=0',
+              "set KYTY_RESOURCE_BLOCKS_32=$mode",
               'set KYTY_DEBUG_QUEUES=',
               'set KYTY_SRT_STATS=',
               'set KYTY_DEBUG_SRT_RUNS=',
@@ -305,7 +370,7 @@ jobs:
               'set KYTY_LIGHT_DRAIN_STATS=1',
               'set KYTY_DEBUG_SAMPLE_GPU=',
               'set KYTY_DEBUG_DUMP_THREADS=',
-              "set KYTY_DEBUG_DRAW_PHASES=$(if ($mode -eq 1) { 'all' } else { '' })",
+              'set KYTY_DEBUG_DRAW_PHASES=',
               'set KYTY_DEBUG_DRAW_STATS=',
               'set KYTY_DEBUG_SPEC_STATS=',
               'set KYTY_DEBUG_STREAM_STATS=',
@@ -316,25 +381,30 @@ jobs:
           }
 
           $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
-          if (-not $maps) { throw "Emulator map missing" }
+          if (-not $maps) {
+            throw "Emulator map missing"
+          }
 
           foreach ($map in $maps) {
             Copy-Item $map.FullName $install -Force
           }
 
           $pdb = "_Build/windows/kyty_emulator.pdb"
-          if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
+          if (-not (Test-Path $pdb)) {
+            throw "Emulator PDB missing"
+          }
           Copy-Item $pdb $install -Force
 
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Comparacion-14.cmd: diagnostic counters OFF.",
-            "Diagnostico-22.cmd: shader CPU ranking ON.",
+            "Comparacion-14.cmd: original 8-block cache.",
+            "Prueba-23.cmd: 32-block cache.",
+            "Diagnostic counters OFF in both modes.",
             "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
             "Copy your working _Patches and select THIS interpreter.",
             "Close emulator and launcher before changing mode.",
-            "Heavy view 60 seconds; light view 60 seconds."
-          ) | Set-Content "$install/DIAGNOSTICO-22.txt" -Encoding ascii
+            "Compare the same heavy view for 60 seconds in each mode."
+          ) | Set-Content "$install/PRUEBA-23.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
@@ -342,10 +412,10 @@ jobs:
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Diagnostico-22-CPU.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-23-Recursos.zip" `
             -Force -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Diagnostico-22-CPU.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-23-Recursos.zip"
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
           }
@@ -353,7 +423,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Diagnostico-22-CPU
-          path: KytyPS5-Windows-AMD-Diagnostico-22-CPU.zip
+          name: KytyPS5-Windows-AMD-Prueba-23-Recursos
+          path: KytyPS5-Windows-AMD-Prueba-23-Recursos.zip
           if-no-files-found: error
           retention-days: 7
