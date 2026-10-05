@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 31 - Lectura directa de SRT
+name: Windows AMD - Prueba 32 - Simplificar SRT
 
 'on':
   workflow_dispatch:
@@ -71,7 +71,7 @@ jobs:
                   continue
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
-              script = Path(f"_prepare31_{index}.ps1")
+              script = Path(f"_prepare32_{index}.ps1")
               script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
               print("Preparing:", step["name"], flush=True)
               subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -81,7 +81,7 @@ jobs:
           '@ | & $env:KYTY_PYTHON -
           if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-      - name: Add optional refreshed SRT shortcut and branch regression
+      - name: Simplify immutable SRT aliases and add regressions
         run: |
           $ErrorActionPreference = "Stop"
           @'
@@ -90,53 +90,125 @@ jobs:
           p = Path("src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp")
           s = p.read_text(encoding="utf-8")
           s = "#include <cstdlib>\n#include <cstring>\n" + s
-          old = "\tauto& memo = m_memo[index];"
+          old = "\tcompiled->descriptor_slots.resize(compiled->descriptors.size());"
           if s.count(old) != 1:
-              raise RuntimeError("Unexpected evaluator memo entry")
+              raise RuntimeError("Compiled graph boundary missing")
 
-          new = """    static const bool direct_flat = [] {
-                  const char* value = std::getenv("KYTY_DIRECT_FLAT_31");
+          code = r'''    static const bool simplify = [] {
+                  const char* value = std::getenv("KYTY_SRT_ALIASES_32");
                   return value && std::strcmp(value, "1") == 0;
               }();
-              // The flat SRT has already been refreshed using the original readers.
-              // Match the existing ReadConst shortcut before entering scalar memoization.
-              if (direct_flat && node.op == NodeOp::ReadConst && m_flat != nullptr &&
-                  node.aux < m_program.srt_reads.size()) {
-                  result = (*m_flat)[m_program.srt_reads[node.aux].flat_offset];
-                  return true;
+              if (simplify) {
+                  // Forward nodes preserve the full value. Redirect immutable graph edges,
+                  // never guest reads or dynamic values. Leave cycles and invalid edges intact.
+                  const auto count = static_cast<uint32_t>(compiled->nodes.size());
+                  std::vector<uint32_t> aliases(count);
+                  for (uint32_t index = 0; index < count; ++index) {
+                      aliases[index] = index;
+                      auto target = index;
+                      for (uint32_t depth = 0; depth < count; ++depth) {
+                          const auto& node = compiled->nodes[target];
+                          if (node.op != NodeOp::Forward) {
+                              aliases[index] = target;
+                              break;
+                          }
+                          const auto next = node.args[0];
+                          if (next >= count) break;
+                          target = next;
+                      }
+                  }
+                  const auto redirect = [&](uint32_t& index) {
+                      if (index < count) index = aliases[index];
+                  };
+                  for (auto& node : compiled->nodes)
+                      for (auto& arg : node.args) redirect(arg);
+                  for (auto& index : compiled->slots) redirect(index);
+                  for (auto& descriptor : compiled->descriptors)
+                      for (auto& index : descriptor) redirect(index);
+                  for (auto& index : compiled->key_counts) redirect(index);
+                  for (auto& index : compiled->selector_masks) redirect(index);
+                  for (auto& index : compiled->conditions) redirect(index);
+                  for (auto& index : compiled->fill) redirect(index);
               }
-          """ + old
-
-          s = s.replace(old, new)
+          '''
+          s = s.replace(old, code + old)
           p.write_text(s, encoding="utf-8", newline="\n")
 
           p = Path("tests/ResourceMaterializationTests.cpp")
           s = p.read_text(encoding="utf-8")
-          old = '        "a branch change was hidden by the memo");\n}'
+          old = "int main() {"
           if s.count(old) != 1:
-              raise RuntimeError("Active branch regression missing")
+              raise RuntimeError("Resource test entry missing")
 
-          new = """        "a branch change was hidden by the memo");
-            // Revisit both leaves and change descriptor data on each iteration.
+          code = r'''void TestSrtForwardCyclesAndFailures() {
+            using namespace Libs::Graphics::ShaderRecompiler::IR;
+            for (const bool cycle : {false, true}) {
+              auto plan = MemoPlan(MemoPlanExtra::None, false);
+              auto& bits = plan.value_storage.emplace_back(ValueOpcode::BitCastF32U32);
+              auto& restored = plan.value_storage.emplace_back(ValueOpcode::BitCastU32F32);
+              restored.SetArg(0, Value(&bits));
+              if (cycle) bits.SetArg(0, Value(&restored));
+              else {
+                auto& undef = plan.value_storage.emplace_back(ValueOpcode::UndefU32);
+                bits.SetArg(0, Value(&undef));
+              }
+              plan.descriptor_sources[1].dwords[0] = Value(&restored);
+              MemoFixture fixture;
+              Check(!fixture.Refresh(plan), "alias cycle or unsupported value was accepted");
+              Check(!fixture.memo.valid, "failed alias refresh left a valid memo");
+            }
+          }
+
+          void TestSrtForwardAliasesKeepFreshValues() {
+            using namespace Libs::Graphics::ShaderRecompiler::IR;
+            auto plan = MemoPlan(MemoPlanExtra::None, true);
+            for (auto& source : plan.descriptor_sources) {
+              for (uint32_t word = 0; word < source.dword_count; ++word) {
+                auto& bits = plan.value_storage.emplace_back(ValueOpcode::BitCastF32U32);
+                bits.SetArg(0, source.dwords[word]);
+                auto& restored = plan.value_storage.emplace_back(ValueOpcode::BitCastU32F32);
+                restored.SetArg(0, Value(&bits));
+                source.dwords[word] = Value(&restored);
+              }
+            }
+            MemoFixture fixture;
             for (uint32_t i = 0; i < 128; ++i) {
               const bool first = (i % 4u) < 2u;
               fixture.memory.words[4] = first ? 1u : 0u;
-              const uint32_t value = 0x3000u + i;
-              if (first) fixture.memory.words[0] = value;
-              else fixture.user_data[2] = value;
-              Check(fixture.Refresh(plan), "cached active branch refresh failed");
-              Check(fixture.snapshot.buffers[first ? 0u : 1u].dwords[0] == value &&
-                        fixture.snapshot.buffers[first ? 1u : 0u].dwords[0] == 0u,
-                    "cached active mask lost a branch or descriptor change");
+              const std::array<uint32_t, 4> patterns {
+                  0x80000000u, 0xffffffffu, 0x7fc00000u, 0x7f800000u};
+              const uint32_t value = patterns[i % patterns.size()] ^ i;
+              fixture.memory.words[0] = value;
+              fixture.user_data[2] = value + 0x1000u;
+              Check(fixture.Refresh(plan), "forward alias refresh failed");
+              Check(fixture.snapshot.buffers[first ? 0u : 1u].dwords[0] ==
+                        (first ? value : value + 0x1000u) &&
+                    fixture.snapshot.buffers[first ? 1u : 0u].dwords[0] == 0u,
+                    "forward aliases hid a descriptor or branch change");
+            }
+            const auto& compiled = CompileResourcePlan(plan);
+            const char* setting = std::getenv("KYTY_SRT_ALIASES_32");
+            if (setting && std::strcmp(setting, "1") == 0) {
+              Check(compiled.nodes[compiled.descriptors[0][0]].op == ResourceNode::Op::ReadConst,
+                    "flat descriptor forward chain was not removed");
+              Check(compiled.nodes[compiled.descriptors[1][0]].op == ResourceNode::Op::UserData,
+                    "user-data descriptor forward chain was not removed");
             }
           }
-          """
 
-          s = s.replace(old, new)
+          '''
+          s = s.replace(old, code + old)
+          s = s.replace(
+              "  TestMemoTracksDescriptorInputs();",
+              "  TestMemoTracksDescriptorInputs();\n"
+              "  TestSrtForwardAliasesKeepFreshValues();\n"
+              "  TestSrtForwardCyclesAndFailures();"
+          )
+          s = "#include <cstring>\n" + s
           p.write_text(s, encoding="utf-8", newline="\n")
-          print("Prueba 31: refreshed flat SRT lookup; guest memory readers unchanged")
+          print("Prueba 32: immutable SRT forward aliases; guest readers unchanged")
           '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "Direct flat adaptation failed" }
+          if ($LASTEXITCODE -ne 0) { throw "SRT simplification failed" }
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
@@ -192,7 +264,7 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected build step")
 
-              script = Path(f"_build31_{index}.ps1")
+              script = Path(f"_build32_{index}.ps1")
               script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
               print("Running:", step["name"], flush=True)
               path_file = Path(os.environ["GITHUB_PATH"])
@@ -201,7 +273,7 @@ jobs:
 
               modes = ("0", "1") if step["name"] == "Test memory and shader paths" else ("0",)
               for mode in modes:
-                  os.environ["KYTY_DIRECT_FLAT_31"] = mode
+                  os.environ["KYTY_SRT_ALIASES_32"] = mode
                   subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
 
           if not started or not finished:
@@ -216,7 +288,7 @@ jobs:
           if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
 
           foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Prueba-31.cmd" } else { "Comparacion-31.cmd" }
+            $name = if ($mode -eq 1) { "Prueba-32.cmd" } else { "Comparacion-32.cmd" }
             @(
               '@echo off',
               'setlocal',
@@ -235,7 +307,8 @@ jobs:
               'set KYTY_RESOURCE_BLOCKS_32=0',
               'set KYTY_HOST_PRIORITY_26=0',
               'set KYTY_REFRESH_DIAGNOSTIC_27=0',
-              "set KYTY_DIRECT_FLAT_31=$mode",
+              "set KYTY_SRT_ALIASES_32=$mode",
+              'set KYTY_DIRECT_FLAT_31=0',
               'set KYTY_DIRECT_INPUTS_29=0',
               'set KYTY_ACTIVE_MASK_VIEW_28=0',
               'set KYTY_DEBUG_QUEUES=',
@@ -269,23 +342,23 @@ jobs:
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
             "Upstream a67a033 and f3dc5ee retained.",
-            "Comparacion-31.cmd: stable settings, shortcut OFF.",
-            "Prueba-31.cmd: same settings, refreshed SRT shortcut ON.",
+            "Comparacion-32.cmd: stable settings, simplification OFF.",
+            "Prueba-32.cmd: same settings, immutable SRT simplification ON.",
             "Keep AMD CPU patch OFF, shader validation OFF, red-zone protection ON.",
             "Copy your working _Patches; select THIS interpreter.",
             "Close all emulator and launcher processes before switching mode.",
             "Compare the same heavy view for 60 seconds; report FPS and visual changes."
-          ) | Set-Content "$install/PRUEBA-31.txt" -Encoding ascii
+          ) | Set-Content "$install/PRUEBA-32.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-31-Recursos.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-32-Recursos.zip" `
             -Force -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Prueba-31-Recursos.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-32-Recursos.zip"
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
           }
@@ -293,7 +366,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-31-Recursos
-          path: KytyPS5-Windows-AMD-Prueba-31-Recursos.zip
+          name: KytyPS5-Windows-AMD-Prueba-32-Recursos
+          path: KytyPS5-Windows-AMD-Prueba-32-Recursos.zip
           if-no-files-found: error
           retention-days: 7
