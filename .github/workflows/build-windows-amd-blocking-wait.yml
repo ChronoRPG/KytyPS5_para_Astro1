@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 23 - Lecturas de recursos
+name: Windows AMD - Prueba 26 - Prioridades de hilos
 
 on:
   workflow_dispatch:
@@ -47,8 +47,13 @@ jobs:
           import subprocess
           import yaml
 
-          baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
-          steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+          baseline = Path(
+              "_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml"
+          )
+          steps = yaml.safe_load(
+              baseline.read_text(encoding="utf-8")
+          )["jobs"]["build"]["steps"]
+
           started = False
           finished = False
 
@@ -56,18 +61,22 @@ jobs:
               if step.get("name") == "Setup MSVC environment":
                   finished = True
                   break
+
               if step.get("name") == "Verify AMD base":
                   started = True
+
               if not started:
                   continue
+
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
 
-              script = Path(f"_prepare23_{index}.ps1")
+              script = Path(f"_prepare26_{index}.ps1")
               script.write_text(
                   '$ErrorActionPreference = "Stop"\n' + step["run"],
                   encoding="utf-8"
               )
+
               print("Preparing:", step["name"], flush=True)
               subprocess.run(
                   ["pwsh", "-NoProfile", "-File", str(script.resolve())],
@@ -82,111 +91,166 @@ jobs:
             throw "Baseline preparation failed"
           }
 
-      - name: Add optional 32 block resource cache
+      - name: Adapt pinned PR 1050 with optional host priorities
         run: |
           $ErrorActionPreference = "Stop"
 
-          @'
-          from pathlib import Path
+          git fetch --no-tags https://github.com/KytyPS5/KytyPS5.git f7b0b3b56b45fa59a91efa8f21df14685fbcac87 356568c1bb3055924e14ddd10bb720d3901842d7
 
-          p = Path("src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp")
-          s = p.read_text(encoding="utf-8")
-
-          old = "class OrdinaryBlockCache {"
-          if s.count(old) != 1:
-              raise RuntimeError("Unexpected cache source")
-          s = s.replace(old, "template <uint32_t Capacity = 8>\n" + old)
-
-          a = s.index("template <uint32_t Capacity = 8>\nclass OrdinaryBlockCache {")
-          b = s.index("\nSrtRuntime ObservedRuntime", a)
-          section = s[a:b]
-          old = "\tstatic constexpr uint32_t Capacity   = 8;\n"
-          if section.count(old) != 1:
-              raise RuntimeError("Capacity missing")
-          s = s[:a] + section.replace(old, "") + s[b:]
-
-          a = s.index("\t\tOrdinaryBlockCache ordinary(clean_source);")
-          b = s.index("\n\t}", a)
-          body = s[a:b]
-          if body.count("result = Materialize(") != 1:
-              raise RuntimeError("Refresh body changed")
-
-          body = body.replace(
-              "OrdinaryBlockCache ordinary",
-              "OrdinaryBlockCache<Capacity> ordinary"
-          )
-          body = body.replace("result = Materialize(", "return Materialize(")
-
-          new = "\t\tconst auto execute = [&]<uint32_t Capacity>() {\n"
-          new += "\n".join("\t" + line for line in body.splitlines())
-          new += "\n\t\t};\n"
-          new += """        static const bool larger_blocks = [] {
-                      const char* value = std::getenv("KYTY_RESOURCE_BLOCKS_32");
-                      return value && std::strcmp(value, "1") == 0;
-                  }();
-                  const bool use_larger = larger_blocks && !capture_reads &&
-                      runtime.read_memory != nullptr && runtime.read_memory_block != nullptr;
-                  result = use_larger ? execute.template operator()<32>()
-                                      : execute.template operator()<8>();"""
-
-          s = s[:a] + new + s[b:]
-          p.write_text(s, encoding="utf-8", newline="\n")
-          print("Prueba 23: optional 32-block cache, fresh for every refresh")
-
-          p = Path("tests/ResourceMaterializationTests.cpp")
-          s = p.read_text(encoding="utf-8")
-          old = "int main() {"
-          if s.count(old) != 1:
-              raise RuntimeError("Unexpected test main")
-
-          new = r"""void TestOrdinaryBlocksKeepFreshReads() {
-            using namespace Libs::Graphics::ShaderRecompiler::IR;
-            struct Memory {
-              TableMemory table;
-              bool reject_block = false;
-              uint32_t block_reads = 0;
-              static bool Exact(void* data, uint64_t address, std::span<uint32_t> values) {
-                return TableMemory::Read(&static_cast<Memory*>(data)->table, address, values);
-              }
-              static bool Whole(void* data, uint64_t address, std::span<uint32_t> values) {
-                auto& self = *static_cast<Memory*>(data);
-                self.block_reads++;
-                return !self.reject_block && Exact(data, address, values);
-              }
-            } memory;
-            const auto plan = SrtPlan(TableMemory::Base);
-            const SrtRuntime runtime {
-              .read_memory = Memory::Exact,
-              .userdata = &memory,
-              .read_memory_block = Memory::Whole,
-            };
-            ResourceSnapshot snapshot;
-            ResourceSpecialization specialization;
-            const auto refresh = [&] {
-              Check(MaterializeResources(plan, runtime, snapshot, specialization),
-                    "ordinary block refresh failed");
-              Check(snapshot.flattened_srt[0] == memory.table.words[0],
-                    "ordinary block cache reused data from an earlier refresh");
-            };
-            memory.table.words[0] = 17;
-            refresh();
-            Check(memory.block_reads != 0, "ordinary block reader was bypassed");
-            memory.table.words[0] = 29;
-            refresh();
-            memory.reject_block = true;
-            memory.table.words[0] = 41;
-            refresh();
+          if ($LASTEXITCODE -ne 0) {
+            throw "Priority source fetch failed"
           }
 
-          int main() {
-            TestOrdinaryBlocksKeepFreshReads();"""
+          @'
+          from pathlib import Path
+          import subprocess
 
-          s = s.replace(old, new)
+          p = Path("src/kernel/pthread.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          a = s.index("int PthreadGetPriorityForKernel(Pthread thread) {")
+          b = s.index("\nint PthreadGetCurrentPriorityForKernel()", a)
+          original = s[a:b]
+
+          patch = Path("_priority26.patch")
+          with patch.open("wb") as out:
+              subprocess.run(
+                  [
+                      "git", "diff",
+                      "f7b0b3b56b45fa59a91efa8f21df14685fbcac87^",
+                      "356568c1bb3055924e14ddd10bb720d3901842d7",
+                      "--", "src/kernel/pthread.cpp"
+                  ],
+                  stdout=out,
+                  check=True
+              )
+
+          subprocess.run(
+              ["git", "apply", "--check", str(patch)],
+              check=True
+          )
+          subprocess.run(
+              ["git", "apply", str(patch)],
+              check=True
+          )
+
+          s = p.read_text(encoding="utf-8")
+
+          def replace(old, new):
+              global s
+              if s.count(old) != 1:
+                  raise RuntimeError(
+                      "Unexpected priority source: " + old[:70]
+                  )
+              s = s.replace(old, new)
+
+          replace(
+              "constexpr int GUEST_HOST_PRIORITY_HIGH   = 0;",
+              '''static bool HostPriority26Enabled() {
+              static const bool enabled = [] {
+                  const char* value = std::getenv("KYTY_HOST_PRIORITY_26");
+                  return value != nullptr && std::strcmp(value, "1") == 0;
+              }();
+              return enabled;
+          }
+          constexpr int GUEST_HOST_PRIORITY_HIGH   = 0;'''
+          )
+
+          replace(
+              "return GUEST_HOST_PRIORITY_HIGH;",
+              "return HostPriority26Enabled() ? GUEST_HOST_PRIORITY_HIGH : +2;"
+          )
+
+          replace(
+              "return GUEST_HOST_PRIORITY_NORMAL;",
+              "return HostPriority26Enabled() ? GUEST_HOST_PRIORITY_NORMAL : 0;"
+          )
+
+          replace(
+              "return core_bound ? std::max(host - 1, -2) : host;",
+              "return HostPriority26Enabled() && core_bound ? std::max(host - 1, -2) : host;"
+          )
+
+          old_body = original[
+              original.index("{") + 1:original.rfind("}")
+          ]
+
+          replace(
+              "int PthreadGetPriorityForKernel(Pthread thread) {",
+              "int PthreadGetPriorityForKernel(Pthread thread) {\n"
+              "#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS\n"
+              "    if (!HostPriority26Enabled()) {\n"
+              + old_body +
+              "\n    }\n"
+              "#endif\n"
+          )
+
+          replace(
+              "thread->core_bound = LowerCoreBoundThread(thread->attr->affinity);",
+              "if (HostPriority26Enabled()) {\n"
+              "\tthread->core_bound = LowerCoreBoundThread(thread->attr->affinity);"
+          )
+
+          replace(
+              "GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));",
+              "GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));\n"
+              "    }"
+          )
+
+          s = "#include <cstdlib>\n#include <cstring>\n" + s
           p.write_text(s, encoding="utf-8", newline="\n")
+
+          p = Path("src/graphics/guest_gpu/graphicsRun.cpp")
+          s = p.read_text(encoding="utf-8")
+
+          anchor = "#include <algorithm>"
+          if s.count(anchor) != 1:
+              raise RuntimeError("Unexpected graphics includes")
+
+          s = s.replace(
+              anchor,
+              '''#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+          #ifndef NOMINMAX
+          #define NOMINMAX
+          #endif
+          #include <windows.h>
+          #undef min
+          #undef max
+          #endif
+          #include <cstring>
+          ''' + anchor
+          )
+
+          anchor = "\tg_gpu_state  = gpu;"
+          if s.count(anchor) != 1:
+              raise RuntimeError("Unexpected GPU entry")
+
+          s = s.replace(
+              anchor,
+              anchor + '''
+          #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+              const char* priority26 = std::getenv("KYTY_HOST_PRIORITY_26");
+              const bool priority26_enabled =
+                  priority26 && std::strcmp(priority26, "1") == 0;
+
+              if (priority26_enabled &&
+                  !SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST)) {
+                  printf("Prueba 26: GPU thread priority failed, error %lu\\n",
+                         GetLastError());
+              }
+
+              printf("Prueba 26: host priorities %s\\n",
+                     priority26_enabled ? "ON" : "OFF");
+          #endif
+          '''
+          )
+
+          p.write_text(s, encoding="utf-8", newline="\n")
+          print("Prueba 26: optional host priorities adapted")
           '@ | python -
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Resource block adaptation failed"
+            throw "Priority adaptation failed"
           }
 
           git diff --check
@@ -212,7 +276,7 @@ jobs:
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
         with:
-          version: '6.8.3'
+          version: 6.8.3
           host: windows
           target: desktop
           arch: win64_msvc2022_64
@@ -222,19 +286,26 @@ jobs:
       - name: Install glslang
         run: |
           $ErrorActionPreference = "Stop"
+
           $headers = @{
             "User-Agent" = "GitHub-Actions-KytyPS5"
             "Accept" = "application/vnd.github+json"
           }
 
-          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" `
+            -Headers $headers
+
           $asset = $release.assets | Where-Object {
-            $_.name -match "(?i)windows" -and $_.name -match "(?i)(x64|x86_64|amd64)" -and $_.name -match "(?i)\.zip$"
+            $_.name -match "(?i)windows" -and
+            $_.name -match "(?i)(x64|x86_64|amd64)" -and
+            $_.name -match "(?i)\.zip$"
           } | Select-Object -First 1
 
           if (-not $asset) {
             $asset = $release.assets | Where-Object {
-              $_.name -match "(?i)windows" -and $_.name -match "(?i)\.zip$"
+              $_.name -match "(?i)windows" -and
+              $_.name -match "(?i)\.zip$"
             } | Select-Object -First 1
           }
 
@@ -245,12 +316,21 @@ jobs:
           $zip = "$env:RUNNER_TEMP/glslang.zip"
           $extract = "$env:RUNNER_TEMP/glslang"
 
-          Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zip
+          Invoke-WebRequest `
+            -Uri $asset.browser_download_url `
+            -Headers $headers `
+            -OutFile $zip
+
           Expand-Archive -Path $zip -DestinationPath $extract -Force
 
-          $validator = Get-ChildItem $extract -Filter "glslangValidator.exe" -Recurse | Select-Object -First 1
+          $validator = Get-ChildItem $extract `
+            -Filter "glslangValidator.exe" -Recurse |
+            Select-Object -First 1
+
           if (-not $validator) {
-            $validator = Get-ChildItem $extract -Filter "glslang.exe" -Recurse | Select-Object -First 1
+            $validator = Get-ChildItem $extract `
+              -Filter "glslang.exe" -Recurse |
+              Select-Object -First 1
           }
 
           if (-not $validator) {
@@ -258,7 +338,9 @@ jobs:
           }
 
           if ($validator.Name -eq "glslang.exe") {
-            Copy-Item $validator.FullName (Join-Path $validator.Directory.FullName "glslangValidator.exe") -Force
+            Copy-Item $validator.FullName `
+              (Join-Path $validator.Directory.FullName "glslangValidator.exe") `
+              -Force
           }
 
           Add-Content $env:GITHUB_PATH $validator.Directory.FullName
@@ -303,21 +385,25 @@ jobs:
           $env:KYTY_TRACKING_BLOCKING_WAIT = "1"
           $env:KYTY_SHARED_SAMPLER_SNAPSHOTS = "1"
 
-          foreach ($blocks in @(0, 1)) {
-            $env:KYTY_RESOURCE_BLOCKS_32 = "$blocks"
+          foreach ($priority in @(0, 1)) {
+            $env:KYTY_HOST_PRIORITY_26 = "$priority"
 
             foreach ($mode in @(0, 1)) {
               $env:KYTY_DIRECT_COLOR_METADATA = "$mode"
 
-              ctest --test-dir _Build/windows -R '^(shader_vertex_metadata|memory_tracker|resource_materialization|shader_cfg|virtual_memory_allocation)$' --output-on-failure --no-tests=error
+              ctest `
+                --test-dir _Build/windows `
+                -R '^(shader_vertex_metadata|memory_tracker|resource_materialization|shader_cfg|virtual_memory_allocation)$' `
+                --output-on-failure `
+                --no-tests=error
 
               if ($LASTEXITCODE -ne 0) {
-                throw "Tests failed: blocks=$blocks metadata=$mode"
+                throw "Tests failed: priority=$priority metadata=$mode"
               }
             }
           }
 
-          Remove-Item Env:KYTY_RESOURCE_BLOCKS_32
+          Remove-Item Env:KYTY_HOST_PRIORITY_26
           Remove-Item Env:KYTY_DIRECT_COLOR_METADATA
           Remove-Item Env:KYTY_SHARED_SAMPLER_SNAPSHOTS
           Remove-Item Env:KYTY_TRACKING_BLOCKING_WAIT
@@ -342,7 +428,11 @@ jobs:
           }
 
           foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Prueba-23.cmd" } else { "Comparacion-14.cmd" }
+            $name = if ($mode -eq 1) {
+              "Prueba-26.cmd"
+            } else {
+              "Comparacion-26.cmd"
+            }
 
             @(
               '@echo off',
@@ -359,7 +449,8 @@ jobs:
               'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
               'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
               'set KYTY_DEBUG_SHADER_CPU=0',
-              "set KYTY_RESOURCE_BLOCKS_32=$mode",
+              'set KYTY_RESOURCE_BLOCKS_32=0',
+              "set KYTY_HOST_PRIORITY_26=$mode",
               'set KYTY_DEBUG_QUEUES=',
               'set KYTY_SRT_STATS=',
               'set KYTY_DEBUG_SRT_RUNS=',
@@ -380,7 +471,9 @@ jobs:
             ) | Set-Content "$install/$name" -Encoding ascii
           }
 
-          $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
+          $maps = Get-ChildItem "_Build/windows" `
+            -Filter "kyty_emulator_*.map" -File
+
           if (-not $maps) {
             throw "Emulator map missing"
           }
@@ -390,21 +483,23 @@ jobs:
           }
 
           $pdb = "_Build/windows/kyty_emulator.pdb"
+
           if (-not (Test-Path $pdb)) {
             throw "Emulator PDB missing"
           }
+
           Copy-Item $pdb $install -Force
 
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Comparacion-14.cmd: original 8-block cache.",
-            "Prueba-23.cmd: 32-block cache.",
-            "Diagnostic counters OFF in both modes.",
-            "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
-            "Copy your working _Patches and select THIS interpreter.",
-            "Close emulator and launcher before changing mode.",
+            "Upstream a67a033 and f3dc5ee retained.",
+            "Comparacion-26.cmd: stable settings, new host priorities OFF.",
+            "Prueba-26.cmd: same settings, new host priorities ON.",
+            "Keep AMD CPU patch OFF, shader validation OFF, red-zone protection ON.",
+            "Copy your working _Patches; select THIS interpreter.",
+            "Close emulator and launcher before switching mode.",
             "Compare the same heavy view for 60 seconds in each mode."
-          ) | Set-Content "$install/PRUEBA-23.txt" -Encoding ascii
+          ) | Set-Content "$install/PRUEBA-26.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
@@ -412,10 +507,12 @@ jobs:
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-23-Recursos.zip" `
-            -Force -ErrorAction Stop
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-26-Prioridades.zip" `
+            -Force `
+            -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Prueba-23-Recursos.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-26-Prioridades.zip"
+
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
           }
@@ -423,7 +520,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-23-Recursos
-          path: KytyPS5-Windows-AMD-Prueba-23-Recursos.zip
+          name: KytyPS5-Windows-AMD-Prueba-26-Prioridades
+          path: KytyPS5-Windows-AMD-Prueba-26-Prioridades.zip
           if-no-files-found: error
           retention-days: 7
