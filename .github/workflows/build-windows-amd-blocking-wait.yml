@@ -61,6 +61,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
           if (-not $pythonExe) { throw "Python executable missing" }
+
           "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
           & $pythonExe -m pip install PyYAML==6.0.2
@@ -163,6 +164,7 @@ jobs:
       - name: Build and test using pinned working workflow
         run: |
           $ErrorActionPreference = "Stop"
+
           & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
           if ($LASTEXITCODE -ne 0) { throw "Pinned Python YAML verification failed" }
 
@@ -196,12 +198,34 @@ jobs:
                       "-DCMAKE_C_COMPILER=clang-cl",
                       "-DCMAKE_CXX_COMPILER=clang-cl",
                       "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
-                      "-DCMAKE_C_FLAGS=" + flags,
-                      "-DCMAKE_CXX_FLAGS=" + flags,
+                      "-DCMAKE_C_FLAGS_INIT=" + flags,
+                      "-DCMAKE_CXX_FLAGS_INIT=" + flags,
                       "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
                   ]
+
                   print("Configuring profile:", os.environ["KYTY_PROFILE_33"], flags, flush=True)
                   subprocess.run(args, check=True)
+
+                  cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
+                  cpp_flags = next(
+                      (
+                          line.split("=", 1)[1]
+                          for line in cache.splitlines()
+                          if line.startswith("CMAKE_CXX_FLAGS:STRING=")
+                      ),
+                      None
+                  )
+
+                  if cpp_flags is None or "/ehsc" not in cpp_flags.lower():
+                      raise RuntimeError(
+                          "CMake lost /EHsc: C++ exceptions must remain enabled"
+                      )
+                  if not all(option in cpp_flags for option in flags.split()):
+                      raise RuntimeError(
+                          "Selected CPU flags are missing from CMAKE_CXX_FLAGS"
+                      )
+
+                  print("Verified C++ flags:", cpp_flags, flush=True)
                   continue
 
               script = Path(f"_build33_{index}.ps1")
@@ -223,6 +247,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $install = "_Build/windows/install"
+
           if (-not (Test-Path "$install/launcher.exe")) {
             throw "launcher.exe missing"
           }
