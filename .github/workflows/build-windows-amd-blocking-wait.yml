@@ -1,4 +1,4 @@
-name: Windows AMD - Diagnostico 27 - Actualizacion de recursos
+name: Windows AMD - Prueba 28 - Recursos activos
 
 on:
   workflow_dispatch:
@@ -97,7 +97,7 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
 
-              script = Path(f"_prepare27_{index}.ps1")
+              script = Path(f"_prepare28_{index}.ps1")
               script.write_text(
                   '$ErrorActionPreference = "Stop"\n' + step["run"],
                   encoding="utf-8"
@@ -117,7 +117,7 @@ jobs:
             throw "Baseline preparation failed"
           }
 
-      - name: Add sampled resource refresh diagnostic
+      - name: Add optional active mask view and branch regression
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -125,185 +125,75 @@ jobs:
           from pathlib import Path
 
           p = Path(
-              "src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+              "src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp"
           )
           s = p.read_text(encoding="utf-8")
+          s = "#include <cstdlib>\n#include <cstring>\n" + s
 
-          helper = r"""
-          namespace {
-          struct Refresh27Stats {
-              uint64_t calls = 0, samples = 0, reused = 0;
-              std::array<uint64_t, 7> ns {};
-              std::chrono::steady_clock::time_point window =
-                  std::chrono::steady_clock::now();
-          };
+          old = (
+              "\t\t\tactive.assign(first, first + count);\n"
+              "\t\t\treturn active;"
+          )
 
-          thread_local Refresh27Stats refresh27_stats;
+          if s.count(old) != 1:
+              raise RuntimeError("Unexpected active-tree hit path")
 
-          struct Refresh27Timer {
-              using Clock = std::chrono::steady_clock;
-              bool sampled = false;
-              size_t phase = 0;
-              Clock::time_point last;
+          new = """            static const bool direct_mask = [] {
+                          const char* value = std::getenv("KYTY_ACTIVE_MASK_VIEW_28");
+                          return value && std::strcmp(value, "1") == 0;
+                      }();
 
-              Refresh27Timer() {
-                  static const bool enabled = [] {
-                      const char* v = std::getenv("KYTY_REFRESH_DIAGNOSTIC_27");
-                      return v && std::strcmp(v, "1") == 0;
-                  }();
+                      if (direct_mask) {
+                          return std::span<const uint8_t>(
+                              m_program.ThreadScratch().active_tree_sources
+                          ).subspan(
+                              tree[node].sources,
+                              static_cast<size_t>(count)
+                          );
+                      }
+          """ + old
 
-                  if (!enabled) return;
+          s = s.replace(old, new)
+          p.write_text(s, encoding="utf-8", newline="\n")
 
-                  auto& st = refresh27_stats;
-                  const uint64_t sequence = ++st.calls;
-                  sampled =
-                      ((sequence * 11400714819323198485ull) >> 54u) == 0;
+          p = Path("tests/ResourceMaterializationTests.cpp")
+          s = p.read_text(encoding="utf-8")
 
-                  if (sampled) last = Clock::now();
-              }
+          old = '        "a branch change was hidden by the memo");\n}'
+          if s.count(old) != 1:
+              raise RuntimeError("Active branch regression missing")
 
-              void Next(size_t next) {
-                  if (!sampled) return;
+          new = """        "a branch change was hidden by the memo");
 
-                  const auto now = Clock::now();
-                  refresh27_stats.ns[phase] += static_cast<uint64_t>(
-                      std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          now - last
-                      ).count()
-                  );
+            // Revisit both cached leaves and change descriptor data.
+            for (uint32_t i = 0; i < 128; ++i) {
+              const bool first = (i % 4u) < 2u;
+              fixture.memory.words[4] = first ? 1u : 0u;
+              const uint32_t value = 0x3000u + i;
 
-                  last = now;
-                  phase = next;
-              }
+              if (first) fixture.memory.words[0] = value;
+              else fixture.user_data[2] = value;
 
-              void Reused() {
-                  if (sampled) ++refresh27_stats.reused;
-              }
+              Check(fixture.Refresh(plan),
+                    "cached active branch refresh failed");
 
-              ~Refresh27Timer() {
-                  if (!sampled) return;
-
-                  Next(phase);
-                  auto& st = refresh27_stats;
-                  ++st.samples;
-
-                  const double seconds =
-                      std::chrono::duration<double>(last - st.window).count();
-
-                  if (seconds < 5.0) return;
-
-                  uint64_t total = 0;
-                  for (auto v : st.ns) total += v;
-
-                  static constexpr const char* names[] = {
-                      "active", "flat", "fill", "memo",
-                      "descriptors", "specialization", "finish"
-                  };
-
-                  std::printf(
-                      "refresh27: seconds=%.1f calls=%llu samples=%llu "
-                      "memo-reused=%llu sampled-us/refresh=%.3f",
-                      seconds,
-                      static_cast<unsigned long long>(st.calls),
-                      static_cast<unsigned long long>(st.samples),
-                      static_cast<unsigned long long>(st.reused),
-                      static_cast<double>(total) / 1000.0 /
-                          static_cast<double>(st.samples)
-                  );
-
-                  for (size_t i = 0; i < 7; ++i) {
-                      std::printf(
-                          " %s-us=%.3f",
-                          names[i],
-                          static_cast<double>(st.ns[i]) / 1000.0 /
-                              static_cast<double>(st.samples)
-                      );
-                  }
-
-                  std::printf("\n");
-                  std::fflush(stdout);
-
-                  st.calls = st.samples = st.reused = 0;
-                  st.ns.fill(0);
-                  st.window = last;
-              }
-          };
+              Check(
+                  fixture.snapshot.buffers[first ? 0u : 1u].dwords[0] == value &&
+                  fixture.snapshot.buffers[first ? 1u : 0u].dwords[0] == 0u,
+                  "cached active mask lost a branch or descriptor change"
+              );
+            }
           }
           """
 
-          def change(old, new):
-              global s
-              if s.count(old) != 1:
-                  raise RuntimeError(
-                      "Unexpected refresh source: " + old[:75]
-                  )
-              s = s.replace(old, new)
-
-          s = (
-              "#include <chrono>\n"
-              "#include <cstdio>\n"
-              "#include <cstdlib>\n"
-              "#include <cstring>\n"
-          ) + s
-
-          change(
-              "template <typename Roots>\nbool Materialize(",
-              helper + "\ntemplate <typename Roots>\nbool Materialize("
-          )
-
-          change(
-              "\tconst auto active = walker.FindActiveSources();",
-              "\tRefresh27Timer timer27;\n"
-              "\tconst auto active = walker.FindActiveSources();\n"
-              "\ttimer27.Next(1);"
-          )
-
-          change(
-              "\tsnapshot.uniform_fill = {};",
-              "\ttimer27.Next(2);\n"
-              "\tsnapshot.uniform_fill = {};"
-          )
-
-          change(
-              "\tif constexpr (std::is_same_v<Roots, CompiledRoots>) {\n"
-              "\t\tif (memo != nullptr) {",
-              "\ttimer27.Next(3);\n"
-              "\tif constexpr (std::is_same_v<Roots, CompiledRoots>) {\n"
-              "\t\tif (memo != nullptr) {"
-          )
-
-          change(
-              "\t\t\t\tmemo->reused = true;",
-              "\t\t\t\ttimer27.Reused();\n"
-              "\t\t\t\tmemo->reused = true;"
-          )
-
-          change(
-              "\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {",
-              "\ttimer27.Next(4);\n"
-              "\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {"
-          )
-
-          change(
-              "\tif (!BuildResourceSpecialization(program, snapshot, specialization)) {",
-              "\ttimer27.Next(5);\n"
-              "\tif (!BuildResourceSpecialization(program, snapshot, specialization)) {"
-          )
-
-          change(
-              "\tif constexpr (std::is_same_v<Roots, CompiledRoots>) {\n"
-              "\t\tif (memo != nullptr && roots.compiled.memoizable) {",
-              "\ttimer27.Next(6);\n"
-              "\tif constexpr (std::is_same_v<Roots, CompiledRoots>) {\n"
-              "\t\tif (memo != nullptr && roots.compiled.memoizable) {"
-          )
-
+          s = s.replace(old, new)
           p.write_text(s, encoding="utf-8", newline="\n")
-          print("Refresh diagnostic 27: sampled CPU preparation phases")
+
+          print("Prueba 28: optional active-mask view")
           '@ | & $env:KYTY_PYTHON -
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Refresh diagnostic adaptation failed"
+            throw "Active mask adaptation failed"
           }
 
           git diff --check
@@ -375,7 +265,7 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected build step")
 
-              script = Path(f"_build27_{index}.ps1")
+              script = Path(f"_build28_{index}.ps1")
               script.write_text(
                   '$ErrorActionPreference = "Stop"\n' + step["run"],
                   encoding="utf-8"
@@ -392,10 +282,18 @@ jobs:
                   entries + [os.environ["PATH"]]
               )
 
-              subprocess.run(
-                  ["pwsh", "-NoProfile", "-File", str(script.resolve())],
-                  check=True
+              modes = (
+                  ("0", "1")
+                  if step["name"] == "Test memory and shader paths"
+                  else ("0",)
               )
+
+              for mode in modes:
+                  os.environ["KYTY_ACTIVE_MASK_VIEW_28"] = mode
+                  subprocess.run(
+                      ["pwsh", "-NoProfile", "-File", str(script.resolve())],
+                      check=True
+                  )
 
           if not started or not finished:
               raise RuntimeError("Build boundaries missing")
@@ -416,9 +314,9 @@ jobs:
 
           foreach ($mode in @(0, 1)) {
             $name = if ($mode -eq 1) {
-              "Diagnostico-27.cmd"
+              "Prueba-28.cmd"
             } else {
-              "Comparacion-27.cmd"
+              "Comparacion-28.cmd"
             }
 
             @(
@@ -438,7 +336,8 @@ jobs:
               'set KYTY_DEBUG_SHADER_CPU=0',
               'set KYTY_RESOURCE_BLOCKS_32=0',
               'set KYTY_HOST_PRIORITY_26=0',
-              "set KYTY_REFRESH_DIAGNOSTIC_27=$mode",
+              'set KYTY_REFRESH_DIAGNOSTIC_27=0',
+              "set KYTY_ACTIVE_MASK_VIEW_28=$mode",
               'set KYTY_DEBUG_QUEUES=',
               'set KYTY_SRT_STATS=',
               'set KYTY_DEBUG_SRT_RUNS=',
@@ -480,13 +379,13 @@ jobs:
 
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Comparacion-27.cmd: stable settings, refresh diagnostic OFF.",
-            "Diagnostico-27.cmd: sampled resource refresh diagnostic ON.",
+            "Comparacion-28.cmd: stable settings, active-mask view OFF.",
+            "Prueba-28.cmd: same settings, active-mask view ON.",
             "Keep AMD CPU patch OFF, shader validation OFF, red-zone protection ON.",
             "Copy your working _Patches; select THIS interpreter.",
-            "Capture heavy and light views separately for 60 seconds.",
-            "Copy the console output containing refresh27 lines."
-          ) | Set-Content "$install/DIAGNOSTICO-27.txt" -Encoding ascii
+            "Close emulator and launcher before switching modes.",
+            "Compare the same heavy view for 60 seconds."
+          ) | Set-Content "$install/PRUEBA-28.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
@@ -494,11 +393,11 @@ jobs:
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Diagnostico-27-Recursos.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-28-Recursos.zip" `
             -Force `
             -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Diagnostico-27-Recursos.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-28-Recursos.zip"
 
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
@@ -507,7 +406,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Diagnostico-27-Recursos
-          path: KytyPS5-Windows-AMD-Diagnostico-27-Recursos.zip
+          name: KytyPS5-Windows-AMD-Prueba-28-Recursos
+          path: KytyPS5-Windows-AMD-Prueba-28-Recursos.zip
           if-no-files-found: error
           retention-days: 7
