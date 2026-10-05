@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 28 - Recursos activos
+name: Windows AMD - Prueba 29 - Entradas directas
 
 on:
   workflow_dispatch:
@@ -97,7 +97,7 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
 
-              script = Path(f"_prepare28_{index}.ps1")
+              script = Path(f"_prepare29_{index}.ps1")
               script.write_text(
                   '$ErrorActionPreference = "Stop"\n' + step["run"],
                   encoding="utf-8"
@@ -117,7 +117,7 @@ jobs:
             throw "Baseline preparation failed"
           }
 
-      - name: Add optional active mask view and branch regression
+      - name: Add optional direct input evaluation and branch regression
         run: |
           $ErrorActionPreference = "Stop"
 
@@ -130,27 +130,29 @@ jobs:
           s = p.read_text(encoding="utf-8")
           s = "#include <cstdlib>\n#include <cstring>\n" + s
 
-          old = (
-              "\t\t\tactive.assign(first, first + count);\n"
-              "\t\t\treturn active;"
-          )
-
+          old = "\tauto& memo = m_memo[index];"
           if s.count(old) != 1:
-              raise RuntimeError("Unexpected active-tree hit path")
+              raise RuntimeError("Unexpected evaluator memo entry")
 
-          new = """            static const bool direct_mask = [] {
-                          const char* value = std::getenv("KYTY_ACTIVE_MASK_VIEW_28");
-                          return value && std::strcmp(value, "1") == 0;
-                      }();
+          new = """    static const bool direct_inputs = [] {
+                  const char* value = std::getenv("KYTY_DIRECT_INPUTS_29");
+                  return value && std::strcmp(value, "1") == 0;
+              }();
 
-                      if (direct_mask) {
-                          return std::span<const uint8_t>(
-                              m_program.ThreadScratch().active_tree_sources
-                          ).subspan(
-                              tree[node].sources,
-                              static_cast<size_t>(count)
-                          );
+              if (direct_inputs) {
+                  if (node.op == NodeOp::UserData) {
+                      if (node.aux >= m_runtime.user_data.size()) {
+                          return false;
                       }
+                      result = m_runtime.user_data[node.aux];
+                      return true;
+                  }
+
+                  if (node.op == NodeOp::ShaderBase) {
+                      result = m_runtime.shader_base;
+                      return true;
+                  }
+              }
           """ + old
 
           s = s.replace(old, new)
@@ -165,7 +167,6 @@ jobs:
 
           new = """        "a branch change was hidden by the memo");
 
-            // Revisit both cached leaves and change descriptor data.
             for (uint32_t i = 0; i < 128; ++i) {
               const bool first = (i % 4u) < 2u;
               fixture.memory.words[4] = first ? 1u : 0u;
@@ -174,13 +175,15 @@ jobs:
               if (first) fixture.memory.words[0] = value;
               else fixture.user_data[2] = value;
 
-              Check(fixture.Refresh(plan),
-                    "cached active branch refresh failed");
+              Check(
+                  fixture.Refresh(plan),
+                  "direct input branch refresh failed"
+              );
 
               Check(
                   fixture.snapshot.buffers[first ? 0u : 1u].dwords[0] == value &&
                   fixture.snapshot.buffers[first ? 1u : 0u].dwords[0] == 0u,
-                  "cached active mask lost a branch or descriptor change"
+                  "direct input evaluation lost a branch or descriptor change"
               );
             }
           }
@@ -189,11 +192,11 @@ jobs:
           s = s.replace(old, new)
           p.write_text(s, encoding="utf-8", newline="\n")
 
-          print("Prueba 28: optional active-mask view")
+          print("Prueba 29: optional direct user-data and shader-base evaluation")
           '@ | & $env:KYTY_PYTHON -
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Active mask adaptation failed"
+            throw "Direct input adaptation failed"
           }
 
           git diff --check
@@ -265,7 +268,7 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected build step")
 
-              script = Path(f"_build28_{index}.ps1")
+              script = Path(f"_build29_{index}.ps1")
               script.write_text(
                   '$ErrorActionPreference = "Stop"\n' + step["run"],
                   encoding="utf-8"
@@ -289,7 +292,7 @@ jobs:
               )
 
               for mode in modes:
-                  os.environ["KYTY_ACTIVE_MASK_VIEW_28"] = mode
+                  os.environ["KYTY_DIRECT_INPUTS_29"] = mode
                   subprocess.run(
                       ["pwsh", "-NoProfile", "-File", str(script.resolve())],
                       check=True
@@ -314,9 +317,9 @@ jobs:
 
           foreach ($mode in @(0, 1)) {
             $name = if ($mode -eq 1) {
-              "Prueba-28.cmd"
+              "Prueba-29.cmd"
             } else {
-              "Comparacion-28.cmd"
+              "Comparacion-29.cmd"
             }
 
             @(
@@ -336,8 +339,9 @@ jobs:
               'set KYTY_DEBUG_SHADER_CPU=0',
               'set KYTY_RESOURCE_BLOCKS_32=0',
               'set KYTY_HOST_PRIORITY_26=0',
+              'set KYTY_ACTIVE_MASK_VIEW_28=0',
               'set KYTY_REFRESH_DIAGNOSTIC_27=0',
-              "set KYTY_ACTIVE_MASK_VIEW_28=$mode",
+              "set KYTY_DIRECT_INPUTS_29=$mode",
               'set KYTY_DEBUG_QUEUES=',
               'set KYTY_SRT_STATS=',
               'set KYTY_DEBUG_SRT_RUNS=',
@@ -379,13 +383,13 @@ jobs:
 
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Comparacion-28.cmd: stable settings, active-mask view OFF.",
-            "Prueba-28.cmd: same settings, active-mask view ON.",
+            "Comparacion-29.cmd: direct input evaluation OFF.",
+            "Prueba-29.cmd: same settings, direct input evaluation ON.",
             "Keep AMD CPU patch OFF, shader validation OFF, red-zone protection ON.",
             "Copy your working _Patches; select THIS interpreter.",
             "Close emulator and launcher before switching modes.",
             "Compare the same heavy view for 60 seconds."
-          ) | Set-Content "$install/PRUEBA-28.txt" -Encoding ascii
+          ) | Set-Content "$install/PRUEBA-29.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
@@ -393,11 +397,11 @@ jobs:
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-28-Recursos.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Prueba-29-Recursos.zip" `
             -Force `
             -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Prueba-28-Recursos.zip"
+          $zip = "KytyPS5-Windows-AMD-Prueba-29-Recursos.zip"
 
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
@@ -406,7 +410,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-28-Recursos
-          path: KytyPS5-Windows-AMD-Prueba-28-Recursos.zip
+          name: KytyPS5-Windows-AMD-Prueba-29-Recursos
+          path: KytyPS5-Windows-AMD-Prueba-29-Recursos.zip
           if-no-files-found: error
           retention-days: 7
