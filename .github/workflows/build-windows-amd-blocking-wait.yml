@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 26 - Prioridades de hilos
+name: Windows AMD - Diagnostico 27 - Actualizacion de recursos
 
 on:
   workflow_dispatch:
@@ -71,7 +71,7 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
 
-              script = Path(f"_prepare26_{index}.ps1")
+              script = Path(f"_prepare27_{index}.ps1")
               script.write_text(
                   '$ErrorActionPreference = "Stop"\n' + step["run"],
                   encoding="utf-8"
@@ -91,166 +91,193 @@ jobs:
             throw "Baseline preparation failed"
           }
 
-      - name: Adapt pinned PR 1050 with optional host priorities
+      - name: Add sampled resource refresh diagnostic
         run: |
           $ErrorActionPreference = "Stop"
 
-          git fetch --no-tags https://github.com/KytyPS5/KytyPS5.git f7b0b3b56b45fa59a91efa8f21df14685fbcac87 356568c1bb3055924e14ddd10bb720d3901842d7
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Priority source fetch failed"
-          }
-
           @'
           from pathlib import Path
-          import subprocess
 
-          p = Path("src/kernel/pthread.cpp")
+          p = Path(
+              "src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
+          )
           s = p.read_text(encoding="utf-8")
 
-          a = s.index("int PthreadGetPriorityForKernel(Pthread thread) {")
-          b = s.index("\nint PthreadGetCurrentPriorityForKernel()", a)
-          original = s[a:b]
+          helper = r"""
+          namespace {
+          struct Refresh27Stats {
+              uint64_t calls = 0, samples = 0, reused = 0;
+              std::array<uint64_t, 7> ns {};
+              std::chrono::steady_clock::time_point window =
+                  std::chrono::steady_clock::now();
+          };
 
-          patch = Path("_priority26.patch")
-          with patch.open("wb") as out:
-              subprocess.run(
-                  [
-                      "git", "diff",
-                      "f7b0b3b56b45fa59a91efa8f21df14685fbcac87^",
-                      "356568c1bb3055924e14ddd10bb720d3901842d7",
-                      "--", "src/kernel/pthread.cpp"
-                  ],
-                  stdout=out,
-                  check=True
-              )
+          thread_local Refresh27Stats refresh27_stats;
 
-          subprocess.run(
-              ["git", "apply", "--check", str(patch)],
-              check=True
-          )
-          subprocess.run(
-              ["git", "apply", str(patch)],
-              check=True
-          )
+          struct Refresh27Timer {
+              using Clock = std::chrono::steady_clock;
+              bool sampled = false;
+              size_t phase = 0;
+              Clock::time_point last;
 
-          s = p.read_text(encoding="utf-8")
+              Refresh27Timer() {
+                  static const bool enabled = [] {
+                      const char* v = std::getenv("KYTY_REFRESH_DIAGNOSTIC_27");
+                      return v && std::strcmp(v, "1") == 0;
+                  }();
 
-          def replace(old, new):
+                  if (!enabled) return;
+
+                  auto& st = refresh27_stats;
+                  const uint64_t sequence = ++st.calls;
+                  sampled =
+                      ((sequence * 11400714819323198485ull) >> 54u) == 0;
+
+                  if (sampled) last = Clock::now();
+              }
+
+              void Next(size_t next) {
+                  if (!sampled) return;
+
+                  const auto now = Clock::now();
+                  refresh27_stats.ns[phase] += static_cast<uint64_t>(
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          now - last
+                      ).count()
+                  );
+
+                  last = now;
+                  phase = next;
+              }
+
+              void Reused() {
+                  if (sampled) ++refresh27_stats.reused;
+              }
+
+              ~Refresh27Timer() {
+                  if (!sampled) return;
+
+                  Next(phase);
+                  auto& st = refresh27_stats;
+                  ++st.samples;
+
+                  const double seconds =
+                      std::chrono::duration<double>(last - st.window).count();
+
+                  if (seconds < 5.0) return;
+
+                  uint64_t total = 0;
+                  for (auto v : st.ns) total += v;
+
+                  static constexpr const char* names[] = {
+                      "active", "flat", "fill", "memo",
+                      "descriptors", "specialization", "finish"
+                  };
+
+                  std::printf(
+                      "refresh27: seconds=%.1f calls=%llu samples=%llu "
+                      "memo-reused=%llu sampled-us/refresh=%.3f",
+                      seconds,
+                      static_cast<unsigned long long>(st.calls),
+                      static_cast<unsigned long long>(st.samples),
+                      static_cast<unsigned long long>(st.reused),
+                      static_cast<double>(total) / 1000.0 /
+                          static_cast<double>(st.samples)
+                  );
+
+                  for (size_t i = 0; i < 7; ++i) {
+                      std::printf(
+                          " %s-us=%.3f",
+                          names[i],
+                          static_cast<double>(st.ns[i]) / 1000.0 /
+                              static_cast<double>(st.samples)
+                      );
+                  }
+
+                  std::printf("\n");
+                  std::fflush(stdout);
+
+                  st.calls = st.samples = st.reused = 0;
+                  st.ns.fill(0);
+                  st.window = last;
+              }
+          };
+          }
+          """
+
+          def change(old, new):
               global s
               if s.count(old) != 1:
                   raise RuntimeError(
-                      "Unexpected priority source: " + old[:70]
+                      "Unexpected refresh source: " + old[:75]
                   )
               s = s.replace(old, new)
 
-          replace(
-              "constexpr int GUEST_HOST_PRIORITY_HIGH   = 0;",
-              '''static bool HostPriority26Enabled() {
-              static const bool enabled = [] {
-                  const char* value = std::getenv("KYTY_HOST_PRIORITY_26");
-                  return value != nullptr && std::strcmp(value, "1") == 0;
-              }();
-              return enabled;
-          }
-          constexpr int GUEST_HOST_PRIORITY_HIGH   = 0;'''
+          s = (
+              "#include <chrono>\n"
+              "#include <cstdio>\n"
+              "#include <cstdlib>\n"
+              "#include <cstring>\n"
+          ) + s
+
+          change(
+              "template <typename Roots>\nbool Materialize(",
+              helper + "\ntemplate <typename Roots>\nbool Materialize("
           )
 
-          replace(
-              "return GUEST_HOST_PRIORITY_HIGH;",
-              "return HostPriority26Enabled() ? GUEST_HOST_PRIORITY_HIGH : +2;"
+          change(
+              "\tconst auto active = walker.FindActiveSources();",
+              "\tRefresh27Timer timer27;\n"
+              "\tconst auto active = walker.FindActiveSources();\n"
+              "\ttimer27.Next(1);"
           )
 
-          replace(
-              "return GUEST_HOST_PRIORITY_NORMAL;",
-              "return HostPriority26Enabled() ? GUEST_HOST_PRIORITY_NORMAL : 0;"
+          change(
+              "\tsnapshot.uniform_fill = {};",
+              "\ttimer27.Next(2);\n"
+              "\tsnapshot.uniform_fill = {};"
           )
 
-          replace(
-              "return core_bound ? std::max(host - 1, -2) : host;",
-              "return HostPriority26Enabled() && core_bound ? std::max(host - 1, -2) : host;"
+          change(
+              "\tif constexpr (std::is_same_v<Roots, CompiledRoots>) {\n"
+              "\t\tif (memo != nullptr) {",
+              "\ttimer27.Next(3);\n"
+              "\tif constexpr (std::is_same_v<Roots, CompiledRoots>) {\n"
+              "\t\tif (memo != nullptr) {"
           )
 
-          old_body = original[
-              original.index("{") + 1:original.rfind("}")
-          ]
-
-          replace(
-              "int PthreadGetPriorityForKernel(Pthread thread) {",
-              "int PthreadGetPriorityForKernel(Pthread thread) {\n"
-              "#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS\n"
-              "    if (!HostPriority26Enabled()) {\n"
-              + old_body +
-              "\n    }\n"
-              "#endif\n"
+          change(
+              "\t\t\t\tmemo->reused = true;",
+              "\t\t\t\ttimer27.Reused();\n"
+              "\t\t\t\tmemo->reused = true;"
           )
 
-          replace(
-              "thread->core_bound = LowerCoreBoundThread(thread->attr->affinity);",
-              "if (HostPriority26Enabled()) {\n"
-              "\tthread->core_bound = LowerCoreBoundThread(thread->attr->affinity);"
+          change(
+              "\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {",
+              "\ttimer27.Next(4);\n"
+              "\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {"
           )
 
-          replace(
-              "GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));",
-              "GuestThreadHostPriority(thread->attr->guest_priority, thread->core_bound));\n"
-              "    }"
+          change(
+              "\tif (!BuildResourceSpecialization(program, snapshot, specialization)) {",
+              "\ttimer27.Next(5);\n"
+              "\tif (!BuildResourceSpecialization(program, snapshot, specialization)) {"
           )
 
-          s = "#include <cstdlib>\n#include <cstring>\n" + s
-          p.write_text(s, encoding="utf-8", newline="\n")
-
-          p = Path("src/graphics/guest_gpu/graphicsRun.cpp")
-          s = p.read_text(encoding="utf-8")
-
-          anchor = "#include <algorithm>"
-          if s.count(anchor) != 1:
-              raise RuntimeError("Unexpected graphics includes")
-
-          s = s.replace(
-              anchor,
-              '''#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-          #ifndef NOMINMAX
-          #define NOMINMAX
-          #endif
-          #include <windows.h>
-          #undef min
-          #undef max
-          #endif
-          #include <cstring>
-          ''' + anchor
-          )
-
-          anchor = "\tg_gpu_state  = gpu;"
-          if s.count(anchor) != 1:
-              raise RuntimeError("Unexpected GPU entry")
-
-          s = s.replace(
-              anchor,
-              anchor + '''
-          #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-              const char* priority26 = std::getenv("KYTY_HOST_PRIORITY_26");
-              const bool priority26_enabled =
-                  priority26 && std::strcmp(priority26, "1") == 0;
-
-              if (priority26_enabled &&
-                  !SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST)) {
-                  printf("Prueba 26: GPU thread priority failed, error %lu\\n",
-                         GetLastError());
-              }
-
-              printf("Prueba 26: host priorities %s\\n",
-                     priority26_enabled ? "ON" : "OFF");
-          #endif
-          '''
+          change(
+              "\tif constexpr (std::is_same_v<Roots, CompiledRoots>) {\n"
+              "\t\tif (memo != nullptr && roots.compiled.memoizable) {",
+              "\ttimer27.Next(6);\n"
+              "\tif constexpr (std::is_same_v<Roots, CompiledRoots>) {\n"
+              "\t\tif (memo != nullptr && roots.compiled.memoizable) {"
           )
 
           p.write_text(s, encoding="utf-8", newline="\n")
-          print("Prueba 26: optional host priorities adapted")
+          print("Refresh diagnostic 27: sampled CPU preparation phases")
           '@ | python -
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Priority adaptation failed"
+            throw "Refresh diagnostic adaptation failed"
           }
 
           git diff --check
@@ -283,139 +310,66 @@ jobs:
           modules: qt5compat
           cache: true
 
-      - name: Install glslang
+      - name: Build and test using pinned working workflow
         run: |
           $ErrorActionPreference = "Stop"
 
-          $headers = @{
-            "User-Agent" = "GitHub-Actions-KytyPS5"
-            "Accept" = "application/vnd.github+json"
-          }
+          @'
+          from pathlib import Path
+          import subprocess
+          import os
+          import yaml
 
-          $release = Invoke-RestMethod `
-            -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" `
-            -Headers $headers
+          baseline = Path(
+              "_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml"
+          )
+          steps = yaml.safe_load(
+              baseline.read_text(encoding="utf-8")
+          )["jobs"]["build"]["steps"]
 
-          $asset = $release.assets | Where-Object {
-            $_.name -match "(?i)windows" -and
-            $_.name -match "(?i)(x64|x86_64|amd64)" -and
-            $_.name -match "(?i)\.zip$"
-          } | Select-Object -First 1
+          started = False
+          finished = False
 
-          if (-not $asset) {
-            $asset = $release.assets | Where-Object {
-              $_.name -match "(?i)windows" -and
-              $_.name -match "(?i)\.zip$"
-            } | Select-Object -First 1
-          }
+          for index, step in enumerate(steps):
+              if step.get("name") == "Package launchers and symbols":
+                  finished = True
+                  break
 
-          if (-not $asset) {
-            throw "No Windows glslang ZIP found"
-          }
+              if step.get("name") == "Install glslang":
+                  started = True
 
-          $zip = "$env:RUNNER_TEMP/glslang.zip"
-          $extract = "$env:RUNNER_TEMP/glslang"
+              if not started:
+                  continue
 
-          Invoke-WebRequest `
-            -Uri $asset.browser_download_url `
-            -Headers $headers `
-            -OutFile $zip
+              if "uses" in step or "run" not in step:
+                  raise RuntimeError("Unexpected build step")
 
-          Expand-Archive -Path $zip -DestinationPath $extract -Force
+              script = Path(f"_build27_{index}.ps1")
+              script.write_text(
+                  '$ErrorActionPreference = "Stop"\n' + step["run"],
+                  encoding="utf-8"
+              )
 
-          $validator = Get-ChildItem $extract `
-            -Filter "glslangValidator.exe" -Recurse |
-            Select-Object -First 1
+              print("Running:", step["name"], flush=True)
 
-          if (-not $validator) {
-            $validator = Get-ChildItem $extract `
-              -Filter "glslang.exe" -Recurse |
-              Select-Object -First 1
-          }
+              entries = Path(os.environ["GITHUB_PATH"]).read_text(
+                  encoding="utf-8"
+              ).splitlines()
+              os.environ["PATH"] = os.pathsep.join(
+                  entries + [os.environ["PATH"]]
+              )
 
-          if (-not $validator) {
-            throw "glslang executable missing"
-          }
+              subprocess.run(
+                  ["pwsh", "-NoProfile", "-File", str(script.resolve())],
+                  check=True
+              )
 
-          if ($validator.Name -eq "glslang.exe") {
-            Copy-Item $validator.FullName `
-              (Join-Path $validator.Directory.FullName "glslangValidator.exe") `
-              -Force
-          }
-
-          Add-Content $env:GITHUB_PATH $validator.Directory.FullName
-
-      - name: Verify glslang
-        run: |
-          glslangValidator --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "glslang verification failed"
-          }
-
-      - name: Configure CMake
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          cmake `
-            -S . `
-            -B _Build/windows `
-            -G Ninja `
-            -DCMAKE_BUILD_TYPE=Release `
-            -DCMAKE_C_COMPILER=clang-cl `
-            -DCMAKE_CXX_COMPILER=clang-cl `
-            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+          if not started or not finished:
+              raise RuntimeError("Build boundaries missing")
+          '@ | python -
 
           if ($LASTEXITCODE -ne 0) {
-            throw "CMake configure failed"
-          }
-
-      - name: Build KytyPS5
-        run: |
-          cmake `
-            --build _Build/windows `
-            --target launcher shader_vertex_metadata_tests memory_tracker_tests resource_materialization_tests shader_cfg_tests virtual_memory_allocation_tests `
-            --parallel
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Build failed"
-          }
-
-      - name: Test memory and shader paths
-        run: |
-          $env:KYTY_TRACKING_BLOCKING_WAIT = "1"
-          $env:KYTY_SHARED_SAMPLER_SNAPSHOTS = "1"
-
-          foreach ($priority in @(0, 1)) {
-            $env:KYTY_HOST_PRIORITY_26 = "$priority"
-
-            foreach ($mode in @(0, 1)) {
-              $env:KYTY_DIRECT_COLOR_METADATA = "$mode"
-
-              ctest `
-                --test-dir _Build/windows `
-                -R '^(shader_vertex_metadata|memory_tracker|resource_materialization|shader_cfg|virtual_memory_allocation)$' `
-                --output-on-failure `
-                --no-tests=error
-
-              if ($LASTEXITCODE -ne 0) {
-                throw "Tests failed: priority=$priority metadata=$mode"
-              }
-            }
-          }
-
-          Remove-Item Env:KYTY_HOST_PRIORITY_26
-          Remove-Item Env:KYTY_DIRECT_COLOR_METADATA
-          Remove-Item Env:KYTY_SHARED_SAMPLER_SNAPSHOTS
-          Remove-Item Env:KYTY_TRACKING_BLOCKING_WAIT
-
-      - name: Install KytyPS5
-        run: |
-          cmake `
-            --install _Build/windows `
-            --prefix _Build/windows/install
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Install failed"
+            throw "Build or tests failed"
           }
 
       - name: Package launchers and symbols
@@ -429,9 +383,9 @@ jobs:
 
           foreach ($mode in @(0, 1)) {
             $name = if ($mode -eq 1) {
-              "Prueba-26.cmd"
+              "Diagnostico-27.cmd"
             } else {
-              "Comparacion-26.cmd"
+              "Comparacion-27.cmd"
             }
 
             @(
@@ -450,7 +404,8 @@ jobs:
               'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
               'set KYTY_DEBUG_SHADER_CPU=0',
               'set KYTY_RESOURCE_BLOCKS_32=0',
-              "set KYTY_HOST_PRIORITY_26=$mode",
+              'set KYTY_HOST_PRIORITY_26=0',
+              "set KYTY_REFRESH_DIAGNOSTIC_27=$mode",
               'set KYTY_DEBUG_QUEUES=',
               'set KYTY_SRT_STATS=',
               'set KYTY_DEBUG_SRT_RUNS=',
@@ -492,14 +447,13 @@ jobs:
 
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Upstream a67a033 and f3dc5ee retained.",
-            "Comparacion-26.cmd: stable settings, new host priorities OFF.",
-            "Prueba-26.cmd: same settings, new host priorities ON.",
+            "Comparacion-27.cmd: stable settings, refresh diagnostic OFF.",
+            "Diagnostico-27.cmd: sampled resource refresh diagnostic ON.",
             "Keep AMD CPU patch OFF, shader validation OFF, red-zone protection ON.",
             "Copy your working _Patches; select THIS interpreter.",
-            "Close emulator and launcher before switching mode.",
-            "Compare the same heavy view for 60 seconds in each mode."
-          ) | Set-Content "$install/PRUEBA-26.txt" -Encoding ascii
+            "Capture heavy and light views separately for 60 seconds.",
+            "Copy the console output containing refresh27 lines."
+          ) | Set-Content "$install/DIAGNOSTICO-27.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
@@ -507,11 +461,11 @@ jobs:
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-26-Prioridades.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Diagnostico-27-Recursos.zip" `
             -Force `
             -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Prueba-26-Prioridades.zip"
+          $zip = "KytyPS5-Windows-AMD-Diagnostico-27-Recursos.zip"
 
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
@@ -520,7 +474,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-26-Prioridades
-          path: KytyPS5-Windows-AMD-Prueba-26-Prioridades.zip
+          name: KytyPS5-Windows-AMD-Diagnostico-27-Recursos
+          path: KytyPS5-Windows-AMD-Diagnostico-27-Recursos.zip
           if-no-files-found: error
           retention-days: 7
