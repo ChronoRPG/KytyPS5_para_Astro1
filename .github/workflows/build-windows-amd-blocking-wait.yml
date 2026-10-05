@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 33 - Zen 3 y AVX2
+name: Windows AMD - Prueba 34 - Descriptores preparados
 
 'on':
   workflow_dispatch:
@@ -8,255 +8,408 @@ permissions:
 
 jobs:
   build:
-    name: Prueba 33 - ${{ matrix.profile }}
     runs-on: windows-2022
 
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - profile: Generica
-            flags: /clang:-ffp-contract=off
-            cmd: Comparacion-33.cmd
-
-          - profile: Zen3-AVX2
-            flags: /clang:-march=x86-64-v3 /clang:-mtune=znver3 /clang:-ffp-contract=off
-            cmd: Prueba-33.cmd
-
     env:
-      KYTY_PROFILE_33: ${{ matrix.profile }}
-      KYTY_FLAGS_33: ${{ matrix.flags }}
-      KYTY_CMD_33: ${{ matrix.cmd }}
+      KYTY_FLAGS_34: /clang:-ffp-contract=off
+      KYTY_PROFILE_34: Generica
 
     defaults:
       run:
         shell: pwsh
 
     steps:
-      - name: Checkout fixed AMD base
-        uses: actions/checkout@v4
-        with:
-          ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
-          submodules: recursive
-          fetch-depth: 1
+    - name: Checkout fixed AMD base
+      uses: actions/checkout@v4
+      with:
+        ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+        submodules: recursive
+        fetch-depth: 1
 
-      - name: Checkout pinned working diagnostic 20
-        uses: actions/checkout@v4
-        with:
-          ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
-          path: _patch_source
-          sparse-checkout: |
-            patches
-            .github/workflows
-          fetch-depth: 1
-          submodules: false
+    - name: Checkout pinned working diagnostic 20
+      uses: actions/checkout@v4
+      with:
+        ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+        path: _patch_source
+        sparse-checkout: |
+          patches
+          .github/workflows
+        fetch-depth: 1
+        submodules: false
 
-      - name: Setup fixed Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+    - name: Setup fixed Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
 
-      - name: Pin Python executable and install YAML parser
-        run: |
-          $ErrorActionPreference = "Stop"
-          $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
-          if (-not $pythonExe) { throw "Python executable missing" }
+    - name: Pin Python executable and install YAML parser
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+        if (-not $pythonExe) { throw "Python executable missing" }
+        "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        & $pythonExe -m pip install PyYAML==6.0.2
+        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+        & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
 
-          "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+    - name: Reproduce working AMD source and retained optimizations
+      run: |
+        $ErrorActionPreference = "Stop"
+        @'
+        from pathlib import Path
+        import subprocess
+        import yaml
 
-          & $pythonExe -m pip install PyYAML==6.0.2
-          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+        baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
+        steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+        started = False
+        finished = False
 
-          & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
-          if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+        for index, step in enumerate(steps):
+            if step.get("name") == "Setup MSVC environment":
+                finished = True
+                break
+            if step.get("name") == "Verify AMD base":
+                started = True
+            if not started:
+                continue
+            if "uses" in step or "run" not in step:
+                raise RuntimeError("Unexpected baseline preparation step")
+            script = Path(f"_prepare34_{index}.ps1")
+            script.write_text(
+                '$ErrorActionPreference = "Stop"\n' + step["run"],
+                encoding="utf-8"
+            )
+            print("Preparing:", step["name"], flush=True)
+            subprocess.run(
+                ["pwsh", "-NoProfile", "-File", str(script.resolve())],
+                check=True
+            )
 
-      - name: Reproduce working AMD source and retained optimizations
-        run: |
-          $ErrorActionPreference = "Stop"
-          @'
-          from pathlib import Path
-          import subprocess
-          import yaml
+        if not started or not finished:
+            raise RuntimeError("Baseline preparation boundaries missing")
+        '@ | & $env:KYTY_PYTHON -
+        if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-          baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
-          steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
-          started = False
-          finished = False
+    - name: Compile immutable descriptor recipes and add regressions
+      run: |
+        $ErrorActionPreference = "Stop"
+        @'
+        from pathlib import Path
 
-          for index, step in enumerate(steps):
-              if step.get("name") == "Setup MSVC environment":
-                  finished = True
-                  break
-              if step.get("name") == "Verify AMD base":
-                  started = True
-              if not started:
-                  continue
-              if "uses" in step or "run" not in step:
-                  raise RuntimeError("Unexpected baseline preparation step")
+        def replace(path, old, new):
+            p = Path(path)
+            s = p.read_text(encoding="utf-8")
+            if s.count(old) != 1:
+                raise RuntimeError("Unexpected source boundary: " + path)
+            p.write_text(
+                s.replace(old, new),
+                encoding="utf-8",
+                newline="\n"
+            )
 
-              script = Path(f"_prepare33_{index}.ps1")
-              script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
-              print("Preparing:", step["name"], flush=True)
-              subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+        replace(
+            "src/graphics/shader/recompiler/ir/ShaderIR.h",
+            "\tstd::vector<std::array<uint32_t, 8>> descriptor_slots;",
+            """
+            struct DescriptorRecipe {
+                DescriptorValue constants {};
+                std::array<uint32_t, 8> flat {};
+                std::array<uint32_t, 8> user {};
+                uint8_t flat_mask = 0;
+                uint8_t user_mask = 0;
+                bool valid = false;
+            };
+            std::vector<DescriptorRecipe> descriptor_recipes;
+        \tstd::vector<std::array<uint32_t, 8>> descriptor_slots;"""
+        )
 
-          if not started or not finished:
-              raise RuntimeError("Baseline preparation boundaries missing")
-          '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
+        replace(
+            "src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp",
+            "\tAnalyzeControlFlow(program, *compiled);",
+            """
+            static const bool recipes = [] {
+                const char* value = std::getenv("KYTY_DESCRIPTOR_RECIPES_34");
+                return value != nullptr && value[0] == '1' && value[1] == '\\0';
+            }();
 
-      - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+            if (recipes) {
+                compiled->descriptor_recipes.resize(compiled->descriptors.size());
 
-      - name: Setup Clang
-        uses: egor-tensin/setup-clang@v1
-        with:
-          version: 18
-          platform: x64
-          cygwin: 0
+                for (uint32_t source = 0; source < compiled->descriptors.size(); ++source) {
+                    auto& recipe = compiled->descriptor_recipes[source];
+                    const auto count = program.descriptor_sources[source].dword_count;
+                    recipe.constants.dword_count = count;
+                    recipe.valid = count <= 8u;
 
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
+                    for (uint32_t word = 0; recipe.valid && word < count; ++word) {
+                        const auto index = compiled->descriptors[source][word];
 
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: 6.8.3
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          modules: qt5compat
-          cache: true
+                        if (index == ResourceNode::NoNode) {
+                            recipe.valid = false;
+                            break;
+                        }
 
-      - name: Verify selected compiler flags
-        run: |
-          $ErrorActionPreference = "Stop"
-          $probe = Join-Path $env:RUNNER_TEMP "kyty_flags33.cpp"
+                        const auto& node = compiled->nodes[index];
+                        const auto slot = compiled->descriptor_slots[source][word];
 
-          @'
-          #if defined(KYTY_EXPECT_AVX2) && !defined(__AVX2__)
-          #error AVX2 was not enabled
-          #endif
-          #if defined(__AVX512F__)
-          #error AVX512 must not be enabled
-          #endif
-          int probe(int a, int b) { return (a + b) ^ (a >> 3); }
-          '@ | Set-Content $probe -Encoding ascii
+                        if (slot != ResourceNode::NoNode) {
+                            recipe.flat[word] = slot;
+                            recipe.flat_mask |= static_cast<uint8_t>(1u << word);
+                        } else if (node.op == NodeOp::Const) {
+                            recipe.constants.dwords[word] = static_cast<uint32_t>(node.imm);
+                        } else if (node.op == NodeOp::UserData) {
+                            recipe.user[word] = node.aux;
+                            recipe.user_mask |= static_cast<uint8_t>(1u << word);
+                        } else {
+                            recipe.valid = false;
+                        }
+                    }
+                }
+            }
 
-          $flags = @($env:KYTY_FLAGS_33 -split ' ' | Where-Object { $_ })
-          if ($env:KYTY_PROFILE_33 -eq "Zen3-AVX2") {
-            $flags += '/DKYTY_EXPECT_AVX2=1'
+        \tAnalyzeControlFlow(program, *compiled);"""
+        )
+
+        p = Path("src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp")
+        p.write_text(
+            "#include <cstdlib>\n" + p.read_text(encoding="utf-8"),
+            encoding="utf-8"
+        )
+
+        replace(
+            str(p),
+            "\tconst auto& dwords = m_compiled.descriptors[source];",
+            """
+            if (!m_compiled.descriptor_recipes.empty()) {
+                const auto& recipe = m_compiled.descriptor_recipes[source];
+
+                // Only immutable mappings are stored; guest values are read afresh.
+                // Walkers without a refreshed flat buffer retain the original path.
+                if (recipe.valid && (recipe.flat_mask == 0u || m_flat != nullptr)) {
+                    result = recipe.constants;
+
+                    auto flat_mask = static_cast<uint32_t>(recipe.flat_mask);
+                    while (flat_mask != 0u) {
+                        const auto word = static_cast<uint32_t>(std::countr_zero(flat_mask));
+                        const auto slot = recipe.flat[word];
+                        if (slot >= m_flat->size()) return false;
+                        result.dwords[word] = (*m_flat)[slot];
+                        flat_mask &= flat_mask - 1u;
+                    }
+
+                    auto user_mask = static_cast<uint32_t>(recipe.user_mask);
+                    while (user_mask != 0u) {
+                        const auto word = static_cast<uint32_t>(std::countr_zero(user_mask));
+                        const auto reg = recipe.user[word];
+                        if (reg >= m_runtime.user_data.size()) return false;
+                        result.dwords[word] = m_runtime.user_data[reg];
+                        user_mask &= user_mask - 1u;
+                    }
+
+                    return true;
+                }
+            }
+
+        \tconst auto& dwords = m_compiled.descriptors[source];"""
+        )
+
+        replace(
+            "tests/ResourceMaterializationTests.cpp",
+            "int main() {",
+            """
+        void TestDescriptorRecipesFreshValues34() {
+          using namespace Libs::Graphics::ShaderRecompiler::IR;
+
+          for (const bool branched : {false, true}) {
+            const auto plan = MemoPlan(MemoPlanExtra::None, branched);
+            MemoFixture fixture;
+
+            for (uint32_t step = 0; step < 96u; ++step) {
+              fixture.memory.words[0] = step * 16u;
+              fixture.memory.words[1] = 0x100u + step;
+              fixture.memory.words[4] = step & 1u;
+              fixture.user_data[2] = 0x200u + step;
+
+              Check(fixture.Refresh(plan), "recipe refresh failed");
+
+              const SrtRuntime runtime {
+                .user_data = fixture.user_data,
+                .read_memory = TableMemory::DirectRead,
+                .userdata = &fixture.memory,
+                .read_specialization_memory = TableMemory::StrictRead,
+              };
+
+              ResourceSnapshot reference;
+              ResourceSpecialization spec;
+
+              Check(
+                MaterializeResourcesReference(plan, runtime, reference, spec),
+                "reference recipe refresh failed"
+              );
+
+              Check(
+                fixture.snapshot.buffers == reference.buffers &&
+                fixture.snapshot.flattened_srt == reference.flattened_srt &&
+                fixture.specialization == spec,
+                "recipe concealed changed memory, user data or branch"
+              );
+            }
           }
+        }
 
-          & clang-cl /nologo /c /O2 `
-            /clang:-Werror=unused-command-line-argument `
-            /clang:-Werror=unknown-argument `
-            @flags $probe "/Fo:$env:RUNNER_TEMP/kyty_flags33.obj"
+        int main() {
+          TestDescriptorRecipesFreshValues34();"""
+        )
+        '@ | & $env:KYTY_PYTHON -
+        if ($LASTEXITCODE -ne 0) { throw "Descriptor recipe patch failed" }
 
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Setup Clang
+      uses: egor-tensin/setup-clang@v1
+      with:
+        version: 18
+        platform: x64
+        cygwin: 0
+
+    - name: Setup Ninja
+      uses: seanmiddleditch/gha-setup-ninja@v5
+
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: 6.8.3
+        host: windows
+        target: desktop
+        arch: win64_msvc2022_64
+        modules: qt5compat
+        cache: true
+
+    - name: Build and test using pinned working workflow
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "Pinned Python YAML verification failed" }
+        @'
+        from pathlib import Path
+        import subprocess
+        import os
+        import yaml
+
+        steps = yaml.safe_load(
+            Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
+            .read_text(encoding="utf-8")
+        )["jobs"]["build"]["steps"]
+
+        started = False
+        finished = False
+
+        for index, step in enumerate(steps):
+            if step.get("name") == "Package launchers and symbols":
+                finished = True
+                break
+            if step.get("name") == "Install glslang":
+                started = True
+            if not started:
+                continue
+            if "uses" in step or "run" not in step:
+                raise RuntimeError("Unexpected build step")
+
+            if step["name"] == "Configure CMake":
+                flags = os.environ["KYTY_FLAGS_34"]
+
+                args = [
+                    "cmake", "-S", ".", "-B", "_Build/windows",
+                    "-G", "Ninja",
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DCMAKE_C_COMPILER=clang-cl",
+                    "-DCMAKE_CXX_COMPILER=clang-cl",
+                    "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
+                    "-DCMAKE_C_FLAGS_INIT=" + flags,
+                    "-DCMAKE_CXX_FLAGS_INIT=" + flags,
+                    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+                ]
+
+                subprocess.run(args, check=True)
+
+                cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
+                cpp_flags = next(
+                    (
+                        line.split("=", 1)[1]
+                        for line in cache.splitlines()
+                        if line.startswith("CMAKE_CXX_FLAGS:STRING=")
+                    ),
+                    None
+                )
+
+                if cpp_flags is None or "/ehsc" not in cpp_flags.lower():
+                    raise RuntimeError("CMake lost /EHsc: exceptions must remain enabled")
+                if not all(option in cpp_flags for option in flags.split()):
+                    raise RuntimeError("Selected compiler flags are missing")
+
+                print("Verified C++ flags:", cpp_flags, flush=True)
+                continue
+
+            script = Path(f"_build34_{index}.ps1")
+            script.write_text(
+                '$ErrorActionPreference = "Stop"\n' + step["run"],
+                encoding="utf-8"
+            )
+
+            print("Running:", step["name"], flush=True)
+            path_file = Path(os.environ["GITHUB_PATH"])
+            entries = (
+                path_file.read_text(encoding="utf-8-sig").splitlines()
+                if path_file.exists() else []
+            )
+            os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
+
+            subprocess.run(
+                ["pwsh", "-NoProfile", "-File", str(script.resolve())],
+                check=True
+            )
+
+        if not started or not finished:
+            raise RuntimeError("Build boundaries missing")
+        '@ | & $env:KYTY_PYTHON -
+        if ($LASTEXITCODE -ne 0) { throw "Build or tests failed" }
+
+    - name: Test both descriptor paths
+      run: |
+        $ErrorActionPreference = "Stop"
+        foreach ($mode in @("0", "1")) {
+          $env:KYTY_DESCRIPTOR_RECIPES_34 = $mode
+          & ctest --test-dir _Build/windows -C Release --output-on-failure -R '^resource_materialization$'
           if ($LASTEXITCODE -ne 0) {
-            throw "Selected CPU compiler flags failed"
+            throw "Descriptor tests failed in mode $mode"
+          }
+        }
+
+    - name: Package launchers and symbols
+      run: |
+        $ErrorActionPreference = "Stop"
+        $install = "_Build/windows/install"
+        if (-not (Test-Path "$install/launcher.exe")) {
+          throw "launcher.exe missing"
+        }
+
+        foreach ($mode in @(0, 1)) {
+          $name = if ($mode -eq 0) {
+            "Comparacion-34.cmd"
+          } else {
+            "Prueba-34.cmd"
           }
 
-          Write-Host "Profile: $env:KYTY_PROFILE_33"
-          Write-Host "Compiler flags: $env:KYTY_FLAGS_33"
-
-      - name: Build and test using pinned working workflow
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
-          if ($LASTEXITCODE -ne 0) { throw "Pinned Python YAML verification failed" }
-
-          @'
-          from pathlib import Path
-          import subprocess
-          import os
-          import yaml
-
-          baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
-          steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
-          started = False
-          finished = False
-
-          for index, step in enumerate(steps):
-              if step.get("name") == "Package launchers and symbols":
-                  finished = True
-                  break
-              if step.get("name") == "Install glslang":
-                  started = True
-              if not started:
-                  continue
-              if "uses" in step or "run" not in step:
-                  raise RuntimeError("Unexpected build step")
-
-              if step["name"] == "Configure CMake":
-                  flags = os.environ["KYTY_FLAGS_33"]
-                  args = [
-                      "cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
-                      "-DCMAKE_BUILD_TYPE=Release",
-                      "-DCMAKE_C_COMPILER=clang-cl",
-                      "-DCMAKE_CXX_COMPILER=clang-cl",
-                      "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
-                      "-DCMAKE_C_FLAGS_INIT=" + flags,
-                      "-DCMAKE_CXX_FLAGS_INIT=" + flags,
-                      "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
-                  ]
-
-                  print("Configuring profile:", os.environ["KYTY_PROFILE_33"], flags, flush=True)
-                  subprocess.run(args, check=True)
-
-                  cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
-                  cpp_flags = next(
-                      (
-                          line.split("=", 1)[1]
-                          for line in cache.splitlines()
-                          if line.startswith("CMAKE_CXX_FLAGS:STRING=")
-                      ),
-                      None
-                  )
-
-                  if cpp_flags is None or "/ehsc" not in cpp_flags.lower():
-                      raise RuntimeError(
-                          "CMake lost /EHsc: C++ exceptions must remain enabled"
-                      )
-                  if not all(option in cpp_flags for option in flags.split()):
-                      raise RuntimeError(
-                          "Selected CPU flags are missing from CMAKE_CXX_FLAGS"
-                      )
-
-                  print("Verified C++ flags:", cpp_flags, flush=True)
-                  continue
-
-              script = Path(f"_build33_{index}.ps1")
-              script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
-              print("Running:", step["name"], flush=True)
-
-              path_file = Path(os.environ["GITHUB_PATH"])
-              entries = path_file.read_text(encoding="utf-8-sig").splitlines() if path_file.exists() else []
-              os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
-
-              subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
-
-          if not started or not finished:
-              raise RuntimeError("Build boundaries missing")
-          '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "Build or tests failed" }
-
-      - name: Package launchers and symbols
-        run: |
-          $ErrorActionPreference = "Stop"
-          $install = "_Build/windows/install"
-
-          if (-not (Test-Path "$install/launcher.exe")) {
-            throw "launcher.exe missing"
-          }
-
-          $name = $env:KYTY_CMD_33
           @(
             '@echo off',
             'setlocal',
             'cd /d "%~dp0"',
+            "set KYTY_DESCRIPTOR_RECIPES_34=$mode",
             'set KYTY_TRACKING_PAUSE=',
             'set KYTY_BDA_SLICE_FILTER=',
             'set KYTY_TRACKING_DIAGNOSTICS=',
@@ -293,51 +446,40 @@ jobs:
             'set KYTY_GPU_ZONES=',
             '"%~dp0launcher.exe" %*'
           ) | Set-Content "$install/$name" -Encoding ascii
+        }
 
-          $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
-          if (-not $maps) { throw "Emulator map missing" }
-          foreach ($map in $maps) {
-            Copy-Item $map.FullName $install -Force
-          }
+        $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
+        if (-not $maps) { throw "Emulator map missing" }
+        foreach ($map in $maps) {
+          Copy-Item $map.FullName $install -Force
+        }
 
-          $pdb = "_Build/windows/kyty_emulator.pdb"
-          if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
-          Copy-Item $pdb $install -Force
+        $pdb = "_Build/windows/kyty_emulator.pdb"
+        if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
+        Copy-Item $pdb $install -Force
 
-          @(
-            "Profile: $env:KYTY_PROFILE_33",
-            "CPU flags: $env:KYTY_FLAGS_33",
-            "Start with: $env:KYTY_CMD_33",
-            "Fixed AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Source and runtime settings are identical in both profiles.",
-            "Experimental changes 31 and 32 are not applied.",
-            "Zen3-AVX2 requires an x86-64-v3 compatible CPU; Ryzen 5900X is compatible.",
-            "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
-            "Copy your working _Patches and select THIS interpreter.",
-            "Compare the same heavy view for 60 seconds after warming up.",
-            "Close emulator and launcher completely before changing profile."
-          ) | Set-Content "$install/PRUEBA-33.txt" -Encoding ascii
+        @(
+          "Comparacion-34.cmd: original descriptor evaluation.",
+          "Prueba-34.cmd: immutable descriptor recipes; dynamic values refreshed.",
+          "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
+          "Copy your working _Patches and select THIS interpreter.",
+          "Warm up 60 seconds, then measure the same heavy view for 60 seconds.",
+          "Close emulator and launcher completely before changing mode."
+        ) | Set-Content "$install/PRUEBA-34.txt" -Encoding ascii
 
-          Copy-Item "_Build/windows/CMakeCache.txt" "$install/BuildFlags-33.txt" -Force
+    - name: Create Windows ZIP
+      run: |
+        $ErrorActionPreference = "Stop"
+        $zip = "KytyPS5-Prueba-34.zip"
+        Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+        if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+          throw "Packaging failed: missing or empty ZIP"
+        }
 
-      - name: Create Windows ZIP
-        run: |
-          $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Prueba-33-$env:KYTY_PROFILE_33.zip"
-
-          Compress-Archive `
-            -Path "_Build/windows/install/*" `
-            -DestinationPath $zip `
-            -Force -ErrorAction Stop
-
-          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
-            throw "Packaging failed: missing or empty ZIP"
-          }
-
-      - name: Upload KytyPS5
-        uses: actions/upload-artifact@v4
-        with:
-          name: KytyPS5-Prueba-33-${{ matrix.profile }}
-          path: KytyPS5-Prueba-33-${{ matrix.profile }}.zip
-          if-no-files-found: error
-          retention-days: 7
+    - name: Upload KytyPS5
+      uses: actions/upload-artifact@v4
+      with:
+        name: KytyPS5-Prueba-34
+        path: KytyPS5-Prueba-34.zip
+        if-no-files-found: error
+        retention-days: 7
