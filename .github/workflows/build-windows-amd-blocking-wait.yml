@@ -33,14 +33,40 @@ jobs:
           fetch-depth: 1
           submodules: false
 
-      - name: Reproduce working AMD source and retained optimizations
+      - name: Setup fixed Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pin Python executable and install YAML parser
         run: |
           $ErrorActionPreference = "Stop"
 
-          python -m pip install PyYAML==6.0.2
+          $pythonExe = (
+            Get-Command python -CommandType Application |
+            Select-Object -First 1
+          ).Source
+
+          if (-not $pythonExe) {
+            throw "Python executable missing"
+          }
+
+          "KYTY_PYTHON=$pythonExe" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          & $pythonExe -m pip install PyYAML==6.0.2
           if ($LASTEXITCODE -ne 0) {
             throw "YAML parser installation failed"
           }
+
+          & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Python YAML verification failed"
+          }
+
+      - name: Reproduce working AMD source and retained optimizations
+        run: |
+          $ErrorActionPreference = "Stop"
 
           @'
           from pathlib import Path
@@ -85,7 +111,7 @@ jobs:
 
           if not started or not finished:
               raise RuntimeError("Baseline preparation boundaries missing")
-          '@ | python -
+          '@ | & $env:KYTY_PYTHON -
 
           if ($LASTEXITCODE -ne 0) {
             throw "Baseline preparation failed"
@@ -274,7 +300,7 @@ jobs:
 
           p.write_text(s, encoding="utf-8", newline="\n")
           print("Refresh diagnostic 27: sampled CPU preparation phases")
-          '@ | python -
+          '@ | & $env:KYTY_PYTHON -
 
           if ($LASTEXITCODE -ne 0) {
             throw "Refresh diagnostic adaptation failed"
@@ -314,6 +340,11 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
+          & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned Python YAML verification failed"
+          }
+
           @'
           from pathlib import Path
           import subprocess
@@ -352,9 +383,11 @@ jobs:
 
               print("Running:", step["name"], flush=True)
 
-              entries = Path(os.environ["GITHUB_PATH"]).read_text(
-                  encoding="utf-8"
-              ).splitlines()
+              path_file = Path(os.environ["GITHUB_PATH"])
+              entries = (
+                  path_file.read_text(encoding="utf-8-sig").splitlines()
+                  if path_file.exists() else []
+              )
               os.environ["PATH"] = os.pathsep.join(
                   entries + [os.environ["PATH"]]
               )
@@ -366,7 +399,7 @@ jobs:
 
           if not started or not finished:
               raise RuntimeError("Build boundaries missing")
-          '@ | python -
+          '@ | & $env:KYTY_PYTHON -
 
           if ($LASTEXITCODE -ne 0) {
             throw "Build or tests failed"
