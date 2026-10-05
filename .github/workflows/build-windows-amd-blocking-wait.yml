@@ -1,4 +1,4 @@
-name: Windows AMD - Diagnostico 20 - Destinos sin pixel shader
+name: Windows AMD - Diagnostico 22 - Coste CPU por shader
 
 on:
   workflow_dispatch:
@@ -8,7 +8,6 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - Diagnostico 20
     runs-on: windows-2022
 
     defaults:
@@ -23,364 +22,135 @@ jobs:
           submodules: recursive
           fetch-depth: 1
 
-      - name: Checkout patches from workflow revision
+      - name: Checkout pinned working diagnostic 20
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
           path: _patch_source
-          sparse-checkout: patches
+          sparse-checkout: |
+            patches
+            .github/workflows
           fetch-depth: 1
           submodules: false
 
-      - name: Verify AMD base
+      - name: Reproduce working AMD source and retained optimizations
         run: |
           $ErrorActionPreference = "Stop"
+          python -m pip install PyYAML==6.0.2
+          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
 
-          $expected = "4068f4ac886dcd25acc52b6e3fa3e3800dc576a9"
-          $actual = git rev-parse HEAD
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "Could not read source commit"
-          }
-
-          if ($actual -ne $expected) {
-            throw "Unexpected source commit: $actual"
-          }
-
-          Write-Host "AMD base verified: $actual"
-
-      - name: Apply lightweight diagnostics patch
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $patch = "_patch_source/patches/KytyPS5_light_drain_stats.patch"
-
-          if (-not (Test-Path $patch)) {
-            throw "Missing patch: $patch"
-          }
-
-          git apply --ignore-whitespace --check $patch
-          if ($LASTEXITCODE -ne 0) {
-            throw "Light diagnostics patch does not apply to AMD base"
-          }
-
-          git apply --ignore-whitespace $patch
-          if ($LASTEXITCODE -ne 0) {
-            throw "Light diagnostics patch application failed"
-          }
-
-          Write-Host "Light diagnostics patch applied"
-
-      - name: Adapt upstream vertex metadata optimization
-        run: |
-          $ErrorActionPreference = "Stop"
           @'
           from pathlib import Path
+          import subprocess
+          import yaml
 
-          def replace_once(path, old, new):
-              p = Path(path)
-              text = p.read_text(encoding="utf-8")
-              if text.count(old) != 1:
-                  raise RuntimeError("Unexpected source: " + path)
-              p.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
+          baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
+          steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+          started = False
+          finished = False
 
-          header = "src/graphics/shader/shaderVertexMetadata.h"
-          replace_once(header, "#include <array>", "#include <span>")
-          replace_once(header,
-              "std::array<ShaderSemantic, ShaderVertexInputInfo::RES_MAX> input_semantics {};",
-              "std::span<const ShaderSemantic> input_semantics {};")
-          replace_once(header,
-              "// Copies the small AGC metadata subset used by the vertex path after validating every guest range.",
-              "// Validates vertex metadata and borrows its semantics for immediate draw preparation.")
-          source = "src/graphics/shader/shaderVertexMetadata.cpp"
-          replace_once(source,
-              "\tconst auto semantic_size =\n\t    static_cast<uint64_t>(data.num_input_semantics) * sizeof(ShaderSemantic);\n",
-              "")
-          replace_once(source,
-              "std::memcpy(next.input_semantics.data(), data.input_semantics, semantic_size);",
-              "next.input_semantics = {data.input_semantics, data.num_input_semantics};")
-          # Keep the existing count and call interface used by this AMD fork.
-          # Existing tests still cover range checks and unchanged output on rejection.
-          print("Adapted upstream e57c37f: vertex semantics view applied")
+          for index, step in enumerate(steps):
+              if step.get("name") == "Setup MSVC environment":
+                  finished = True
+                  break
+              if step.get("name") == "Verify AMD base":
+                  started = True
+              if not started:
+                  continue
+              if "uses" in step or "run" not in step:
+                  raise RuntimeError("Unexpected baseline preparation step")
+
+              script = Path(f"_prepare22_{index}.ps1")
+              script.write_text(
+                  '$ErrorActionPreference = "Stop"\n' + step["run"],
+                  encoding="utf-8"
+              )
+              print("Preparing:", step["name"], flush=True)
+              subprocess.run(
+                  ["pwsh", "-NoProfile", "-File", str(script.resolve())],
+                  check=True
+              )
+
+          if not started or not finished:
+              raise RuntimeError("Baseline preparation boundaries missing")
           '@ | python -
-          if ($LASTEXITCODE -ne 0) { throw "Metadata adaptation failed" }
 
-      - name: Apply pinned upstream optimizations
+          if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
+
+      - name: Add shader CPU ranking
         run: |
           $ErrorActionPreference = "Stop"
-          $repo = "https://github.com/KytyPS5/KytyPS5.git"
-          $commits = @(
-            "a67a033ff88406707f47492a7cdcfef736973d66",
-            "f3dc5ee4a9e0725b17bd3e0a4ad1bdbeb0afc8a9"
-          )
-          foreach ($commit in $commits) {
-            git fetch --no-tags --depth=2 $repo $commit
-            if ($LASTEXITCODE -ne 0) { throw "Could not fetch $commit" }
-            $patch = Join-Path $env:RUNNER_TEMP "$commit.patch"
-            git diff --output=$patch "$commit^" $commit -- src
-            if ($LASTEXITCODE -ne 0) { throw "Could not generate $commit patch" }
-            git apply --check $patch
-            if ($LASTEXITCODE -ne 0) { throw "Patch does not apply: $commit" }
-            git apply $patch
-            if ($LASTEXITCODE -ne 0) { throw "Patch application failed: $commit" }
-          }
 
-      - name: Add optional blocking tracking wait
-        run: |
-          $ErrorActionPreference = "Stop"
           @'
           from pathlib import Path
 
-          p = Path("src/graphics/host_gpu/regionManager.h")
+          p = Path("src/graphics/host_gpu/renderer/debug.cpp")
           s = p.read_text(encoding="utf-8")
-          def replace_once(old, new):
+
+          def replace(old, new):
               global s
               if s.count(old) != 1:
-                  raise RuntimeError("Unexpected tracking lock source: " + repr(old))
+                  raise RuntimeError("Unexpected diagnostic source: " + repr(old))
               s = s.replace(old, new)
 
-          replace_once("#include <atomic>", "#include <atomic>\n#include <cstdlib>\n#include <cstring>")
-          replace_once("\t\t\tstd::atomic_signal_fence(std::memory_order_seq_cst);", """\t\t\tif (BlockingWait()) {
-          \t\t\t\t// Recheck after waking; test_and_set still acquires ownership.
-          \t\t\t\tm_lock.wait(true, std::memory_order_relaxed);
-          \t\t\t} else {
-          \t\t\t\tstd::atomic_signal_fence(std::memory_order_seq_cst);
-          \t\t\t}""")
-          replace_once("\t\tm_lock.clear(std::memory_order_release);", """\t\tm_lock.clear(std::memory_order_release);
-          \t\tif (BlockingWait()) {
-          \t\t\tm_lock.notify_one();
-          \t\t}""")
-          replace_once("private:\n\tstatic uint32_t CurrentThread() noexcept {", """private:
-          \tstatic bool BlockingWait() noexcept {
-          \t\tstatic const bool enabled = [] {
-          \t\t\tconst char* v = std::getenv("KYTY_TRACKING_BLOCKING_WAIT");
-          \t\t\treturn v && std::strcmp(v, "1") == 0;
-          \t\t}();
-          \t\treturn enabled;
-          \t}
-          \tstatic uint32_t CurrentThread() noexcept {""")
+          replace("\t// DRAW_INDEX_AUTO draws, also on their own (see Begin).", r"""
+              struct ShaderCpuRow {
+                  uint64_t draws = 0;
+                  uint64_t ticks = 0;
+                  std::array<uint64_t, Count> phases {};
+                  std::array<uint64_t, ProbeCount> probes {};
+              };
+              static const bool rank_enabled = [] {
+                  const char* v = std::getenv("KYTY_DEBUG_SHADER_CPU");
+                  return v && std::strcmp(v, "1") == 0;
+              }();
+              static std::unordered_map<uint64_t, ShaderCpuRow> shader_cpu;
+              if (rank_enabled) {
+                  auto& row = shader_cpu[pixel_hash];
+                  row.draws++;
+                  row.ticks += sum;
+                  for (uint32_t i = 0; i < Count; i++) row.phases[i] += current[i];
+                  for (uint32_t i = 0; i < ProbeCount; i++) row.probes[i] += probes[i];
+              }
+              // DRAW_INDEX_AUTO draws, also on their own (see Begin).""")
+
+          replace("\tconst auto   gpu_ns  = g_gpu_busy_ns.load(std::memory_order_relaxed);", r"""
+              if (rank_enabled) {
+                  std::vector<std::pair<uint64_t, ShaderCpuRow>> ranked(shader_cpu.begin(), shader_cpu.end());
+                  std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+                      return a.second.ticks > b.second.ticks;
+                  });
+                  uint64_t total_ticks = 0;
+                  for (const auto& entry: ranked) total_ticks += entry.second.ticks;
+                  std::printf("shader-cpu: %.1fs groups=%zu total-ms/s=%.2f unit=CPU-preparation\n",
+                              seconds, ranked.size(), total_ticks * to_us / 1000.0 / seconds);
+                  for (size_t n = 0; n < ranked.size() && n < 16; n++) {
+                      const auto& entry = ranked[n];
+                      const auto& row = entry.second;
+                      std::printf("shader-cpu ps=%016llx draws/s=%.0f us/draw=%.2f ms/s=%.2f share=%.1f%%",
+                                  static_cast<unsigned long long>(entry.first), row.draws / seconds,
+                                  row.draws ? row.ticks * to_us / row.draws : 0.0,
+                                  row.ticks * to_us / 1000.0 / seconds,
+                                  total_ticks ? 100.0 * row.ticks / total_ticks : 0.0);
+                      for (uint32_t i = 0; i < Count; i++)
+                          std::printf(" %s=%.2f", Names[i], row.phases[i] * to_us / row.draws);
+                      std::printf(" | probes:");
+                      for (uint32_t i = 0; i < ProbeCount; i++)
+                          std::printf(" %s=%.2f", ProbeNames[i], row.probes[i] * to_us / row.draws);
+                      std::printf("\n");
+                  }
+                  shader_cpu.clear();
+              }
+              const auto   gpu_ns  = g_gpu_busy_ns.load(std::memory_order_relaxed);""")
+
           p.write_text(s, encoding="utf-8", newline="\n")
-          print("Retained optional atomic wait/notify from Prueba 10")
+          print("Diagnostic 22: top 16 shader groups by CPU preparation time")
           '@ | python -
-          if ($LASTEXITCODE -ne 0) { throw "Blocking wait adaptation failed" }
 
-      - name: Adapt shared sampler snapshots
-        run: |
-          $ErrorActionPreference = "Stop"
-          @'
-          from pathlib import Path
-
-          def replace(path, old, new):
-              p = Path(path)
-              s = p.read_text(encoding='utf-8')
-              if s.count(old) != 1:
-                  raise RuntimeError('Unexpected source: ' + path + ' ' + repr(old))
-              p.write_text(s.replace(old, new), encoding='utf-8', newline='\n')
-
-          header = 'src/graphics/shader/recompiler/ir/ShaderIR.h'
-          replace(header, '#include <deque>', '#include <deque>\n#include <cstdlib>\n#include <cstring>')
-          replace(header, 'enum class ResourceKind {', '''inline bool SharedSamplerSnapshotsEnabled() noexcept {
-              static const bool enabled = [] {
-                  const char* value = std::getenv("KYTY_SHARED_SAMPLER_SNAPSHOTS");
-                  return value && std::strcmp(value, "1") == 0;
-              }();
-              return enabled;
-          }
-
-          enum class ResourceKind {''')
-          replace(header, 'struct SamplerResource {\n\tuint32_t source                = 0;\n\tuint32_t first_use_pc          = 0;\n\tbool     force_point_filtering = false;\n\tbool     depth_compare         = false;', 'struct SamplerResource {\n\tuint32_t source                = 0;\n\tuint32_t first_use_pc          = 0;\n\tbool     force_point_filtering = false;\n\tbool     depth_compare         = false;\n\tuint32_t snapshot_index        = 0;')
-          source = 'src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp'
-          replace(source, '\tfor (uint32_t index = 0; index < program.info.samplers.size(); index++) {\n\t\tconst auto target = sampler_plan.point_sampler[index];\n\t\tif (target != UINT32_MAX', '\tfor (uint32_t index = 0; !SharedSamplerSnapshotsEnabled() && index < program.info.samplers.size(); index++) {\n\t\tconst auto target = sampler_plan.point_sampler[index];\n\t\tif (target != UINT32_MAX')
-          replace(source, '\tsamplers.reserve(sampler_plan.sampler_count);', '''\tsamplers.reserve(sampler_plan.sampler_count);
-          \tfor (uint32_t index = 0; index < samplers.size(); index++) {
-          \t\tsamplers[index].snapshot_index = index;
-          \t}''')
-          replace(source, '\t\t\tsampler.force_point_filtering = true;\n\t\t\tsamplers.push_back', '''\t\t\tsampler.force_point_filtering = true;
-          \t\t\tsampler.snapshot_index = SharedSamplerSnapshotsEnabled() ? index : target;
-          \t\t\tsamplers.push_back''')
-          replace('src/graphics/host_gpu/renderer/pipeline/descriptors.cpp', 'NativeSampler(m_context, program, i, snapshot.samplers[i])', 'NativeSampler(m_context, program, i, snapshot.samplers[program.info.samplers[i].snapshot_index])')
-          replace('src/graphics/host_gpu/renderer/renderCompute.cpp', 'DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[i])', 'DecodeNativeDescriptor<ShaderSamplerResource>(resources.samplers[program.info.samplers[i].snapshot_index])')
-          tests = 'tests/ResourceMaterializationTests.cpp'
-          replace(tests, 'void TestMixedSamplerDuplicatesTheCorrectSnapshot() {', 'void TestMixedSamplerDuplicatesTheCorrectSnapshot() {\n  using Libs::Graphics::ShaderRecompiler::IR::SamplerResource;\n  const SamplerResource positional {17u, 29u, true, true};\n  Check(positional.source == 17u && positional.first_use_pc == 29u &&\n            positional.force_point_filtering && positional.depth_compare &&\n            positional.snapshot_index == 0u,\n        "sampler sharing changed positional aggregate initialization");')
-
-          replace(tests, '''  Check(snapshot.samplers.size() == 3,
-                  "mixed sampler materialization appended unrelated samplers");
-            Check(snapshot.samplers[2] == snapshot.samplers[1] &&
-                      snapshot.samplers[2] != snapshot.samplers[0],
-                  "point sampler variant duplicated the wrong runtime descriptor");''', '''  if (SharedSamplerSnapshotsEnabled()) {
-              Check(snapshot.samplers.size() == 2,
-                    "shared sampler materialization duplicated a descriptor");
-              Check(snapshot.samplers[0] != snapshot.samplers[1],
-                    "shared sampler descriptors lost their distinct values");
-            } else {
-              Check(snapshot.samplers.size() == 3,
-                    "mixed sampler materialization appended unrelated samplers");
-              Check(snapshot.samplers[2] == snapshot.samplers[1] &&
-                        snapshot.samplers[2] != snapshot.samplers[0],
-                    "point sampler variant duplicated the wrong runtime descriptor");
-            }''')
-          replace(tests, "  }\n}\n\n// Guest memory", """  }
-            Program program;
-            program.resource_tracking_complete = true;
-            program.info = plan.info;
-            ApplyResourceSpecialization(program, specialization);
-            Check(program.info.samplers.size() == 3,
-                  "sampler sharing changed the native sampler layout");
-            Check(program.info.samplers[0].snapshot_index == 0 &&
-                      program.info.samplers[1].snapshot_index == 1 &&
-                      program.info.samplers[2].snapshot_index ==
-                          (SharedSamplerSnapshotsEnabled() ? 1u : 2u),
-                  "native sampler variant selected the wrong snapshot index");
-            Check(snapshot.samplers[program.info.samplers[2].snapshot_index] == snapshot.samplers[1],
-                  "native point sampler lost its original descriptor");
-          }
-
-          // Guest memory""")
-          print('Prueba 12: adapted shared sampler snapshots; existing layout checks retained')
-          '@ | python -
-          if ($LASTEXITCODE -ne 0) { throw "Sampler adaptation failed" }
-
-      - name: Adapt color metadata publication
-        run: |
-          $ErrorActionPreference = "Stop"
-          @'
-          from pathlib import Path
-          p = Path("src/graphics/host_gpu/renderer/cache/textureCache.cpp")
-          s = p.read_text(encoding="utf-8")
-          old = "\t\t\tm_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);"
-          new = """\t\t\tstatic const bool direct_metadata = [] {
-          \t\t\t\tconst char* value = std::getenv("KYTY_DIRECT_COLOR_METADATA");
-          \t\t\t\treturn value && std::strcmp(value, "1") == 0;
-          \t\t\t}();
-          \t\t\tif (direct_metadata) {
-          \t\t\t\tstd::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
-          \t\t\t\tm_buffer_cache.InvalidateMemory(address, slice_size);
-          \t\t\t\tLibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
-          \t\t\t\t// Retain this AMD base's descriptor-read epoch invalidation.
-          \t\t\t\tm_scheduler.Context().AdvanceBdaEpochForGpuWrite();
-          \t\t\t} else {
-          \t\t\t\tm_buffer_cache.FillBuffer(address, slice_size, UINT32_MAX, false);
-          \t\t\t}"""
-          if s.count(old) != 1:
-              raise RuntimeError("Unexpected color metadata source")
-          if "#include <cstring>" not in s:
-              s = s.replace("#include <cstdlib>", "#include <cstdlib>\n#include <cstring>", 1)
-              if "#include <cstring>" not in s:
-                  raise RuntimeError("Expected standard includes missing")
-          p.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
-          print("Prueba 13: adapted upstream 190608a; metadata A/B switch installed")
-          '@ | python -
-          if ($LASTEXITCODE -ne 0) { throw "Metadata publication adaptation failed" }
-
-      - name: Add no pixel render target diagnostics
-        run: |
-          $ErrorActionPreference = "Stop"
-          @'
-          from pathlib import Path
-
-          def replace(path, old, new):
-              p = Path(path)
-              text = p.read_text(encoding='utf-8')
-              if text.count(old) != 1:
-                  raise RuntimeError('Unexpected source: ' + path + ' ' + repr(old))
-              p.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
-
-          header = 'src/graphics/host_gpu/renderer/debug.h'
-          replace(header, '\tstatic constexpr uint64_t AllDraws = ~uint64_t {0};',
-              '\tstatic constexpr uint64_t AllDraws = ~uint64_t {0};\n\tstatic constexpr uint64_t NoPixelDraws = AllDraws - 1u;')
-          source = 'src/graphics/host_gpu/renderer/debug.cpp'
-          replace(source, '\t\treturn std::strcmp(text, "all") == 0 ? AllDraws : std::strtoull(text, nullptr, 16);',
-              '\t\tif (std::strcmp(text, "nopixel") == 0) return NoPixelDraws;\n\t\treturn std::strcmp(text, "all") == 0 ? AllDraws : std::strtoull(text, nullptr, 16);')
-          replace(source, '\tif (pixel_hash == Hash() || Hash() == AllDraws) {',
-              '\tif (pixel_hash == Hash() || Hash() == AllDraws ||\n\t    (Hash() == NoPixelDraws && pixel_hash == 0)) {')
-          source = 'src/graphics/host_gpu/renderer/renderDraw.cpp'
-          helper = r'''
-          // Diagnostic only: CPU thread owns these counters. No changes to draw execution.
-          static void AccountNoPixelTargets(const DrawRenderState& state) {
-              static const bool enabled = [] {
-                  const auto* value = std::getenv("KYTY_DEBUG_NO_PIXEL_TARGETS");
-                  return value != nullptr && std::strcmp(value, "1") == 0;
-              }();
-              if (!enabled || state.ps_active) return;
-              using Key = std::array<uint64_t, 13>;
-              static std::map<Key, uint64_t> counts;
-              static auto start = std::chrono::steady_clock::now();
-              const auto* vertex = state.vertex_info[0].stage.program;
-              Key key {};
-              key[0] = vertex != nullptr ? vertex->shader_hash : 0;
-              if (state.depth_info.image_id) {
-                  const auto& depth = state.depth_info;
-                  key[1] = depth.desc.info.data.address;
-                  key[2] = depth.desc.info.extent.width;
-                  key[3] = depth.desc.info.extent.height;
-                  key[4] = depth.desc.view_info.base_level;
-                  key[5] = depth.desc.view_info.base_layer;
-                  key[6] = depth.desc.view_info.layer_count;
-                  key[7] = depth.depth_test_enable ? 1 : 0;
-                  key[8] = depth.depth_write_enable ? 1 : 0;
-                  key[9] = depth.depth_clear_enable ? 1 : 0;
-              }
-              key[10] = state.color_count;
-              if (state.color_count != 0) {
-                  key[11] = state.color_info[0].desc.info.data.address;
-                  key[12] = state.color_info[0].target_slot;
-              }
-              counts[key]++;
-              const auto now = std::chrono::steady_clock::now();
-              if (now - start < std::chrono::seconds(10)) return;
-              const auto seconds = std::chrono::duration<double>(now - start).count();
-              std::vector<std::pair<Key, uint64_t>> rows(counts.begin(), counts.end());
-              std::ranges::sort(rows, [](const auto& a, const auto& b) { return a.second > b.second; });
-              uint64_t total = 0;
-              for (const auto& row : rows) total += row.second;
-              std::printf("nopixel-targets: %.1fs draws/s=%.0f groups=%zu\n",
-                          seconds, total / seconds, rows.size());
-              for (size_t i = 0; i < std::min<size_t>(rows.size(), 12); ++i) {
-                  const auto& [k, count] = rows[i];
-                  std::printf("nopixel-target vs=%016" PRIx64 " depth=%016" PRIx64
-                              " size=%" PRIu64 "x%" PRIu64 " mip=%" PRIu64
-                              " layer=%" PRIu64 "+%" PRIu64 " test=%" PRIu64
-                              " write=%" PRIu64 " clear=%" PRIu64 " colors=%" PRIu64
-                              " first-color=%016" PRIx64 " slot=%" PRIu64 " draws/s=%.0f\n",
-                              k[0], k[1], k[2], k[3], k[4], k[5], k[6], k[7], k[8],
-                              k[9], k[10], k[11], k[12], count / seconds);
-              }
-              counts.clear();
-              start = now;
-          }
-
-          '''
-          replace(source, 'static_assert(std::is_trivially_destructible_v<ShaderVertexInputInfo>);',
-              helper + 'static_assert(std::is_trivially_destructible_v<ShaderVertexInputInfo>);')
-          replace(source, '\tif (DrawLog::StatsEnabled()) [[unlikely]] {',
-              '\tAccountNoPixelTargets(state);\n\tif (DrawLog::StatsEnabled()) [[unlikely]] {')
-          print('Diagnostic 20: no-pixel CPU phases and render target groups installed')
-          '@ | python -
-          if ($LASTEXITCODE -ne 0) { throw "Diagnostic 20 adaptation failed" }
-
-      - name: Verify patched source
-        run: |
-          $ErrorActionPreference = "Stop"
+          if ($LASTEXITCODE -ne 0) { throw "Shader CPU instrumentation failed" }
 
           git diff --check
-          if ($LASTEXITCODE -ne 0) {
-            throw "Invalid source diff"
-          }
-
-          $config = Get-Content "src/common/emulatorConfig.h" -Raw
-
-          if ($config -notmatch 'gpu_frames_ahead\s*=\s*0\s*;') {
-            throw "Expected original gpu_frames_ahead = 0"
-          }
-
-          $statsSource = Get-Content `
-            "src/graphics/host_gpu/renderer/drainStats.cpp" -Raw
-
-          if (-not $statsSource.Contains("KYTY_LIGHT_DRAIN_STATS")) {
-            throw "Light diagnostics patch verification failed"
-          }
-
-          git diff --stat
+          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -410,26 +180,33 @@ jobs:
       - name: Install glslang
         run: |
           $ErrorActionPreference = "Stop"
-          $headers = @{ "User-Agent" = "GitHub-Actions-KytyPS5"; "Accept" = "application/vnd.github+json" }
+          $headers = @{
+            "User-Agent" = "GitHub-Actions-KytyPS5"
+            "Accept" = "application/vnd.github+json"
+          }
           $release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers
           $asset = $release.assets | Where-Object {
             $_.name -match "(?i)windows" -and $_.name -match "(?i)(x64|x86_64|amd64)" -and $_.name -match "(?i)\.zip$"
           } | Select-Object -First 1
+
           if (-not $asset) {
             $asset = $release.assets | Where-Object {
               $_.name -match "(?i)windows" -and $_.name -match "(?i)\.zip$"
             } | Select-Object -First 1
           }
           if (-not $asset) { throw "No Windows glslang ZIP found" }
+
           $zip = "$env:RUNNER_TEMP/glslang.zip"
           $extract = "$env:RUNNER_TEMP/glslang"
           Invoke-WebRequest -Uri $asset.browser_download_url -Headers $headers -OutFile $zip
           Expand-Archive -Path $zip -DestinationPath $extract -Force
+
           $validator = Get-ChildItem $extract -Filter "glslangValidator.exe" -Recurse | Select-Object -First 1
           if (-not $validator) {
             $validator = Get-ChildItem $extract -Filter "glslang.exe" -Recurse | Select-Object -First 1
           }
           if (-not $validator) { throw "glslang executable missing" }
+
           if ($validator.Name -eq "glslang.exe") {
             Copy-Item $validator.FullName (Join-Path $validator.Directory.FullName "glslangValidator.exe") -Force
           }
@@ -438,10 +215,7 @@ jobs:
       - name: Verify glslang
         run: |
           glslangValidator --version
-
-          if ($LASTEXITCODE -ne 0) {
-            throw "glslang verification failed"
-          }
+          if ($LASTEXITCODE -ne 0) { throw "glslang verification failed" }
 
       - name: Configure CMake
         run: |
@@ -456,9 +230,7 @@ jobs:
             -DCMAKE_CXX_COMPILER=clang-cl `
             -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "CMake configure failed"
-          }
+          if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 
       - name: Build KytyPS5
         run: |
@@ -467,19 +239,23 @@ jobs:
             --target launcher shader_vertex_metadata_tests memory_tracker_tests resource_materialization_tests shader_cfg_tests virtual_memory_allocation_tests `
             --parallel
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Build failed"
-          }
+          if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 
       - name: Test memory and shader paths
         run: |
           $env:KYTY_TRACKING_BLOCKING_WAIT = "1"
+
           foreach ($mode in @(0, 1)) {
             $env:KYTY_DIRECT_COLOR_METADATA = "$mode"
             $env:KYTY_SHARED_SAMPLER_SNAPSHOTS = "1"
+
             ctest --test-dir _Build/windows -R '^(shader_vertex_metadata|memory_tracker|resource_materialization|shader_cfg|virtual_memory_allocation)$' --output-on-failure --no-tests=error
-            if ($LASTEXITCODE -ne 0) { throw "Memory or shader tests failed in mode $mode" }
+
+            if ($LASTEXITCODE -ne 0) {
+              throw "Memory or shader tests failed in mode $mode"
+            }
           }
+
           Remove-Item Env:KYTY_DIRECT_COLOR_METADATA
           Remove-Item Env:KYTY_SHARED_SAMPLER_SNAPSHOTS
           Remove-Item Env:KYTY_TRACKING_BLOCKING_WAIT
@@ -490,17 +266,20 @@ jobs:
             --install _Build/windows `
             --prefix _Build/windows/install
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Install failed"
-          }
+          if ($LASTEXITCODE -ne 0) { throw "Install failed" }
 
       - name: Package launchers and symbols
         run: |
           $ErrorActionPreference = "Stop"
           $install = "_Build/windows/install"
-          if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
+
+          if (-not (Test-Path "$install/launcher.exe")) {
+            throw "launcher.exe missing"
+          }
+
           foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Diagnostico-20.cmd" } else { "Comparacion-14.cmd" }
+            $name = if ($mode -eq 1) { "Diagnostico-22.cmd" } else { "Comparacion-14.cmd" }
+
             @(
               '@echo off',
               'setlocal',
@@ -514,7 +293,8 @@ jobs:
               'set KYTY_DIRECT_COLOR_METADATA=1',
               'set KYTY_RECORD_THREAD=0',
               'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
-              "set KYTY_DEBUG_NO_PIXEL_TARGETS=$mode",
+              'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
+              "set KYTY_DEBUG_SHADER_CPU=$mode",
               'set KYTY_DEBUG_QUEUES=',
               'set KYTY_SRT_STATS=',
               'set KYTY_DEBUG_SRT_RUNS=',
@@ -525,7 +305,7 @@ jobs:
               'set KYTY_LIGHT_DRAIN_STATS=1',
               'set KYTY_DEBUG_SAMPLE_GPU=',
               'set KYTY_DEBUG_DUMP_THREADS=',
-              "set KYTY_DEBUG_DRAW_PHASES=$(if ($mode -eq 1) { 'nopixel' } else { '' })",
+              "set KYTY_DEBUG_DRAW_PHASES=$(if ($mode -eq 1) { 'all' } else { '' })",
               'set KYTY_DEBUG_DRAW_STATS=',
               'set KYTY_DEBUG_SPEC_STATS=',
               'set KYTY_DEBUG_STREAM_STATS=',
@@ -534,22 +314,27 @@ jobs:
               '"%~dp0launcher.exe" %*'
             ) | Set-Content "$install/$name" -Encoding ascii
           }
+
           $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
           if (-not $maps) { throw "Emulator map missing" }
-          foreach ($map in $maps) { Copy-Item $map.FullName $install -Force }
+
+          foreach ($map in $maps) {
+            Copy-Item $map.FullName $install -Force
+          }
+
           $pdb = "_Build/windows/kyty_emulator.pdb"
           if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
           Copy-Item $pdb $install -Force
+
           @(
             "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Upstream a67a033 and f3dc5ee retained.",
-            "Comparacion-14.cmd: Prueba 14 settings, diagnostic counters OFF.",
-            "Diagnostico-20.cmd: same settings, no-pixel phases and target groups ON.",
-            "Keep AMD CPU patch OFF, shader validation OFF, red-zone protection ON.",
-            "Copy your working _Patches; select THIS interpreter.",
-            "Close all emulator and launcher processes before switching mode.",
-            "Capture console: heavy view 30s, then light view 30s; report FPS for each."
-          ) | Set-Content "$install/DIAGNOSTICO-20.txt" -Encoding ascii
+            "Comparacion-14.cmd: diagnostic counters OFF.",
+            "Diagnostico-22.cmd: shader CPU ranking ON.",
+            "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
+            "Copy your working _Patches and select THIS interpreter.",
+            "Close emulator and launcher before changing mode.",
+            "Heavy view 60 seconds; light view 60 seconds."
+          ) | Set-Content "$install/DIAGNOSTICO-22.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
@@ -557,10 +342,10 @@ jobs:
 
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Diagnostico-20-Destinos.zip" `
+            -DestinationPath "KytyPS5-Windows-AMD-Diagnostico-22-CPU.zip" `
             -Force -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Diagnostico-20-Destinos.zip"
+          $zip = "KytyPS5-Windows-AMD-Diagnostico-22-CPU.zip"
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
           }
@@ -568,7 +353,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Diagnostico-20-Destinos
-          path: KytyPS5-Windows-AMD-Diagnostico-20-Destinos.zip
+          name: KytyPS5-Windows-AMD-Diagnostico-22-CPU
+          path: KytyPS5-Windows-AMD-Diagnostico-22-CPU.zip
           if-no-files-found: error
           retention-days: 7
