@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 32 - Simplificar SRT
+name: Windows AMD - Prueba 33 - Zen 3 y AVX2
 
 'on':
   workflow_dispatch:
@@ -8,7 +8,26 @@ permissions:
 
 jobs:
   build:
+    name: Prueba 33 - ${{ matrix.profile }}
     runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: Generica
+            flags: /clang:-ffp-contract=off
+            cmd: Comparacion-33.cmd
+
+          - profile: Zen3-AVX2
+            flags: /clang:-march=x86-64-v3 /clang:-mtune=znver3 /clang:-ffp-contract=off
+            cmd: Prueba-33.cmd
+
+    env:
+      KYTY_PROFILE_33: ${{ matrix.profile }}
+      KYTY_FLAGS_33: ${{ matrix.flags }}
+      KYTY_CMD_33: ${{ matrix.cmd }}
+
     defaults:
       run:
         shell: pwsh
@@ -43,8 +62,10 @@ jobs:
           $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
           if (-not $pythonExe) { throw "Python executable missing" }
           "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
           & $pythonExe -m pip install PyYAML==6.0.2
           if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+
           & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
           if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
 
@@ -71,7 +92,8 @@ jobs:
                   continue
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
-              script = Path(f"_prepare32_{index}.ps1")
+
+              script = Path(f"_prepare33_{index}.ps1")
               script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
               print("Preparing:", step["name"], flush=True)
               subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -80,137 +102,6 @@ jobs:
               raise RuntimeError("Baseline preparation boundaries missing")
           '@ | & $env:KYTY_PYTHON -
           if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
-
-      - name: Simplify immutable SRT aliases and add regressions
-        run: |
-          $ErrorActionPreference = "Stop"
-          @'
-          from pathlib import Path
-
-          p = Path("src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp")
-          s = p.read_text(encoding="utf-8")
-          s = "#include <cstdlib>\n#include <cstring>\n" + s
-          old = "\tcompiled->descriptor_slots.resize(compiled->descriptors.size());"
-          if s.count(old) != 1:
-              raise RuntimeError("Compiled graph boundary missing")
-
-          code = r'''    static const bool simplify = [] {
-                  const char* value = std::getenv("KYTY_SRT_ALIASES_32");
-                  return value && std::strcmp(value, "1") == 0;
-              }();
-              if (simplify) {
-                  // Forward nodes preserve the full value. Redirect immutable graph edges,
-                  // never guest reads or dynamic values. Leave cycles and invalid edges intact.
-                  const auto count = static_cast<uint32_t>(compiled->nodes.size());
-                  std::vector<uint32_t> aliases(count);
-                  for (uint32_t index = 0; index < count; ++index) {
-                      aliases[index] = index;
-                      auto target = index;
-                      for (uint32_t depth = 0; depth < count; ++depth) {
-                          const auto& node = compiled->nodes[target];
-                          if (node.op != NodeOp::Forward) {
-                              aliases[index] = target;
-                              break;
-                          }
-                          const auto next = node.args[0];
-                          if (next >= count) break;
-                          target = next;
-                      }
-                  }
-                  const auto redirect = [&](uint32_t& index) {
-                      if (index < count) index = aliases[index];
-                  };
-                  for (auto& node : compiled->nodes)
-                      for (auto& arg : node.args) redirect(arg);
-                  for (auto& index : compiled->slots) redirect(index);
-                  for (auto& descriptor : compiled->descriptors)
-                      for (auto& index : descriptor) redirect(index);
-                  for (auto& index : compiled->key_counts) redirect(index);
-                  for (auto& index : compiled->selector_masks) redirect(index);
-                  for (auto& index : compiled->conditions) redirect(index);
-                  for (auto& index : compiled->fill) redirect(index);
-              }
-          '''
-          s = s.replace(old, code + old)
-          p.write_text(s, encoding="utf-8", newline="\n")
-
-          p = Path("tests/ResourceMaterializationTests.cpp")
-          s = p.read_text(encoding="utf-8")
-          old = "int main() {"
-          if s.count(old) != 1:
-              raise RuntimeError("Resource test entry missing")
-
-          code = r'''void TestSrtForwardCyclesAndFailures() {
-            using namespace Libs::Graphics::ShaderRecompiler::IR;
-            for (const bool cycle : {false, true}) {
-              auto plan = MemoPlan(MemoPlanExtra::None, false);
-              auto& bits = plan.value_storage.emplace_back(ValueOpcode::BitCastF32U32);
-              auto& restored = plan.value_storage.emplace_back(ValueOpcode::BitCastU32F32);
-              restored.SetArg(0, Value(&bits));
-              if (cycle) bits.SetArg(0, Value(&restored));
-              else {
-                auto& undef = plan.value_storage.emplace_back(ValueOpcode::UndefU32);
-                bits.SetArg(0, Value(&undef));
-              }
-              plan.descriptor_sources[1].dwords[0] = Value(&restored);
-              MemoFixture fixture;
-              Check(!fixture.Refresh(plan), "alias cycle or unsupported value was accepted");
-              Check(!fixture.memo.valid, "failed alias refresh left a valid memo");
-            }
-          }
-
-          void TestSrtForwardAliasesKeepFreshValues() {
-            using namespace Libs::Graphics::ShaderRecompiler::IR;
-            auto plan = MemoPlan(MemoPlanExtra::None, true);
-            for (auto& source : plan.descriptor_sources) {
-              for (uint32_t word = 0; word < source.dword_count; ++word) {
-                auto& bits = plan.value_storage.emplace_back(ValueOpcode::BitCastF32U32);
-                bits.SetArg(0, source.dwords[word]);
-                auto& restored = plan.value_storage.emplace_back(ValueOpcode::BitCastU32F32);
-                restored.SetArg(0, Value(&bits));
-                source.dwords[word] = Value(&restored);
-              }
-            }
-            MemoFixture fixture;
-            for (uint32_t i = 0; i < 128; ++i) {
-              const bool first = (i % 4u) < 2u;
-              fixture.memory.words[4] = first ? 1u : 0u;
-              const std::array<uint32_t, 4> patterns {
-                  0x80000000u, 0xffffffffu, 0x7fc00000u, 0x7f800000u};
-              const uint32_t value = patterns[i % patterns.size()] ^ i;
-              fixture.memory.words[0] = value;
-              fixture.user_data[2] = value + 0x1000u;
-              Check(fixture.Refresh(plan), "forward alias refresh failed");
-              Check(fixture.snapshot.buffers[first ? 0u : 1u].dwords[0] ==
-                        (first ? value : value + 0x1000u) &&
-                    fixture.snapshot.buffers[first ? 1u : 0u].dwords[0] == 0u,
-                    "forward aliases hid a descriptor or branch change");
-            }
-            const auto& compiled = CompileResourcePlan(plan);
-            const char* setting = std::getenv("KYTY_SRT_ALIASES_32");
-            if (setting && std::strcmp(setting, "1") == 0) {
-              Check(compiled.nodes[compiled.descriptors[0][0]].op == ResourceNode::Op::ReadConst,
-                    "flat descriptor forward chain was not removed");
-              Check(compiled.nodes[compiled.descriptors[1][0]].op == ResourceNode::Op::UserData,
-                    "user-data descriptor forward chain was not removed");
-            }
-          }
-
-          '''
-          s = s.replace(old, code + old)
-          s = s.replace(
-              "  TestMemoTracksDescriptorInputs();",
-              "  TestMemoTracksDescriptorInputs();\n"
-              "  TestSrtForwardAliasesKeepFreshValues();\n"
-              "  TestSrtForwardCyclesAndFailures();"
-          )
-          s = "#include <cstring>\n" + s
-          p.write_text(s, encoding="utf-8", newline="\n")
-          print("Prueba 32: immutable SRT forward aliases; guest readers unchanged")
-          '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "SRT simplification failed" }
-          git diff --check
-          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
@@ -237,11 +128,44 @@ jobs:
           modules: qt5compat
           cache: true
 
+      - name: Verify selected compiler flags
+        run: |
+          $ErrorActionPreference = "Stop"
+          $probe = Join-Path $env:RUNNER_TEMP "kyty_flags33.cpp"
+
+          @'
+          #if defined(KYTY_EXPECT_AVX2) && !defined(__AVX2__)
+          #error AVX2 was not enabled
+          #endif
+          #if defined(__AVX512F__)
+          #error AVX512 must not be enabled
+          #endif
+          int probe(int a, int b) { return (a + b) ^ (a >> 3); }
+          '@ | Set-Content $probe -Encoding ascii
+
+          $flags = @($env:KYTY_FLAGS_33 -split ' ' | Where-Object { $_ })
+          if ($env:KYTY_PROFILE_33 -eq "Zen3-AVX2") {
+            $flags += '/DKYTY_EXPECT_AVX2=1'
+          }
+
+          & clang-cl /nologo /c /O2 `
+            /clang:-Werror=unused-command-line-argument `
+            /clang:-Werror=unknown-argument `
+            @flags $probe "/Fo:$env:RUNNER_TEMP/kyty_flags33.obj"
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Selected CPU compiler flags failed"
+          }
+
+          Write-Host "Profile: $env:KYTY_PROFILE_33"
+          Write-Host "Compiler flags: $env:KYTY_FLAGS_33"
+
       - name: Build and test using pinned working workflow
         run: |
           $ErrorActionPreference = "Stop"
           & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
           if ($LASTEXITCODE -ne 0) { throw "Pinned Python YAML verification failed" }
+
           @'
           from pathlib import Path
           import subprocess
@@ -264,17 +188,31 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected build step")
 
-              script = Path(f"_build32_{index}.ps1")
+              if step["name"] == "Configure CMake":
+                  flags = os.environ["KYTY_FLAGS_33"]
+                  args = [
+                      "cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
+                      "-DCMAKE_BUILD_TYPE=Release",
+                      "-DCMAKE_C_COMPILER=clang-cl",
+                      "-DCMAKE_CXX_COMPILER=clang-cl",
+                      "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
+                      "-DCMAKE_C_FLAGS=" + flags,
+                      "-DCMAKE_CXX_FLAGS=" + flags,
+                      "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
+                  ]
+                  print("Configuring profile:", os.environ["KYTY_PROFILE_33"], flags, flush=True)
+                  subprocess.run(args, check=True)
+                  continue
+
+              script = Path(f"_build33_{index}.ps1")
               script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
               print("Running:", step["name"], flush=True)
+
               path_file = Path(os.environ["GITHUB_PATH"])
               entries = path_file.read_text(encoding="utf-8-sig").splitlines() if path_file.exists() else []
               os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
 
-              modes = ("0", "1") if step["name"] == "Test memory and shader paths" else ("0",)
-              for mode in modes:
-                  os.environ["KYTY_SRT_ALIASES_32"] = mode
-                  subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+              subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
 
           if not started or not finished:
               raise RuntimeError("Build boundaries missing")
@@ -285,80 +223,88 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $install = "_Build/windows/install"
-          if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
-
-          foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Prueba-32.cmd" } else { "Comparacion-32.cmd" }
-            @(
-              '@echo off',
-              'setlocal',
-              'cd /d "%~dp0"',
-              'set KYTY_TRACKING_PAUSE=',
-              'set KYTY_BDA_SLICE_FILTER=',
-              'set KYTY_TRACKING_DIAGNOSTICS=',
-              'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
-              'set KYTY_TRACKING_BLOCKING_WAIT=1',
-              'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
-              'set KYTY_DIRECT_COLOR_METADATA=1',
-              'set KYTY_RECORD_THREAD=0',
-              'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
-              'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
-              'set KYTY_DEBUG_SHADER_CPU=0',
-              'set KYTY_RESOURCE_BLOCKS_32=0',
-              'set KYTY_HOST_PRIORITY_26=0',
-              'set KYTY_REFRESH_DIAGNOSTIC_27=0',
-              "set KYTY_SRT_ALIASES_32=$mode",
-              'set KYTY_DIRECT_FLAT_31=0',
-              'set KYTY_DIRECT_INPUTS_29=0',
-              'set KYTY_ACTIVE_MASK_VIEW_28=0',
-              'set KYTY_DEBUG_QUEUES=',
-              'set KYTY_SRT_STATS=',
-              'set KYTY_DEBUG_SRT_RUNS=',
-              'set KYTY_VERIFY_SRT=',
-              'set KYTY_VERIFY_SPEC=',
-              'set KYTY_VERIFY_SPEC_READS=',
-              'set KYTY_SPECULATE_DRAWS=0',
-              'set KYTY_LIGHT_DRAIN_STATS=1',
-              'set KYTY_DEBUG_SAMPLE_GPU=',
-              'set KYTY_DEBUG_DUMP_THREADS=',
-              'set KYTY_DEBUG_DRAW_PHASES=',
-              'set KYTY_DEBUG_DRAW_STATS=',
-              'set KYTY_DEBUG_SPEC_STATS=',
-              'set KYTY_DEBUG_STREAM_STATS=',
-              'set KYTY_DEBUG_UPLOADS=',
-              'set KYTY_GPU_ZONES=',
-              '"%~dp0launcher.exe" %*'
-            ) | Set-Content "$install/$name" -Encoding ascii
+          if (-not (Test-Path "$install/launcher.exe")) {
+            throw "launcher.exe missing"
           }
+
+          $name = $env:KYTY_CMD_33
+          @(
+            '@echo off',
+            'setlocal',
+            'cd /d "%~dp0"',
+            'set KYTY_TRACKING_PAUSE=',
+            'set KYTY_BDA_SLICE_FILTER=',
+            'set KYTY_TRACKING_DIAGNOSTICS=',
+            'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
+            'set KYTY_TRACKING_BLOCKING_WAIT=1',
+            'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
+            'set KYTY_DIRECT_COLOR_METADATA=1',
+            'set KYTY_RECORD_THREAD=0',
+            'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
+            'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
+            'set KYTY_DEBUG_SHADER_CPU=0',
+            'set KYTY_RESOURCE_BLOCKS_32=0',
+            'set KYTY_HOST_PRIORITY_26=0',
+            'set KYTY_REFRESH_DIAGNOSTIC_27=0',
+            'set KYTY_SRT_ALIASES_32=0',
+            'set KYTY_DIRECT_FLAT_31=0',
+            'set KYTY_DIRECT_INPUTS_29=0',
+            'set KYTY_ACTIVE_MASK_VIEW_28=0',
+            'set KYTY_DEBUG_QUEUES=',
+            'set KYTY_SRT_STATS=',
+            'set KYTY_DEBUG_SRT_RUNS=',
+            'set KYTY_VERIFY_SRT=',
+            'set KYTY_VERIFY_SPEC=',
+            'set KYTY_VERIFY_SPEC_READS=',
+            'set KYTY_SPECULATE_DRAWS=0',
+            'set KYTY_LIGHT_DRAIN_STATS=1',
+            'set KYTY_DEBUG_SAMPLE_GPU=',
+            'set KYTY_DEBUG_DUMP_THREADS=',
+            'set KYTY_DEBUG_DRAW_PHASES=',
+            'set KYTY_DEBUG_DRAW_STATS=',
+            'set KYTY_DEBUG_SPEC_STATS=',
+            'set KYTY_DEBUG_STREAM_STATS=',
+            'set KYTY_DEBUG_UPLOADS=',
+            'set KYTY_GPU_ZONES=',
+            '"%~dp0launcher.exe" %*'
+          ) | Set-Content "$install/$name" -Encoding ascii
 
           $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
           if (-not $maps) { throw "Emulator map missing" }
-          foreach ($map in $maps) { Copy-Item $map.FullName $install -Force }
+          foreach ($map in $maps) {
+            Copy-Item $map.FullName $install -Force
+          }
 
           $pdb = "_Build/windows/kyty_emulator.pdb"
           if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
           Copy-Item $pdb $install -Force
 
           @(
-            "Base AMD: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Upstream a67a033 and f3dc5ee retained.",
-            "Comparacion-32.cmd: stable settings, simplification OFF.",
-            "Prueba-32.cmd: same settings, immutable SRT simplification ON.",
-            "Keep AMD CPU patch OFF, shader validation OFF, red-zone protection ON.",
-            "Copy your working _Patches; select THIS interpreter.",
-            "Close all emulator and launcher processes before switching mode.",
-            "Compare the same heavy view for 60 seconds; report FPS and visual changes."
-          ) | Set-Content "$install/PRUEBA-32.txt" -Encoding ascii
+            "Profile: $env:KYTY_PROFILE_33",
+            "CPU flags: $env:KYTY_FLAGS_33",
+            "Start with: $env:KYTY_CMD_33",
+            "Fixed AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
+            "Source and runtime settings are identical in both profiles.",
+            "Experimental changes 31 and 32 are not applied.",
+            "Zen3-AVX2 requires an x86-64-v3 compatible CPU; Ryzen 5900X is compatible.",
+            "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
+            "Copy your working _Patches and select THIS interpreter.",
+            "Compare the same heavy view for 60 seconds after warming up.",
+            "Close emulator and launcher completely before changing profile."
+          ) | Set-Content "$install/PRUEBA-33.txt" -Encoding ascii
+
+          Copy-Item "_Build/windows/CMakeCache.txt" "$install/BuildFlags-33.txt" -Force
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
+          $zip = "KytyPS5-Prueba-33-$env:KYTY_PROFILE_33.zip"
+
           Compress-Archive `
             -Path "_Build/windows/install/*" `
-            -DestinationPath "KytyPS5-Windows-AMD-Prueba-32-Recursos.zip" `
+            -DestinationPath $zip `
             -Force -ErrorAction Stop
 
-          $zip = "KytyPS5-Windows-AMD-Prueba-32-Recursos.zip"
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
           }
@@ -366,7 +312,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Windows-AMD-Prueba-32-Recursos
-          path: KytyPS5-Windows-AMD-Prueba-32-Recursos.zip
+          name: KytyPS5-Prueba-33-${{ matrix.profile }}
+          path: KytyPS5-Prueba-33-${{ matrix.profile }}.zip
           if-no-files-found: error
           retention-days: 7
