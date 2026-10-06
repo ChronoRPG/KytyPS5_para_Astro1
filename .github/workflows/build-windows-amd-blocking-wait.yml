@@ -1,4 +1,4 @@
-name: Windows AMD - Diagnostico 37 - Coste por shader
+name: Windows AMD - Prueba 38 - Recursos ya presentes
 
 'on':
   workflow_dispatch:
@@ -8,12 +8,12 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - Diagnostico 37
+    name: Windows x64 - Prueba 38
     runs-on: windows-2022
 
     env:
-      KYTY_FLAGS_37: /clang:-ffp-contract=off
-      KYTY_PROFILE_37: Generica
+      KYTY_FLAGS_38: /clang:-ffp-contract=off
+      KYTY_PROFILE_38: Generica
 
     defaults:
       run:
@@ -80,7 +80,7 @@ jobs:
             if "uses" in step or "run" not in step:
                 raise RuntimeError("Unexpected baseline preparation step")
 
-            script = Path(f"_prepare37_{index}.ps1")
+            script = Path(f"_prepare38_{index}.ps1")
             script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
             print("Preparing:", step["name"], flush=True)
             subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -90,7 +90,7 @@ jobs:
         '@ | & $env:KYTY_PYTHON -
         if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-    - name: Add resource timing by shader
+    - name: Add optional redundant-source optimization and regression tests
       run: |
         $ErrorActionPreference = "Stop"
         @'
@@ -100,133 +100,166 @@ jobs:
             p=Path(path)
             s=p.read_text(encoding='utf-8')
             if s.count(old)!=1:
-                raise RuntimeError('Unexpected diagnostic 37 boundary: '+path)
+                raise RuntimeError('Unexpected source 38 boundary: '+path)
             p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
 
-        header='src/graphics/shader/recompiler/ir/passes/ResourceCosts37.h'
-        Path(header).write_text('#pragma once\nnamespace Libs::Graphics::ShaderRecompiler::IR {\ninline thread_local bool t_resource_costs37=false;\n}\n',encoding='utf-8')
+        header='src/graphics/shader/recompiler/ir/passes/RedundantSources38.h'
+        Path(header).write_text(r'''#pragma once
+        #include <cstdlib>
+        #include <cstring>
+        namespace Libs::Graphics::ShaderRecompiler::IR {
+        inline bool RedundantSources38Enabled() {
+            static const bool enabled=[] {
+                const auto* v=std::getenv("KYTY_REDUNDANT_SOURCES_38");
+                return v!=nullptr && std::strcmp(v,"1")==0;
+            }();
+            return enabled;
+        }
+        }
+        ''',encoding='utf-8')
 
-        p=Path('src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp')
-        p.write_text('#include "graphics/shader/recompiler/ir/passes/ResourceCosts37.h"\n#include <chrono>\n#include <map>\n#include <tuple>\n#include <string>\n'+p.read_text(encoding='utf-8'),encoding='utf-8')
+        p=Path('src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp')
+        p.write_text('#include "graphics/shader/recompiler/ir/passes/RedundantSources38.h"\n#include <atomic>\n#include <cstdio>\n'+p.read_text(encoding='utf-8'),encoding='utf-8')
 
-        helper=r'''
-        namespace {
-        const char* ResourceReason37(const ResourcePlan& p) {
-            if (!p.compiled || !p.srt_plan_complete || !p.resource_tracking_complete) return "incomplete";
-            if (p.has_address_writes) return "address-writes";
-            if (p.uniform_fill.fill.words!=0u) return "uniform-fill";
-            if (std::ranges::any_of(p.clean_flat_slots,[](auto x){return x!=0u;})) return "clean-SRT";
-            if (std::ranges::any_of(p.info.buffers,&BufferResource::written)) return "buffer-writes";
-            if (std::ranges::any_of(p.info.images,&ImageResource::written)) return "image-writes";
-            if (std::ranges::any_of(p.descriptor_sources,[](const auto& x){return x.indirect_image.has_value();})) return "indirect-images";
+        replace(str(p),
+            '\tconst auto count = program.control_flow.size();\n\tcompiled.inert_successors.assign(count, 0u);',
+            r'''    const bool redundant38=RedundantSources38Enabled() && !program.has_address_writes &&
+                program.uniform_fill.fill.words==0u &&
+                !std::ranges::any_of(program.info.buffers,&BufferResource::written) &&
+                !std::ranges::any_of(program.info.images,&ImageResource::written) &&
+                !std::ranges::any_of(program.descriptor_sources,[](const auto& x){return x.indirect_image.has_value();});
+            uint32_t extra_conditions38=0;
+            const auto count = program.control_flow.size();
+            compiled.inert_successors.assign(count, 0u);''')
 
-            for (const auto& n:p.compiled->nodes) {
-                if (n.op==ResourceNode::Op::Select) return "select";
-                if (n.op==ResourceNode::Op::ReadFirstLane) return "read-first-lane";
-                if ((n.flags&ResourceNode::CleanSlot)!=0u) return "clean-node";
+        replace(str(p),
+            '\t\tbool inert = true;\n\t\twhile (!stack.empty() && inert) {',
+            r'''        bool inert = true;
+                bool originally_inert38 = true;
+                while (!stack.empty() && inert) {''')
+
+        replace(str(p),
+            '\t\t\tinert          = program.control_flow[index].sources.empty();',
+            r'''            const auto& reached_sources38=program.control_flow[index].sources;
+                    originally_inert38=originally_inert38 && reached_sources38.empty();
+                    inert=reached_sources38.empty();
+                    if (redundant38 && !inert) {
+                        const auto& available38=program.control_flow[block].sources;
+                        inert=std::ranges::all_of(reached_sources38,[&](uint32_t source) {
+                            return std::ranges::find(available38,source)!=available38.end();
+                        });
+                    }''')
+
+        replace(str(p),
+            '\t\tcompiled.inert_successors[block] = inert ? 1u : 0u;\n\t}\n}\n\nvoid AnalyzeMemo',
+            r'''        compiled.inert_successors[block] = inert ? 1u : 0u;
+                if (redundant38 && inert && !originally_inert38 &&
+                    compiled.conditions[block]!=ResourceNode::NoNode) ++extra_conditions38;
             }
-
-            for (size_t i=0;i<p.compiled->conditions.size();++i) {
-                if (p.compiled->conditions[i]!=ResourceNode::NoNode &&
-                    (i>=p.compiled->direct_conditions.size() || p.compiled->direct_conditions[i]==0u))
-                    return "strict-condition";
+            if (RedundantSources38Enabled()) {
+                static std::atomic<uint64_t> seen38=0,affected38=0,conditions38=0;
+                if (extra_conditions38!=0u) {
+                    affected38.fetch_add(1u,std::memory_order_relaxed);
+                    conditions38.fetch_add(extra_conditions38,std::memory_order_relaxed);
+                    std::printf("source38-plan: shader=%016llx stage=%s extra-conditions=%u\n",
+                        static_cast<unsigned long long>(program.shader_hash),StageName(program.stage),extra_conditions38);
+                }
+                const auto n=seen38.fetch_add(1u,std::memory_order_relaxed)+1u;
+                if (n%128u==0u) {
+                    std::printf("source38-plans: seen=%llu affected=%llu extra-conditions=%llu\n",
+                        static_cast<unsigned long long>(n),
+                        static_cast<unsigned long long>(affected38.load(std::memory_order_relaxed)),
+                        static_cast<unsigned long long>(conditions38.load(std::memory_order_relaxed)));
+                }
+                if (extra_conditions38!=0u || n%128u==0u) std::fflush(stdout);
             }
-
-            if (!p.compiled->memoizable)
-                return p.requires_specialization_memory ? "strict-memory" : "other-nonmemo";
-            return "capturable36";
         }
 
-        struct ResourceRow37 {
-            uint64_t calls=0,hits=0,failed=0;
-            double us=0;
-            const char* reason=nullptr;
-        };
+        void AnalyzeMemo''')
 
-        void RecordResourceCost37(const ResourcePlan& p,double us,bool result,bool hit) {
-            using Key=std::tuple<uint64_t,uint32_t,std::string>;
-            static std::map<Key,ResourceRow37> rows;
-            static uint64_t samples=0;
-            static double total_us=0;
-            static auto start=std::chrono::steady_clock::now();
+        replace('src/graphics/shader/recompiler/ir/ShaderIR.h',
+            '// Per control_flow block: no block reachable from its successors guards a source, so its',
+            '// Per control_flow block: successors add no source (or only sources already in this block), so its')
 
-            ++samples;
-            total_us+=us;
-            const auto* reason=ResourceReason37(p);
-            const Key key {p.shader_hash,static_cast<uint32_t>(p.stage),reason};
+        p=Path('src/graphics/guest_gpu/graphicsRun.cpp')
+        p.write_text('#include "graphics/shader/recompiler/ir/passes/RedundantSources38.h"\n'+p.read_text(encoding='utf-8'),encoding='utf-8')
 
-            if (rows.size()<8192u || rows.contains(key)) {
-                auto& r=rows[key];
-                if (r.reason==nullptr) r.reason=reason;
-                ++r.calls;
-                r.us+=us;
-                r.hits+=hit ? 1u : 0u;
-                r.failed+=result ? 0u : 1u;
+        replace(str(p),'\tg_gpu_thread = true;',r'''    g_gpu_thread = true;
+            std::printf("source38: redundant-source optimization %s\n",
+                ShaderRecompiler::IR::RedundantSources38Enabled() ? "ON" : "OFF");
+            std::fflush(stdout);''')
+
+        p=Path('tests/ResourceMaterializationTests.cpp')
+        p.write_text('#include "graphics/shader/recompiler/ir/passes/RedundantSources38.h"\n'+p.read_text(encoding='utf-8'),encoding='utf-8')
+
+        tests=r'''
+        void TestRedundantSources38() {
+            using namespace Libs::Graphics::ShaderRecompiler::IR;
+            const bool enabled=RedundantSources38Enabled();
+            SetResourceMaterializationVerification(false);
+
+            for (const bool reject:{false,true}) {
+                for (const uint32_t value:{0u,1u,0xffffffffu}) {
+                    auto plan=MemoPlan(MemoPlanExtra::DynamicRead,true);
+                    plan.control_flow[0].condition=plan.descriptor_sources[2].dwords[0];
+                    plan.control_flow[0].sources={0u,1u};
+                    plan.control_flow[2].successors={0u};
+
+                    MemoFixture f;
+                    f.memory.reject_strict=reject;
+                    f.memory.words[2]=value;
+                    Check(f.Refresh(plan),"dominated resource plan failed");
+                    Check((CompileResourcePlan(plan).inert_successors[0]!=0u)==enabled,
+                        "shared resources were not classified correctly");
+                    Check(enabled ? f.memory.strict_reads==0u : f.memory.strict_reads!=0u,
+                        "strict condition elimination did not follow the selected mode");
+
+                    ResourceSnapshot ref;
+                    ResourceSpecialization spec;
+                    const SrtRuntime rt {.user_data=f.user_data,.read_memory=TableMemory::DirectRead,
+                        .userdata=&f.memory,.read_specialization_memory=TableMemory::StrictRead};
+
+                    Check(MaterializeResourcesReference(plan,rt,ref,spec),"dominated reference failed");
+                    Check(ref.buffers==f.snapshot.buffers && ref.images==f.snapshot.images &&
+                        ref.samplers==f.snapshot.samplers && ref.user_data==f.snapshot.user_data &&
+                        ref.flattened_srt==f.snapshot.flattened_srt && ref.uniform_fill==f.snapshot.uniform_fill &&
+                        spec==f.specialization,"eliminating a shared-resource branch changed its output");
+
+                    f.memory.words[0]^=0x100u;
+                    Check(f.Refresh(plan) && f.snapshot.buffers[0].dwords[0]==f.memory.words[0],
+                        "branch elimination reused old guest data");
+                }
             }
 
-            if (samples%256u!=0u) return;
-            const auto now=std::chrono::steady_clock::now();
-            std::vector<std::pair<Key,ResourceRow37>> sorted(rows.begin(),rows.end());
-            std::ranges::sort(sorted,[](const auto& a,const auto& b){return a.second.us>b.second.us;});
+            // A descendant can introduce a source absent from the current block.
+            for (const uint32_t value:{0u,1u}) {
+                auto plan=MemoPlan(MemoPlanExtra::DynamicRead,true);
+                plan.control_flow[0].condition=plan.descriptor_sources[2].dwords[0];
+                plan.control_flow[0].sources={0u};
 
-            std::printf("resource37: interval-s=%.2f samples=%llu avg-us=%.3f groups=%zu; ranked by sampled CPU time\n",
-                std::chrono::duration<double>(now-start).count(),
-                static_cast<unsigned long long>(samples),total_us/samples,rows.size());
-
-            for (size_t i=0;i<std::min<size_t>(12u,sorted.size());++i) {
-                const auto& [k,r]=sorted[i];
-                std::printf("resource37-row: shader=%016llx stage=%u reason=%s calls=%llu hits=%llu failed=%llu avg-us=%.3f sample-share=%.2f%%\n",
-                    static_cast<unsigned long long>(std::get<0>(k)),std::get<1>(k),r.reason,
-                    static_cast<unsigned long long>(r.calls),
-                    static_cast<unsigned long long>(r.hits),
-                    static_cast<unsigned long long>(r.failed),
-                    r.us/r.calls,total_us>0 ? 100.0*r.us/total_us : 0.0);
+                MemoFixture f;
+                f.memory.words[2]=value;
+                Check(f.Refresh(plan),"non-dominated plan failed");
+                Check(CompileResourcePlan(plan).inert_successors[0]==0u && f.memory.strict_reads!=0u,
+                    "a condition guarding a new source was removed");
+                Check((f.snapshot.buffers[1].dwords[0]!=0u)==(value==0u),
+                    "condition elimination activated the wrong branch");
             }
 
-            std::fflush(stdout);
-            rows.clear();
-            samples=0;
-            total_us=0;
-            start=std::chrono::steady_clock::now();
-        }
+            auto written=MemoPlan(MemoPlanExtra::DynamicRead,true);
+            written.control_flow[0].sources={0u,1u};
+            written.info.buffers[0].written=true;
+            Check(CompileResourcePlan(written).inert_successors[0]==0u,
+                "branch expansion was applied to a write-capable plan");
+
+            std::puts("RedundantSources38: shared sources, cycles, strict failures and fresh inputs passed");
         }
         '''
 
-        boundary='bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,'
-        replace(str(p),boundary,helper+'\n'+boundary)
-
-        replace(str(p),
-            '\tconst bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);',
-            r'''    thread_local uint64_t calls37=0;
-            thread_local uint32_t slot37=1543u;
-            bool sample37=false;
-            if (t_resource_costs37) {
-                ++calls37;
-                if ((calls37&4095u)==0u) slot37=(slot37+1543u)&4095u;
-                sample37=(calls37&4095u)==slot37;
-            }
-            const auto begin37=sample37 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-            const bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);
-            if (sample37) {
-                const auto us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin37).count();
-                RecordResourceCost37(program,us,result,memo!=nullptr && memo->reused);
-            }''')
-
-        p=Path('src/graphics/guest_gpu/graphicsRun.cpp')
-        p.write_text('#include "graphics/shader/recompiler/ir/passes/ResourceCosts37.h"\n'+p.read_text(encoding='utf-8'),encoding='utf-8')
-
-        replace(str(p),'\tg_gpu_thread = true;',r'''    g_gpu_thread = true;
-            const char* costs37=std::getenv("KYTY_RESOURCE_COSTS_37");
-            ShaderRecompiler::IR::t_resource_costs37=costs37!=nullptr && costs37[0]=='1' && costs37[1]=='\0';
-            if (ShaderRecompiler::IR::t_resource_costs37) {
-                std::printf("resource37: diagnostic active; original execution; one sample per 4096 calls\n");
-                std::printf("resource37: stage legend: Unknown=0 Vertex=1 Pixel=2 Fetch=3 Compute=4 Mesh=5 Local=6 TessControl=7 TessEval=8\n");
-                std::fflush(stdout);
-            }''')
-
-        print('Diagnostic 37 installed: timing original calls only',flush=True)
+        replace(str(p),'int main() {',tests+'\nint main() {\n  TestRedundantSources38();')
+        print('Prueba 38 installed; original reads and descriptor evaluation retained',flush=True)
         '@ | & $env:KYTY_PYTHON -
-        if ($LASTEXITCODE -ne 0) { throw "Diagnostic 37 adaptation failed" }
+        if ($LASTEXITCODE -ne 0) { throw "Prueba 38 adaptation failed" }
         git diff --check
         if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
@@ -282,7 +315,7 @@ jobs:
                 raise RuntimeError("Unexpected build step")
 
             if step["name"] == "Configure CMake":
-                flags = os.environ["KYTY_FLAGS_37"]
+                flags = os.environ["KYTY_FLAGS_38"]
                 args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
                         "-DCMAKE_BUILD_TYPE=Release",
                         "-DCMAKE_C_COMPILER=clang-cl",
@@ -292,7 +325,7 @@ jobs:
                         "-DCMAKE_CXX_FLAGS_INIT=" + flags,
                         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
 
-                print("Configuring profile:", os.environ["KYTY_PROFILE_37"], flags, flush=True)
+                print("Configuring profile:", os.environ["KYTY_PROFILE_38"], flags, flush=True)
                 subprocess.run(args, check=True)
 
                 cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
@@ -307,7 +340,7 @@ jobs:
                 print("Verified C++ flags:", cpp_flags, flush=True)
                 continue
 
-            script = Path(f"_build37_{index}.ps1")
+            script = Path(f"_build38_{index}.ps1")
             script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
             print("Running:", step["name"], flush=True)
 
@@ -315,7 +348,14 @@ jobs:
             entries = path_file.read_text(encoding="utf-8-sig").splitlines() if path_file.exists() else []
             os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
 
-            subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+            if step["name"] == "Test memory and shader paths":
+                for mode38 in ("0", "1"):
+                    os.environ["KYTY_REDUNDANT_SOURCES_38"] = mode38
+                    print("Testing source optimization mode:", mode38, flush=True)
+                    subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+                os.environ.pop("KYTY_REDUNDANT_SOURCES_38", None)
+            else:
+                subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
 
         if not started or not finished:
             raise RuntimeError("Build boundaries missing")
@@ -329,12 +369,13 @@ jobs:
         if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
 
         foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Diagnostico-37.cmd" } else { "Comparacion-37.cmd" }
+            $name = if ($mode -eq 1) { "Prueba-38.cmd" } else { "Comparacion-38.cmd" }
             @(
                 '@echo off',
                 'setlocal',
                 'cd /d "%~dp0"',
-                "set KYTY_RESOURCE_COSTS_37=$mode",
+                "set KYTY_REDUNDANT_SOURCES_38=$mode",
+                'set KYTY_RESOURCE_COSTS_37=0',
                 'set KYTY_FROZEN_DIAGNOSTIC_36=0',
                 'set KYTY_DESCRIPTOR_MEMO_35=0',
                 'set KYTY_DESCRIPTOR_STATS_35=0',
@@ -387,20 +428,20 @@ jobs:
 
         @(
             "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Diagnostico-37.cmd: samples the original resource preparation by shader.",
-            "Comparacion-37.cmd: same executable, diagnostic OFF.",
-            "Reports timing only; no extra resource evaluation or memory capture.",
+            "Prueba-38.cmd: eliminates resource conditions only when successors add no new sources.",
+            "Comparacion-38.cmd: same executable, optimization OFF.",
+            "Compare the same heavy view three times; report FPS, pauses, and graphics errors.",
             "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
             "Copy your working _Patches and select THIS interpreter.",
             "Warm up, then remain in the fixed heavy view for 60 seconds.",
-            "Copy console output including resource37 lines.",
+            "Copy Prueba-38 console including source38-plan and source38-plans lines.",
             "Close emulator and launcher completely before changing mode."
-        ) | Set-Content "$install/DIAGNOSTICO-37.txt" -Encoding ascii
+        ) | Set-Content "$install/PRUEBA-38.txt" -Encoding ascii
 
     - name: Create Windows ZIP
       run: |
         $ErrorActionPreference = "Stop"
-        $zip = "KytyPS5-Diagnostico-37.zip"
+        $zip = "KytyPS5-Prueba-38.zip"
         Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
         if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
@@ -409,7 +450,7 @@ jobs:
     - name: Upload KytyPS5
       uses: actions/upload-artifact@v4
       with:
-        name: KytyPS5-Diagnostico-37
-        path: KytyPS5-Diagnostico-37.zip
+        name: KytyPS5-Prueba-38
+        path: KytyPS5-Prueba-38.zip
         if-no-files-found: error
         retention-days: 7
