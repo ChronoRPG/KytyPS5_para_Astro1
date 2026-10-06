@@ -1,454 +1,470 @@
-name: Windows AMD - Prueba 42 - Comparaciones inmediatas
+name: Windows AMD - Diagnostico 43 - Rutas de imagenes
 
-on:
-  workflow_dispatch:
+'on':
+  workflow_dispatch: null
 
 permissions:
   contents: read
 
 jobs:
   build:
-    name: Windows x64 - Prueba 42
+    name: Windows x64 - Diagnostico 43
     runs-on: windows-2022
 
     env:
-      KYTY_FLAGS_42: /clang:-ffp-contract=off
-      KYTY_PROFILE_42: Generica
+      KYTY_FLAGS_43: /clang:-ffp-contract=off
+      KYTY_PROFILE_43: Generica
 
     defaults:
       run:
         shell: pwsh
 
     steps:
-      - name: Checkout fixed AMD base
-        uses: actions/checkout@v4
-        with:
-          ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
-          submodules: recursive
-          fetch-depth: 1
+    - name: Checkout fixed AMD base
+      uses: actions/checkout@v4
+      with:
+        ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+        submodules: recursive
+        fetch-depth: 1
 
-      - name: Checkout pinned working diagnostic 20
-        uses: actions/checkout@v4
-        with:
-          ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
-          path: _patch_source
-          sparse-checkout: |
-            patches
-            .github/workflows
-          fetch-depth: 1
-          submodules: false
+    - name: Checkout pinned working diagnostic 20
+      uses: actions/checkout@v4
+      with:
+        ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+        path: _patch_source
+        sparse-checkout: |
+          patches
+          .github/workflows
+        fetch-depth: 1
+        submodules: false
 
-      - name: Setup fixed Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+    - name: Setup fixed Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
 
-      - name: Pin Python executable and install YAML parser
-        run: |
-          $ErrorActionPreference = "Stop"
-          $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
-          if (-not $pythonExe) { throw "Python executable missing" }
-          "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          & $pythonExe -m pip install PyYAML==6.0.2
-          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
-          & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
-          if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+    - name: Pin Python executable and install YAML parser
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+        if (-not $pythonExe) { throw "Python executable missing" }
 
-      - name: Reproduce working AMD source and retained optimizations
-        run: |
-          $ErrorActionPreference = "Stop"
-          & $env:KYTY_PYTHON -m pip install PyYAML==6.0.2
-          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
-          @'
-          from pathlib import Path
-          import subprocess
-          import yaml
-          baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
-          steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
-          started = False
-          finished = False
-          for index, step in enumerate(steps):
-              if step.get("name") == "Setup MSVC environment":
-                  finished = True
-                  break
-              if step.get("name") == "Verify AMD base":
-                  started = True
-              if not started:
-                  continue
-              if "uses" in step or "run" not in step:
-                  raise RuntimeError("Unexpected baseline preparation step")
-              script = Path(f"_prepare42_{index}.ps1")
-              script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
-              print("Preparing:", step["name"], flush=True)
-              subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
-          if not started or not finished:
-              raise RuntimeError("Baseline preparation boundaries missing")
-          '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
+        "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Add optional immediate comparisons and regression tests
-        run: |
-          $ErrorActionPreference = "Stop"
-          @'
-          from pathlib import Path
+        & $pythonExe -m pip install PyYAML==6.0.2
+        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
 
-          def replace(path,old,new):
-              p=Path(path);s=p.read_text(encoding='utf-8')
-              if s.count(old)!=1:
-                  raise RuntimeError('Unexpected condition42 boundary: '+path)
-              p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
+        & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
 
-          header='src/graphics/shader/recompiler/ir/passes/ImmediateConditions42.h'
-          Path(header).write_text(r'''#pragma once
-          #include <cstdlib>
-          #include <cstring>
-          namespace Libs::Graphics::ShaderRecompiler::IR {
-          inline bool ImmediateConditions42Enabled() {
-              static const bool enabled=[] {
-                  const auto* v=std::getenv("KYTY_IMMEDIATE_CONDITIONS_42");
-                  return v!=nullptr && std::strcmp(v,"1")==0;
-              }();
-              return enabled;
-          }
-          }
-          ''',encoding='utf-8')
+    - name: Reproduce working AMD source and retained optimizations
+      run: |
+        $ErrorActionPreference = "Stop"
 
-          p='src/graphics/shader/recompiler/ir/ShaderIR.h'
-          replace(p,'\t\tLogicalNot,',
-              '\t\tLogicalNot,\n        CompareImmediate32,\n        MaskedCompareImmediate32,')
+        & $env:KYTY_PYTHON -m pip install PyYAML==6.0.2
+        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
 
-          p='src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp'
-          f=Path(p)
-          f.write_text('#include "graphics/shader/recompiler/ir/passes/ImmediateConditions42.h"\n#include <atomic>\n#include <cstdio>\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
+        @'
+        from pathlib import Path
+        import subprocess
+        import yaml
 
-          replace(p,'\t\tnode.op = arithmetic;\n\t\treturn node;',r'''
-                  node.op = arithmetic;
-                  if (ImmediateConditions42Enabled() &&
-                      (arithmetic==NodeOp::IEqual32 || arithmetic==NodeOp::INotEqual32)) {
-                      for (uint32_t side=0;side<2u;++side) {
-                          const auto& constant=m_compiled.nodes[node.args[side]];
-                          if (constant.op!=NodeOp::Const) continue;
-                          const auto value=node.args[1u-side];
-                          node.flags=arithmetic==NodeOp::INotEqual32 ? 1u : 0u;
-                          node.imm=static_cast<uint32_t>(constant.imm);
-                          node.op=NodeOp::CompareImmediate32;
-                          node.args={value,ResourceNode::NoNode,ResourceNode::NoNode,ResourceNode::NoNode,ResourceNode::NoNode};
-                          const auto& masked=m_compiled.nodes[value];
-                          if (masked.op==NodeOp::BitwiseAnd32) {
-                              for (uint32_t mask_side=0;mask_side<2u;++mask_side) {
-                                  const auto& mask=m_compiled.nodes[masked.args[mask_side]];
-                                  if (mask.op!=NodeOp::Const) continue;
-                                  node.op=NodeOp::MaskedCompareImmediate32;
-                                  // Keep the original AND node for analyses and its evaluation memo.
-                                  node.args[1]=masked.args[1u-mask_side];
-                                  node.imm|=static_cast<uint64_t>(static_cast<uint32_t>(mask.imm))<<32u;
-                                  break;
-                              }
-                          }
-                          break;
-                      }
-                  }
-                  return node;''')
+        baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
+        steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
 
-          replace(p,'\t\tcase NodeOp::IEqual32:',r'''
-                  case NodeOp::CompareImmediate32:
-                      if (!unary()) return false;
-                      result=(static_cast<uint32_t>(a)==static_cast<uint32_t>(node.imm)) ^ (node.flags!=0u);
-                      return true;
-                  case NodeOp::MaskedCompareImmediate32: {
-                      auto& masked=m_memo[node.args[0]];
-                      if (masked.generation==m_generation) {
-                          a=masked.value;
-                      } else {
-                          if (masked.generation==(m_generation|1u)) return false;
-                          masked.generation=m_generation|1u;
-                          if (!EvaluateWide(node.args[1],a)) {
-                              masked.generation=0;
-                              return false;
-                          }
-                          a=static_cast<uint32_t>(a)&static_cast<uint32_t>(node.imm>>32u);
-                          masked.value=a;
-                          masked.generation=m_generation;
-                      }
-                      result=(static_cast<uint32_t>(a)==static_cast<uint32_t>(node.imm)) ^ (node.flags!=0u);
-                      return true;
-                  }
-                  case NodeOp::IEqual32:''')
+        started = False
+        finished = False
 
-          replace(p,'\tBuildFlatRuns(program, *compiled);',r'''
-              BuildFlatRuns(program, *compiled);
-              if (ImmediateConditions42Enabled()) {
-                  uint32_t immediate=0,masked=0;
-                  for (const auto& node:compiled->nodes) {
-                      immediate+=node.op==NodeOp::CompareImmediate32 ? 1u : 0u;
-                      masked+=node.op==NodeOp::MaskedCompareImmediate32 ? 1u : 0u;
-                  }
-                  static std::atomic<uint32_t> reports42 {0};
-                  const bool target=program.shader_hash==0x3b809f9d156a95ddull || program.shader_hash==0xf112e0ba527945adull;
-                  if (target || ((immediate+masked)!=0u && reports42.fetch_add(1,std::memory_order_relaxed)<12u)) {
-                      std::printf("condition42-plan: shader=%016llx immediate=%u masked=%u\n",
-                          static_cast<unsigned long long>(program.shader_hash),immediate,masked);
-                      std::fflush(stdout);
-                  }
-              }''')
+        for index, step in enumerate(steps):
+            if step.get("name") == "Setup MSVC environment":
+                finished = True
+                break
 
-          p='src/graphics/guest_gpu/graphicsRun.cpp'
-          f=Path(p)
-          f.write_text('#include "graphics/shader/recompiler/ir/passes/ImmediateConditions42.h"\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
-          replace(p,'\tg_gpu_thread = true;',r'''
-              g_gpu_thread = true;
-              std::printf("condition42: immediate comparisons %s\n",
-                  ShaderRecompiler::IR::ImmediateConditions42Enabled() ? "ON" : "OFF");
-              std::fflush(stdout);''')
+            if step.get("name") == "Verify AMD base":
+                started = True
 
-          p='tests/ResourceMaterializationTests.cpp'
-          f=Path(p)
-          f.write_text('#include "graphics/shader/recompiler/ir/passes/ImmediateConditions42.h"\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
+            if not started:
+                continue
 
-          tests=r'''
-          void TestImmediateConditions42() {
-              using namespace Libs::Graphics::ShaderRecompiler::IR;
-              SetResourceMaterializationVerification(true);
-              for (const bool masked:{false,true}) for (const bool unequal:{false,true})
-              for (const bool reverse:{false,true}) for (const bool mask_reverse:{false,true}) {
-                  auto plan=MemoPlan(MemoPlanExtra::DynamicRead,true);
-                  const auto input=plan.descriptor_sources[2].dwords[0];
-                  Value value=input;
-                  if (masked) {
-                      auto& band=plan.value_storage.emplace_back(ValueOpcode::BitwiseAnd32);
-                      band.SetArg(mask_reverse ? 1u : 0u,input);
-                      band.SetArg(mask_reverse ? 0u : 1u,Value(0xffu));
-                      value=Value(&band);
-                  }
-                  auto& cmp=plan.value_storage.emplace_back(unequal ? ValueOpcode::INotEqual32 : ValueOpcode::IEqual32);
-                  cmp.SetArg(reverse ? 1u : 0u,value);
-                  cmp.SetArg(reverse ? 0u : 1u,Value(0x21u));
-                  plan.control_flow[0].condition=Value(&cmp);
-                  const auto& compiled=CompileResourcePlan(plan);
-                  const auto op=compiled.nodes[compiled.conditions[0]].op;
-                  const auto wanted=masked ? ResourceNode::Op::MaskedCompareImmediate32 : ResourceNode::Op::CompareImmediate32;
-                  Check((op==wanted)==ImmediateConditions42Enabled(),"immediate comparison did not follow selected mode");
-                  MemoFixture f;
-                  for (const bool reject:{false,true}) for (const uint32_t word:{0u,0x21u,0x121u,0xffffffffu}) {
-                      f.memory.reject_strict=reject;
-                      f.memory.words[2]=word;
-                      Check(f.Refresh(plan),"immediate condition refresh failed");
-                      const bool truth=(((masked ? word&0xffu : word)==0x21u)!=unequal);
-                      Check((f.snapshot.buffers[0].dwords[0]!=0u)==(reject || truth) &&
-                            (f.snapshot.buffers[1].dwords[0]!=0u)==(reject || !truth),
-                            "immediate comparison changed branch activity or failure handling");
-                  }
-              }
-              // A cycle must keep the original in-progress failure behavior.
-              {
-                  auto plan=MemoPlan(MemoPlanExtra::DynamicRead,true);
-                  auto& band=plan.value_storage.emplace_back(ValueOpcode::BitwiseAnd32);
-                  auto& cmp=plan.value_storage.emplace_back(ValueOpcode::IEqual32);
-                  band.SetArg(0,Value(&cmp));
-                  band.SetArg(1,Value(0xffu));
-                  cmp.SetArg(0,Value(&band));
-                  cmp.SetArg(1,Value(0x21u));
-                  plan.control_flow[0].condition=Value(&cmp);
-                  MemoFixture f;
-                  Check(f.Refresh(plan) && f.snapshot.buffers[0].dwords[0]!=0u &&
-                        f.snapshot.buffers[1].dwords[0]!=0u,
-                        "immediate comparison changed cycle failure handling");
-              }
-              std::puts("ImmediateConditions42: equality, inequality, masks, operand order, fresh reads, strict failures and cycles passed");
-          }
-          '''
-          replace(p,'int main() {',tests+'\nint main() {\n  TestImmediateConditions42();')
-          print('Immediate condition optimization 42 installed',flush=True)
-          '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "Immediate comparisons adaptation failed" }
-          git diff --check
-          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+            if "uses" in step or "run" not in step:
+                raise RuntimeError("Unexpected baseline preparation step")
 
-      - name: Setup MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: x64
+            script = Path(f"_prepare43_{index}.ps1")
+            script.write_text(
+                '$ErrorActionPreference = "Stop"\n' + step["run"],
+                encoding="utf-8",
+            )
 
-      - name: Setup Clang
-        uses: egor-tensin/setup-clang@v1
-        with:
-          version: 18
-          platform: x64
-          cygwin: 0
+            print("Preparing:", step["name"], flush=True)
+            subprocess.run(
+                ["pwsh", "-NoProfile", "-File", str(script.resolve())],
+                check=True,
+            )
 
-      - name: Setup Ninja
-        uses: seanmiddleditch/gha-setup-ninja@v5
+        if not started or not finished:
+            raise RuntimeError("Baseline preparation boundaries missing")
+        '@ | & $env:KYTY_PYTHON -
 
-      - name: Install Qt
-        uses: jurplel/install-qt-action@v4
-        with:
-          version: 6.8.3
-          host: windows
-          target: desktop
-          arch: win64_msvc2022_64
-          modules: qt5compat
-          cache: true
+        if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-      - name: Build and test using pinned working workflow
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
-          if ($LASTEXITCODE -ne 0) { throw "Pinned Python YAML verification failed" }
-          @'
-          from pathlib import Path
-          import subprocess
-          import os
-          import yaml
-          steps = yaml.safe_load(Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml").read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
-          started = False
-          finished = False
-          for index, step in enumerate(steps):
-              if step.get("name") == "Package launchers and symbols":
-                  finished = True
-                  break
-              if step.get("name") == "Install glslang":
-                  started = True
-              if not started:
-                  continue
-              if "uses" in step or "run" not in step:
-                  raise RuntimeError("Unexpected build step")
-              if step["name"] == "Configure CMake":
-                  flags = os.environ["KYTY_FLAGS_42"]
-                  args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
-                          "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang-cl",
-                          "-DCMAKE_CXX_COMPILER=clang-cl",
-                          "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
-                          "-DCMAKE_C_FLAGS_INIT=" + flags, "-DCMAKE_CXX_FLAGS_INIT=" + flags,
-                          "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
-                  print("Configuring profile:", os.environ["KYTY_PROFILE_42"], flags, flush=True)
-                  subprocess.run(args, check=True)
-                  cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
-                  cpp_flags = next((line.split("=", 1)[1] for line in cache.splitlines()
-                                    if line.startswith("CMAKE_CXX_FLAGS:STRING=")), None)
-                  if cpp_flags is None or "/ehsc" not in cpp_flags.lower():
-                      raise RuntimeError("CMake lost /EHsc: C++ exceptions must remain enabled")
-                  if not all(option in cpp_flags for option in flags.split()):
-                      raise RuntimeError("Selected CPU flags are missing from CMAKE_CXX_FLAGS")
-                  print("Verified C++ flags:", cpp_flags, flush=True)
-                  continue
-              script = Path(f"_build42_{index}.ps1")
-              source = step["run"]
-              if step["name"] == "Install glslang":
-                  api_call = '$release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers'
-                  if source.count(api_call) != 1:
-                      raise RuntimeError("Unexpected glslang API call")
-                  authenticated = '\n'.join([
-                      'if (-not $env:GH_TOKEN) { throw "GitHub Actions token missing" }',
-                      '$apiHeaders = $headers.Clone()',
-                      '$apiHeaders["Authorization"] = "Bearer $env:GH_TOKEN"',
-                      '$apiHeaders["X-GitHub-Api-Version"] = "2022-11-28"',
-                      api_call.replace('-Headers $headers', '-Headers $apiHeaders'),
-                  ])
-                  source = source.replace(api_call, authenticated)
-              script.write_text('$ErrorActionPreference = "Stop"\n' + source, encoding="utf-8")
-              print("Running:", step["name"], flush=True)
-              path_file = Path(os.environ["GITHUB_PATH"])
-              entries = path_file.read_text(encoding="utf-8-sig").splitlines() if path_file.exists() else []
-              os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
-              if step["name"] == "Test memory and shader paths":
-                  for mode in ("0", "1"):
-                      os.environ["KYTY_IMMEDIATE_CONDITIONS_42"] = mode
-                      subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
-              else:
-                  subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
-          if not started or not finished:
-              raise RuntimeError("Build boundaries missing")
-          '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "Build or tests failed" }
+    - name: Add bounded image-route audit
+      run: |
+        $ErrorActionPreference = "Stop"
 
-      - name: Package launchers and symbols
-        run: |
-          $ErrorActionPreference = "Stop"
-          $install = "_Build/windows/install"
-          if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
-          foreach ($mode in @(0, 1)) {
-              $name = if ($mode -eq 1) { "Prueba-42.cmd" } else { "Comparacion-42.cmd" }
-              @(
-                  '@echo off',
-                  'setlocal',
-                  'cd /d "%~dp0"',
-                  "set KYTY_IMMEDIATE_CONDITIONS_42=$mode",
-                  'set KYTY_REDUNDANT_SOURCES_38=0',
-                  'set KYTY_RESOURCE_COSTS_37=0',
-                  'set KYTY_FROZEN_DIAGNOSTIC_36=0',
-                  'set KYTY_DESCRIPTOR_MEMO_35=0',
-                  'set KYTY_DESCRIPTOR_STATS_35=0',
-                  'set KYTY_DESCRIPTOR_RECIPES_34=0',
-                  'set KYTY_TRACKING_PAUSE=',
-                  'set KYTY_BDA_SLICE_FILTER=',
-                  'set KYTY_TRACKING_DIAGNOSTICS=',
-                  'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
-                  'set KYTY_TRACKING_BLOCKING_WAIT=1',
-                  'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
-                  'set KYTY_DIRECT_COLOR_METADATA=1',
-                  'set KYTY_RECORD_THREAD=0',
-                  'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
-                  'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
-                  'set KYTY_DEBUG_SHADER_CPU=0',
-                  'set KYTY_RESOURCE_BLOCKS_32=0',
-                  'set KYTY_HOST_PRIORITY_26=0',
-                  'set KYTY_REFRESH_DIAGNOSTIC_27=0',
-                  'set KYTY_SRT_ALIASES_32=0',
-                  'set KYTY_DIRECT_FLAT_31=0',
-                  'set KYTY_DIRECT_INPUTS_29=0',
-                  'set KYTY_ACTIVE_MASK_VIEW_28=0',
-                  'set KYTY_DEBUG_QUEUES=',
-                  'set KYTY_SRT_STATS=',
-                  'set KYTY_DEBUG_SRT_RUNS=',
-                  'set KYTY_VERIFY_SRT=',
-                  'set KYTY_VERIFY_SPEC=',
-                  'set KYTY_VERIFY_SPEC_READS=',
-                  'set KYTY_SPECULATE_DRAWS=0',
-                  'set KYTY_LIGHT_DRAIN_STATS=1',
-                  'set KYTY_DEBUG_SAMPLE_GPU=',
-                  'set KYTY_DEBUG_DUMP_THREADS=',
-                  'set KYTY_DEBUG_DRAW_PHASES=',
-                  'set KYTY_DEBUG_DRAW_STATS=',
-                  'set KYTY_DEBUG_SPEC_STATS=',
-                  'set KYTY_DEBUG_STREAM_STATS=',
-                  'set KYTY_DEBUG_UPLOADS=',
-                  'set KYTY_GPU_ZONES=',
-                  '"%~dp0launcher.exe" %*'
-              ) | Set-Content "$install/$name" -Encoding ascii
-          }
-          $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
-          if (-not $maps) { throw "Emulator map missing" }
-          foreach ($map in $maps) { Copy-Item $map.FullName $install -Force }
-          $pdb = "_Build/windows/kyty_emulator.pdb"
-          if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
-          Copy-Item $pdb $install -Force
-          @(
-              "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-              "Prueba-42.cmd: optional immediate comparisons; original reads retained.",
-              "Comparacion-42.cmd: same executable, immediate comparisons OFF.",
-              "Compare the same heavy view for 60 seconds in each mode.",
-              "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
-              "Copy your working _Patches and select THIS interpreter.",
-              "Warm up, then remain in the fixed heavy view for 60 seconds.",
-              "Copy Prueba-42 console including condition42 and condition42-plan lines.",
-              "Close emulator and launcher completely before changing mode."
-          ) | Set-Content "$install/PRUEBA-42.txt" -Encoding ascii
+        @'
+        from pathlib import Path
 
-      - name: Create Windows ZIP
-        run: |
-          $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Prueba-42.zip"
-          Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
-          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
-              throw "Packaging failed: missing or empty ZIP"
-          }
+        p = Path("src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp")
+        s = p.read_text(encoding="utf-8")
 
-      - name: Upload KytyPS5
-        uses: actions/upload-artifact@v4
-        with:
-          name: KytyPS5-Prueba-42
-          path: KytyPS5-Prueba-42.zip
-          if-no-files-found: error
-          retention-days: 7
+        needle = "\treturn plan;\n}\n\nnamespace {\n\nbool g_verify_materialization"
+        assert s.count(needle) == 1, "Unexpected resource-plan boundary"
+
+        code = r"""
+            static const bool route43=[] {
+                const auto* value=std::getenv("KYTY_IMAGE_ROUTE_43");
+                return value!=nullptr && std::strcmp(value,"1")==0;
+            }();
+
+            if (route43) {
+                uint32_t indirect=0, masked=0, bounded=0, image_roots=0;
+
+                for (const auto& source:plan.descriptor_sources) {
+                    if (!source.indirect_image.has_value()) continue;
+                    ++indirect;
+                    masked+=!source.indirect_image->selector_mask.IsEmpty() ? 1u : 0u;
+                    bounded+=source.indirect_image->material_source==UINT32_MAX ? 1u : 0u;
+                }
+
+                for (const auto& image:plan.info.images) {
+                    const auto* source=Source(plan,image.source);
+                    image_roots+=source!=nullptr && source->indirect_image.has_value() ? 1u : 0u;
+                }
+
+                static std::atomic<uint32_t> reports {0}, target_a {0}, target_b {0};
+
+                const bool a=plan.shader_hash==0x3b809f9d156a95ddull;
+                const bool b=plan.shader_hash==0xf112e0ba527945adull;
+
+                const bool report=
+                    (a && target_a.fetch_add(1,std::memory_order_relaxed)<8u) ||
+                    (b && target_b.fetch_add(1,std::memory_order_relaxed)<8u) ||
+                    (!a && !b && indirect!=0u &&
+                     reports.fetch_add(1,std::memory_order_relaxed)<16u);
+
+                if (report) {
+                    std::printf(
+                        "image43-plan: shader=%016llx target=%u images=%zu buffers=%zu sources=%zu indirect=%u image-roots=%u masked=%u bounded=%u flat=%zu\n",
+                        static_cast<unsigned long long>(plan.shader_hash),
+                        (a||b)?1u:0u,
+                        plan.info.images.size(),
+                        plan.info.buffers.size(),
+                        plan.descriptor_sources.size(),
+                        indirect,
+                        image_roots,
+                        masked,
+                        bounded,
+                        plan.srt_reads.size()
+                    );
+                    std::fflush(stdout);
+                }
+            }
+        """
+
+        s = "#include <atomic>\n#include <cstdlib>\n" + s
+        s = s.replace(needle, code + needle)
+        p.write_text(s, encoding="utf-8", newline="\n")
+
+        p = Path("src/graphics/guest_gpu/graphicsRun.cpp")
+        s = p.read_text(encoding="utf-8")
+
+        needle = "g_gpu_thread = true;"
+        assert s.count(needle) == 1, "Unexpected graphics-thread boundary"
+
+        startup = r"""
+            const auto* route43=std::getenv("KYTY_IMAGE_ROUTE_43");
+            std::printf(
+                "image43: indirect-image route audit %s\n",
+                route43!=nullptr && std::strcmp(route43,"1")==0 ? "ON" : "OFF"
+            );
+            std::fflush(stdout);
+        """
+
+        s = "#include <cstdlib>\n#include <cstring>\n" + s
+        s = s.replace(needle, needle + "\n" + startup)
+        p.write_text(s, encoding="utf-8", newline="\n")
+
+        print(
+            "Image-route audit 43 installed: at most 32 plan messages; no runtime reader changes",
+            flush=True,
+        )
+        '@ | & $env:KYTY_PYTHON -
+
+        if ($LASTEXITCODE -ne 0) { throw "Image-route audit adaptation failed" }
+
+        git diff --check
+        if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+
+    - name: Setup Clang
+      uses: egor-tensin/setup-clang@v1
+      with:
+        version: 18
+        platform: x64
+        cygwin: 0
+
+    - name: Setup Ninja
+      uses: seanmiddleditch/gha-setup-ninja@v5
+
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: 6.8.3
+        host: windows
+        target: desktop
+        arch: win64_msvc2022_64
+        modules: qt5compat
+        cache: true
+
+    - name: Build and test using pinned working workflow
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "Pinned Python YAML verification failed" }
+
+        @'
+        from pathlib import Path
+        import subprocess
+        import os
+        import yaml
+
+        steps = yaml.safe_load(
+            Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
+            .read_text(encoding="utf-8")
+        )["jobs"]["build"]["steps"]
+
+        started = False
+        finished = False
+
+        for index, step in enumerate(steps):
+            if step.get("name") == "Package launchers and symbols":
+                finished = True
+                break
+
+            if step.get("name") == "Install glslang":
+                started = True
+
+            if not started:
+                continue
+
+            if "uses" in step or "run" not in step:
+                raise RuntimeError("Unexpected build step")
+
+            if step["name"] == "Configure CMake":
+                flags = os.environ["KYTY_FLAGS_43"]
+
+                args = [
+                    "cmake", "-S", ".", "-B", "_Build/windows",
+                    "-G", "Ninja",
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DCMAKE_C_COMPILER=clang-cl",
+                    "-DCMAKE_CXX_COMPILER=clang-cl",
+                    "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
+                    "-DCMAKE_C_FLAGS_INIT=" + flags,
+                    "-DCMAKE_CXX_FLAGS_INIT=" + flags,
+                    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+                ]
+
+                print(
+                    "Configuring profile:",
+                    os.environ["KYTY_PROFILE_43"],
+                    flags,
+                    flush=True,
+                )
+                subprocess.run(args, check=True)
+
+                cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
+                cpp_flags = next(
+                    (
+                        line.split("=", 1)[1]
+                        for line in cache.splitlines()
+                        if line.startswith("CMAKE_CXX_FLAGS:STRING=")
+                    ),
+                    None,
+                )
+
+                if cpp_flags is None or "/ehsc" not in cpp_flags.lower():
+                    raise RuntimeError("CMake lost /EHsc: C++ exceptions must remain enabled")
+
+                if not all(option in cpp_flags for option in flags.split()):
+                    raise RuntimeError("Selected CPU flags are missing from CMAKE_CXX_FLAGS")
+
+                print("Verified C++ flags:", cpp_flags, flush=True)
+                continue
+
+            script = Path(f"_build43_{index}.ps1")
+            source = step["run"]
+
+            if step["name"] == "Install glslang":
+                api_call = '$release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers'
+
+                if source.count(api_call) != 1:
+                    raise RuntimeError("Unexpected glslang API call")
+
+                authenticated = "\n".join([
+                    'if (-not $env:GH_TOKEN) { throw "GitHub Actions token missing" }',
+                    "$apiHeaders = $headers.Clone()",
+                    '$apiHeaders["Authorization"] = "Bearer $env:GH_TOKEN"',
+                    '$apiHeaders["X-GitHub-Api-Version"] = "2022-11-28"',
+                    api_call.replace("-Headers $headers", "-Headers $apiHeaders"),
+                ])
+
+                source = source.replace(api_call, authenticated)
+
+            script.write_text(
+                '$ErrorActionPreference = "Stop"\n' + source,
+                encoding="utf-8",
+            )
+
+            print("Running:", step["name"], flush=True)
+
+            path_file = Path(os.environ["GITHUB_PATH"])
+            entries = (
+                path_file.read_text(encoding="utf-8-sig").splitlines()
+                if path_file.exists()
+                else []
+            )
+            os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
+
+            if step["name"] == "Test memory and shader paths":
+                for mode in ("0", "1"):
+                    os.environ["KYTY_IMAGE_ROUTE_43"] = mode
+                    subprocess.run(
+                        ["pwsh", "-NoProfile", "-File", str(script.resolve())],
+                        check=True,
+                    )
+            else:
+                subprocess.run(
+                    ["pwsh", "-NoProfile", "-File", str(script.resolve())],
+                    check=True,
+                )
+
+        if not started or not finished:
+            raise RuntimeError("Build boundaries missing")
+        '@ | & $env:KYTY_PYTHON -
+
+        if ($LASTEXITCODE -ne 0) { throw "Build or tests failed" }
+
+    - name: Package launchers and symbols
+      run: |
+        $ErrorActionPreference = "Stop"
+        $install = "_Build/windows/install"
+
+        if (-not (Test-Path "$install/launcher.exe")) {
+            throw "launcher.exe missing"
+        }
+
+        foreach ($mode in @(0, 1)) {
+            $name = if ($mode -eq 1) {
+                "Diagnostico-43.cmd"
+            } else {
+                "Comparacion-43.cmd"
+            }
+
+            @(
+                '@echo off',
+                'setlocal',
+                'cd /d "%~dp0"',
+                "set KYTY_IMAGE_ROUTE_43=$mode",
+                'set KYTY_IMMEDIATE_CONDITIONS_42=0',
+                'set KYTY_REDUNDANT_SOURCES_38=0',
+                'set KYTY_RESOURCE_COSTS_37=0',
+                'set KYTY_FROZEN_DIAGNOSTIC_36=0',
+                'set KYTY_DESCRIPTOR_MEMO_35=0',
+                'set KYTY_DESCRIPTOR_STATS_35=0',
+                'set KYTY_DESCRIPTOR_RECIPES_34=0',
+                'set KYTY_TRACKING_PAUSE=',
+                'set KYTY_BDA_SLICE_FILTER=',
+                'set KYTY_TRACKING_DIAGNOSTICS=',
+                'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
+                'set KYTY_TRACKING_BLOCKING_WAIT=1',
+                'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
+                'set KYTY_DIRECT_COLOR_METADATA=1',
+                'set KYTY_RECORD_THREAD=0',
+                'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
+                'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
+                'set KYTY_DEBUG_SHADER_CPU=0',
+                'set KYTY_RESOURCE_BLOCKS_32=0',
+                'set KYTY_HOST_PRIORITY_26=0',
+                'set KYTY_REFRESH_DIAGNOSTIC_27=0',
+                'set KYTY_SRT_ALIASES_32=0',
+                'set KYTY_DIRECT_FLAT_31=0',
+                'set KYTY_DIRECT_INPUTS_29=0',
+                'set KYTY_ACTIVE_MASK_VIEW_28=0',
+                'set KYTY_DEBUG_QUEUES=',
+                'set KYTY_SRT_STATS=',
+                'set KYTY_DEBUG_SRT_RUNS=',
+                'set KYTY_VERIFY_SRT=',
+                'set KYTY_VERIFY_SPEC=',
+                'set KYTY_VERIFY_SPEC_READS=',
+                'set KYTY_SPECULATE_DRAWS=0',
+                'set KYTY_LIGHT_DRAIN_STATS=1',
+                'set KYTY_DEBUG_SAMPLE_GPU=',
+                'set KYTY_DEBUG_DUMP_THREADS=',
+                'set KYTY_DEBUG_DRAW_PHASES=',
+                'set KYTY_DEBUG_DRAW_STATS=',
+                'set KYTY_DEBUG_SPEC_STATS=',
+                'set KYTY_DEBUG_STREAM_STATS=',
+                'set KYTY_DEBUG_UPLOADS=',
+                'set KYTY_GPU_ZONES=',
+                '"%~dp0launcher.exe" %*'
+            ) | Set-Content "$install/$name" -Encoding ascii
+        }
+
+        $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
+        if (-not $maps) { throw "Emulator map missing" }
+
+        foreach ($map in $maps) {
+            Copy-Item $map.FullName $install -Force
+        }
+
+        $pdb = "_Build/windows/kyty_emulator.pdb"
+        if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
+        Copy-Item $pdb $install -Force
+
+        @(
+            "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
+            "Diagnostico-43.cmd: image-route audit ON.",
+            "Comparacion-43.cmd: same executable, audit OFF.",
+            "Enter the heavy view for 20 seconds, then light view for 20 seconds.",
+            "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
+            "Copy your working _Patches and select THIS interpreter.",
+            "No cache deletion. FPS gain is not expected from this diagnostic.",
+            "Copy the complete console including image43 and image43-plan lines."
+        ) | Set-Content "$install/DIAGNOSTICO-43.txt" -Encoding ascii
+
+    - name: Create Windows ZIP
+      run: |
+        $ErrorActionPreference = "Stop"
+        $zip = "KytyPS5-Diagnostico-43.zip"
+
+        Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+
+        if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+            throw "Packaging failed: missing or empty ZIP"
+        }
+
+    - name: Upload KytyPS5
+      uses: actions/upload-artifact@v4
+      with:
+        name: KytyPS5-Diagnostico-43
+        path: KytyPS5-Diagnostico-43.zip
+        if-no-files-found: error
+        retention-days: 7
