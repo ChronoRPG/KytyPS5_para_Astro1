@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 35 - Reutilizar sets Vulkan
+name: Windows AMD - Diagnostico 35 - Contadores en directo
 
 'on':
   workflow_dispatch:
@@ -63,7 +63,6 @@ jobs:
 
         baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
         steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
-
         started = False
         finished = False
 
@@ -218,7 +217,6 @@ jobs:
             key.push_back(writes.size());
 
             for (const auto& write : writes) {
-                // Unsupported writes retain the original allocation/update path.
                 if (write.pNext != nullptr || write.pTexelBufferView != nullptr ||
                     (write.pImageInfo == nullptr) == (write.pBufferInfo == nullptr))
                     return fresh();
@@ -254,7 +252,6 @@ jobs:
             if (const auto* found = m_memo35.Find(layout_key, tick, m_pool_epoch35, key)) return *found;
 
             const auto set = fresh();
-            // Commit may rotate/reset the pool. Store with the resulting epoch.
             m_memo35.Store(layout_key, tick, m_pool_epoch35, key, set);
             return set;
         }
@@ -303,16 +300,6 @@ jobs:
             "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.cpp",
             '\tm_sets.clear();',
             '\t++m_pool_epoch35;\n\tm_sets.clear();'
-        )
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.cpp",
-            'DescriptorHeap::~DescriptorHeap() {',
-            '''DescriptorHeap::~DescriptorHeap() {
-            if (m_attempts35 != 0)
-                std::printf("descriptor-memo35: attempts=%llu hits=%llu\\n",
-                    static_cast<unsigned long long>(m_attempts35),
-                    static_cast<unsigned long long>(m_hits35));'''
         )
 
         impl = Path("patches/heap_impl35.txt").read_text(encoding="utf-8")
@@ -390,6 +377,65 @@ jobs:
         )
         '@ | & $env:KYTY_PYTHON -
         if ($LASTEXITCODE -ne 0) { throw "Descriptor set patch failed" }
+
+    - name: Print diagnostic counters during rendering
+      run: |
+        $ErrorActionPreference = "Stop"
+        @'
+        from pathlib import Path
+
+        def replace(path, old, new):
+            p = Path(path)
+            s = p.read_text(encoding="utf-8")
+            if s.count(old) != 1:
+                raise RuntimeError("Unexpected diagnostic boundary: " + path)
+            p.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
+
+        replace(
+            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.cpp",
+            "#include <cstdio>",
+            "#include <cstdio>\n#include <cstdlib>"
+        )
+
+        replace(
+            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.cpp",
+            "    ++m_attempts35;",
+            """
+            ++m_attempts35;
+            static const bool report35 = [] {
+                const char* v = std::getenv("KYTY_DESCRIPTOR_STATS_35");
+                return v != nullptr && v[0] == '1' && v[1] == '\\0';
+            }();
+
+            if (report35 && (m_attempts35 == 1u || (m_attempts35 & 262143u) == 0u)) {
+                std::printf("descriptor-memo35-live: attempts=%llu hits=%llu\\n",
+                    static_cast<unsigned long long>(m_attempts35),
+                    static_cast<unsigned long long>(m_hits35));
+                std::fflush(stdout);
+            }
+        """
+        )
+
+        p = Path("src/graphics/host_gpu/renderer/pipeline/shaders.cpp")
+        s = "#include <cstdio>\n" + p.read_text(encoding="utf-8")
+
+        old = """        return v != nullptr && v[0] == '1' && v[1] == '\\0';"""
+
+        new = """        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\\0';
+                const char* diagnostic = std::getenv("KYTY_DESCRIPTOR_STATS_35");
+                if (diagnostic != nullptr && diagnostic[0] == '1' && diagnostic[1] == '\\0') {
+                    std::printf("descriptor-memo35: diagnostic build active; reuse=%u\\n",
+                        enabled ? 1u : 0u);
+                    std::fflush(stdout);
+                }
+                return enabled;"""
+
+        if s.count(old) != 1:
+            raise RuntimeError("Diagnostic startup boundary missing")
+
+        p.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
+        '@ | & $env:KYTY_PYTHON -
+        if ($LASTEXITCODE -ne 0) { throw "Live counter patch failed" }
 
     - name: Setup MSVC environment
       uses: ilammy/msvc-dev-cmd@v1
@@ -523,18 +569,22 @@ jobs:
           throw "launcher.exe missing"
         }
 
-        foreach ($mode in @(0, 1)) {
-          $name = if ($mode -eq 0) {
-            "Comparacion-35.cmd"
-          } else {
-            "Prueba-35.cmd"
+        foreach ($mode in @(0, 1, 2)) {
+          $name = switch ($mode) {
+            0 { "Comparacion-35.cmd" }
+            1 { "Prueba-35.cmd" }
+            2 { "Diagnostico-35.cmd" }
           }
+
+          $memoMode = if ($mode -eq 0) { 0 } else { 1 }
+          $statsMode = if ($mode -eq 2) { 1 } else { 0 }
 
           @(
             '@echo off',
             'setlocal',
             'cd /d "%~dp0"',
-            "set KYTY_DESCRIPTOR_MEMO_35=$mode",
+            "set KYTY_DESCRIPTOR_MEMO_35=$memoMode",
+            "set KYTY_DESCRIPTOR_STATS_35=$statsMode",
             'set KYTY_DESCRIPTOR_RECIPES_34=0',
             'set KYTY_TRACKING_PAUSE=',
             'set KYTY_BDA_SLICE_FILTER=',
@@ -586,18 +636,17 @@ jobs:
         Copy-Item $pdb $install -Force
 
         @(
+          "Diagnostico-35.cmd: live counters; do not use to benchmark FPS.",
           "Comparacion-35.cmd: original Vulkan descriptor management.",
           "Prueba-35.cmd: vertex push preference and regular descriptor set reuse.",
           "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
-          "Copy your working _Patches and select THIS interpreter.",
-          "Warm up 60 seconds, then measure the same heavy view for 60 seconds.",
-          "Close emulator and launcher completely before changing mode."
+          "Copy your working _Patches and select THIS interpreter."
         ) | Set-Content "$install/PRUEBA-35.txt" -Encoding ascii
 
     - name: Create Windows ZIP
       run: |
         $ErrorActionPreference = "Stop"
-        $zip = "KytyPS5-Prueba-35.zip"
+        $zip = "KytyPS5-Diagnostico-35.zip"
         Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
         if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
           throw "Packaging failed: missing or empty ZIP"
@@ -606,7 +655,7 @@ jobs:
     - name: Upload KytyPS5
       uses: actions/upload-artifact@v4
       with:
-        name: KytyPS5-Prueba-35
-        path: KytyPS5-Prueba-35.zip
+        name: KytyPS5-Diagnostico-35
+        path: KytyPS5-Diagnostico-35.zip
         if-no-files-found: error
         retention-days: 7
