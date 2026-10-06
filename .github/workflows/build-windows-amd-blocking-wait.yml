@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 44 corregida - Lecturas limpias agrupadas
+name: Windows AMD - Prueba 47 - Direcciones preparadas
 
 on:
   workflow_dispatch:
@@ -8,17 +8,14 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - Prueba 44
+    name: Windows x64 - Prueba 47
     runs-on: windows-2022
-
     env:
-      KYTY_FLAGS_44: /clang:-ffp-contract=off
-      KYTY_PROFILE_44: Generica
-
+      KYTY_FLAGS_47: /clang:-ffp-contract=off
+      KYTY_PROFILE_47: Generica
     defaults:
       run:
         shell: pwsh
-
     steps:
       - name: Checkout fixed AMD base
         uses: actions/checkout@v4
@@ -77,7 +74,7 @@ jobs:
                   continue
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
-              script = Path(f"_prepare44_{index}.ps1")
+              script = Path(f"_prepare47_{index}.ps1")
               script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
               print("Preparing:", step["name"], flush=True)
               subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -86,7 +83,7 @@ jobs:
           '@ | & $env:KYTY_PYTHON -
           if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-      - name: Add optional clean multi-block reads and tests
+      - name: Prepare direct address operands and tests
         run: |
           $ErrorActionPreference = "Stop"
           @'
@@ -94,244 +91,136 @@ jobs:
 
           def replace(path,old,new):
            p=Path(path);s=p.read_text(encoding='utf-8')
-           if s.count(old)!=1:raise RuntimeError('Unexpected run44 boundary: '+path)
+           if s.count(old)!=1:raise RuntimeError('Unexpected address47 boundary: '+path)
            p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
 
+          p='src/graphics/shader/recompiler/ir/ShaderIR.h'
+          replace(p,'\t\tLogicalNot,','\t\tLogicalNot,\n        DirectAddress47,')
+          replace(p,'\tstd::vector<ResourceNode>            nodes;', '''    struct AddressInput47 {
+                  uint64_t constant=0;
+                  uint32_t user_index=0;
+                  uint8_t kind=0; // 0 constant, 1 user data, 2 shader base
+              };
+              std::vector<std::array<AddressInput47,3>> addresses47;
+          \tstd::vector<ResourceNode>            nodes;''')
+
           p='src/graphics/shader/recompiler/ir/passes/SrtWalker.h'
-          replace(p,'\tSrtMemoryReader           read_memory_block          = nullptr;','\tSrtMemoryReader           read_memory_block          = nullptr;\n\t// Optional clean aligned multi-block read; false leaves normal reads available.\n\tSrtMemoryReader           read_memory_run44          = nullptr;')
-          p='src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp'
-          replace(p,'\t\truntime.read_memory_block       = nullptr;',r'''
-                  runtime.read_memory_block = nullptr;
-                  runtime.read_memory_run44 = m_source.read_memory_run44!=nullptr ? ReadRun44 : nullptr;''')
-          source=Path(p).read_text(encoding='utf-8')
-          cache_start=source.index('class OrdinaryBlockCache {')
-          cache=source[cache_start:]
-          needle='\tstatic constexpr uint32_t BlockWords = BlockBytes / sizeof(uint32_t);'
-          if cache.count(needle)!=1:
-           raise RuntimeError('Unexpected ordinary cache declaration; original capacity must be preserved')
-          callback=r'''
-              static bool ReadRun44(void* userdata,uint64_t address,std::span<uint32_t> values) {
-                  auto& self=*static_cast<OrdinaryBlockCache*>(userdata);
-                  const auto bytes=values.size_bytes();
-                  if (address==0 || (address&63u)!=0u || bytes<128u || bytes>256u || (bytes&63u)!=0u ||
-                      address>UINT64_MAX-bytes || (address>>12u)!=((address+bytes-1u)>>12u)) return false;
-                  // Preserve any value or failed whole-block probe cached earlier in this refresh.
-                  for (uint32_t i=0;i<self.m_count;++i)
-                      if (self.m_blocks[i].address>=address && self.m_blocks[i].address<address+bytes)
-                          return false;
-                  if (!self.m_source.read_memory_run44(self.m_source.userdata,address,values)) return false;
-                  // Populate the same whole blocks that the original path would cache, in the same order.
-                  for (uint32_t word=0;word<values.size();word+=BlockWords) {
-                      auto& block=self.m_blocks[self.m_next];
-                      self.m_next=(self.m_next+1u)%Capacity;
-                      if (self.m_count<Capacity) ++self.m_count;
-                      block.address=address+uint64_t{word}*4u;
-                      std::copy_n(values.data()+word,BlockWords,block.words.data());
-                      block.whole=true;
-                  }
-                  return true;
-              }
-          '''
-          source=source[:cache_start]+cache.replace(needle,callback+needle,1)
-          Path(p).write_text(source,encoding='utf-8',newline='\n')
-          replace(p,'\t\tif (observed.read_memory != nullptr) observed.read_memory = CaptureOrdinaryRead;','\t\tif (observed.read_memory != nullptr) observed.read_memory = CaptureOrdinaryRead;\n        observed.read_memory_run44=nullptr;')
-          needle='\tReadLogger(const SrtRuntime& source, ReadLog& log): m_source(source), m_log(log) {}'
-          replace(p,needle,needle)
-          start=Path(p).read_text();a=start.index('class ReadLogger {');tail=start[a:]
-          old='\t\tauto runtime                    = m_source;'
-          assert tail.count(old)==1
-          start=start[:a]+tail.replace(old,old+'\n        runtime.read_memory_run44=nullptr;',1)
-          Path(p).write_text(start,encoding='utf-8',newline='\n')
-          p='src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp'
-          needle='bool ReadShaderGuestBlockOnGpuThread(void*, uint64_t address, std::span<uint32_t> values) {'
-          replace(p,needle,r'''
-          bool ReadShaderGuestRun44(void*,uint64_t address,std::span<uint32_t> values) {
-              if (!Libs::Graphics::GuestGpu::IsGpuThread()) return false;
-              const auto bytes=values.size_bytes();
-              if (address==0 || (address&63u)!=0u || bytes<128u || bytes>256u || (bytes&63u)!=0u ||
-                  address>UINT64_MAX-bytes || (address>>12u)!=((address+bytes-1u)>>12u)) return false;
-              // Entire range lies inside one 4 KiB page; the existing plain reader checks dirty hints.
-              return Libs::LibKernel::Memory::TryReadGuestPlainOnGpuThread(address,values.data(),bytes);
-          }
-          ''' + needle)
-          replace(p,'\t\t    .read_memory_block          = ReadShaderGuestBlockOnGpuThread,','\t\t    .read_memory_block          = ReadShaderGuestBlockOnGpuThread,\n            .read_memory_run44          = ReadShaderGuestRun44,')
-          p='src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp'
-          needle='\t// One read per 64-byte block, as dword reads through a block cache would see memory.\n\tstd::array<uint32_t, CompiledResourcePlan::MaxRunDwords> words;\n\tfor (uint32_t done = 0; done < run.dwords;) {'
-          replace(p,needle,r'''
-              std::array<uint32_t, CompiledResourcePlan::MaxRunDwords> words;
-              static const bool run44=[] {
-                  const auto* v=std::getenv("KYTY_CLEAN_RUNS_44");
-                  return v!=nullptr && std::strcmp(v,"1")==0;
-              }();
-              const bool bulk=run44 && m_runtime.read_memory_run44!=nullptr &&
-                  m_runtime.read_memory_run44(m_runtime.userdata,first,std::span(words).first(run.dwords));
-              if (bulk) {
-                  static thread_local uint32_t seen=0;
-                  const auto hash=m_program.shader_hash;
-                  const uint32_t bit=hash==0x3b809f9d156a95ddull ? 1u : hash==0xf112e0ba527945adull ? 2u : 0u;
-                  if (bit!=0u && (seen&bit)==0u) {
-                      seen|=bit;
-                      std::printf("run44-used: shader=%016llx bytes=%u\n",static_cast<unsigned long long>(hash),run.dwords*4u);
-                      std::fflush(stdout);
-                  }
-              }
-              // A rejected multi-block read falls back to the original 64-byte loop.
-              for (uint32_t done = bulk ? run.dwords : 0u; done < run.dwords;) {''')
-          f=Path(p);f.write_text('#include <cstdlib>\n#include <cstdio>\n'+f.read_text(),encoding='utf-8',newline='\n')
-          p='src/graphics/guest_gpu/graphicsRun.cpp'
-          replace(p,'g_gpu_thread = true;',r'''g_gpu_thread = true;
-              const auto* run44=std::getenv("KYTY_CLEAN_RUNS_44");
-              std::printf("run44: clean multi-block reads %s\n",run44!=nullptr && std::strcmp(run44,"1")==0 ? "ON" : "OFF");
-              std::fflush(stdout);''')
-          f=Path(p);f.write_text('#include <cstdlib>\n#include <cstring>\n'+f.read_text(),encoding='utf-8',newline='\n')
-          print('Clean multi-block reads 44 installed',flush=True)
-          p='src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp'
-          replace(p,'SrtRuntime CleanRuntime(SrtRuntime runtime) {','SrtRuntime CleanRuntime(SrtRuntime runtime) {\n    runtime.read_memory_run44=nullptr;')
-          p='tests/ResourceMaterializationTests.cpp'
-          tests=r'''
-          void TestCleanRuns44() {
-              using namespace Libs::Graphics::ShaderRecompiler::IR;
-              SetResourceMaterializationVerification(true);
-              Program program;
-              program.stage=Libs::Graphics::ShaderType::Pixel;
-              program.shader_hash=0x3b809f9d156a95ddull;
-              program.srt_plan_complete=true;
-              program.resource_tracking_complete=true;
-              program.user_data_count=2u;
-              auto& block=AddValueBlock(program);
-              auto& base0=block.AppendNewInst(ValueOpcode::GetUserData,{Value(static_cast<ScalarReg>(0))});
-              auto& handle=block.AppendNewInst(ValueOpcode::GetAddressResource,{Value(&base0),Value(0u)});
-              for (uint32_t slot=0;slot<64u;++slot) {
-                  MemoryInfo memory;
-                  memory.kind=ResourceKind::ScalarAddress;
-                  memory.planning_only=true;
-                  memory.offset=slot*4u;
-                  const auto index=static_cast<uint32_t>(program.memory_info.size());
-                  program.memory_info.push_back(memory);
-                  auto& raw=block.AppendNewInst(ValueOpcode::LoadAddressU32,
-                      {Value(&handle),Value(0u),Value(0u),Value(true)});
-                  raw.SetFlags(MemoryFlags{.index=index});
-                  program.srt_reads.push_back({Value(&raw),slot});
-              }
-              auto plan=ExtractResourcePlan(program);
-              struct Memory {
-                  std::array<uint32_t,64> words {};
-                  uint64_t base=0x10000u;
-                  uint32_t runs=0,blocks=0,ordinary=0;
-                  bool reject_run=false,reject_exact=false;
-                  static bool Exact(void* data,uint64_t address,std::span<uint32_t> out) {
-                      auto& m=*static_cast<Memory*>(data);++m.ordinary;
-                      if (m.reject_exact || address<m.base || address+out.size_bytes()>m.base+256u) return false;
-                      std::copy_n(m.words.data()+(address-m.base)/4u,out.size(),out.data());return true;
-                  }
-                  static bool Block(void* data,uint64_t address,std::span<uint32_t> out) {
-                      auto& m=*static_cast<Memory*>(data);++m.blocks;
-                      return !m.reject_run && Exact(data,address,out);
-                  }
-                  static bool Run(void* data,uint64_t address,std::span<uint32_t> out) {
-                      auto& m=*static_cast<Memory*>(data);++m.runs;
-                      return !m.reject_run && Exact(data,address,out);
-                  }
-              } memory;
-              std::array<uint32_t,2> user_data {0x10000u,0x10000u};
-              const SrtRuntime runtime {.user_data=user_data,.read_memory=Memory::Exact,.userdata=&memory,
-                  .read_memory_block=Memory::Block,.read_memory_run44=Memory::Run};
-              ResourceSnapshot snapshot;
-              ResourceSpecialization specialization;
-              Check(!CompileResourcePlan(plan).flat_runs.empty(),"run44 fixture has no runs");
-              for (uint32_t epoch=0;epoch<128u;++epoch) {
-                  for (uint32_t i=0;i<64u;++i) memory.words[i]=epoch*100u+i;
-                  memory.reject_run=(epoch&1u)!=0u;
-                  Check(MaterializeResources(plan,runtime,snapshot,specialization),"run44 refresh failed");
-                  Check(std::equal(memory.words.begin(),memory.words.end(),snapshot.flattened_srt.begin()),
-                      "run44 changed values or reused a previous refresh");
-              }
-              const auto* enabled=std::getenv("KYTY_CLEAN_RUNS_44");
-              Check((memory.runs!=0u)==(enabled!=nullptr && std::strcmp(enabled,"1")==0),
-                  "run44 switch did not select the tested path");
+          replace(p,'\tbool EvaluateRawRead(const ResourceNode& node, uint64_t& result);','\tbool EvaluateRawRead(const ResourceNode& node, uint64_t& result);\n    bool AddressInputs47(const ResourceNode& node,uint64_t& low,uint64_t& high,uint64_t& offset);')
 
-              memory.reject_run=false;
-              for (const uint32_t base:{0x10004u,0x10fc0u}) {
-                  memory.base=base;user_data.fill(base);
-                  const auto prior=memory.runs;
-                  Check(MaterializeResources(plan,runtime,snapshot,specialization),"run44 alignment/page fallback failed");
-                  Check(memory.runs==prior,"run44 attempted an unaligned or cross-page bulk read");
-                  Check(std::equal(memory.words.begin(),memory.words.end(),snapshot.flattened_srt.begin()),
-                      "run44 alignment/page fallback changed data");
-              }
-              memory.base=0x10000u;user_data.fill(0x10000u);
-              // Distinct user-data roots resolve to the same table: the second run must respect cached blocks.
-              auto& base1=block.AppendNewInst(ValueOpcode::GetUserData,{Value(static_cast<ScalarReg>(1))});
-              auto& handle1=block.AppendNewInst(ValueOpcode::GetAddressResource,{Value(&base1),Value(0u)});
-              for (uint32_t slot=0;slot<64u;++slot) {
-                  MemoryInfo info;info.kind=ResourceKind::ScalarAddress;info.planning_only=true;info.offset=slot*4u;
-                  const auto index=static_cast<uint32_t>(program.memory_info.size());program.memory_info.push_back(info);
-                  auto& raw=block.AppendNewInst(ValueOpcode::LoadAddressU32,
-                      {Value(&handle1),Value(0u),Value(0u),Value(true)});
-                  raw.SetFlags(MemoryFlags{.index=index});program.srt_reads.push_back({Value(&raw),64u+slot});
-              }
-              auto overlap=ExtractResourcePlan(program);
-              const auto previous=memory.runs;
-              Check(MaterializeResources(overlap,runtime,snapshot,specialization),"run44 overlapping refresh failed");
-              Check(memory.runs-previous==(enabled!=nullptr && std::strcmp(enabled,"1")==0 ? 1u : 0u),
-                  "run44 reread blocks already cached by an overlapping run");
-              for (uint32_t i=0;i<128u;++i)
-                  Check(snapshot.flattened_srt[i]==memory.words[i%64u],"run44 overlapping table changed data");
-              memory.reject_run=true;memory.reject_exact=true;
-              Check(!MaterializeResources(plan,runtime,snapshot,specialization),"run44 ignored failed ordinary reads");
-              memory.reject_run=false;memory.reject_exact=false;
-              const auto runs=memory.runs;
-              ReadLog log;
-              Check(MaterializeResourcesLogged(plan,runtime,snapshot,specialization,log),"run44 logged refresh failed");
-              Check(memory.runs==runs && !log.entries.empty(),"run44 bypassed read logging");
-              auto clean=CleanRuntime(runtime);
-              Check(clean.read_memory_run44==nullptr,"run44 reached the strict reader");
-              std::puts("CleanRuns44: fresh values, rejected bulk fallback, failed reads, logged and strict paths passed");
-          }
-          '''
-          replace(p,'int main() {',tests+'\nint main() {\n    TestCleanRuns44();')
-          f=Path(p);f.write_text('#include <algorithm>\n#include <cstring>\n'+f.read_text(),encoding='utf-8',newline='\n')
           p='src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp'
-          replace(p,'BuildFlatRuns(program, *compiled);',r'''
-              BuildFlatRuns(program, *compiled);
-              const auto* run44mode=std::getenv("KYTY_CLEAN_RUNS_44");
-              if (run44mode!=nullptr && std::strcmp(run44mode,"1")==0 &&
-                  (program.shader_hash==0x3b809f9d156a95ddull || program.shader_hash==0xf112e0ba527945adull)) {
-                  static thread_local uint32_t count_a=0,count_b=0;
-                  auto& count=program.shader_hash==0x3b809f9d156a95ddull ? count_a : count_b;
-                  if (count++<8u) {
-                      uint32_t multi=0,maximum=0;
-                      for (const auto& run:compiled->flat_runs) {
-                          multi+=run.dwords>=32u && (run.dwords%16u)==0u ? 1u : 0u;
-                          maximum=std::max(maximum,run.dwords);
+          replace(p,'\tprogram.compiled = std::move(compiled);',r'''
+              // Lower only side-effect-free address operands, after all plan analyses and flat-run construction.
+              const auto* mode47=std::getenv("KYTY_DIRECT_ADDRESSES_47");
+              if (mode47!=nullptr && std::strcmp(mode47,"1")==0) {
+                  uint32_t lowered=0;
+                  for (auto& node:compiled->nodes) {
+                      if (node.op!=NodeOp::RawAddress) continue;
+                      std::array<CompiledResourcePlan::AddressInput47,3> inputs {};
+                      bool valid=true;
+                      for (uint32_t operand=0;operand<3u && valid;++operand) {
+                          auto index=node.args[operand];
+                          uint32_t steps=0;
+                          while (index<compiled->nodes.size() && compiled->nodes[index].op==NodeOp::Forward && steps++<compiled->nodes.size())
+                              index=compiled->nodes[index].args[0];
+                          if (index>=compiled->nodes.size() || steps>compiled->nodes.size()) {valid=false;break;}
+                          const auto& leaf=compiled->nodes[index];
+                          auto& input=inputs[operand];
+                          if (leaf.op==NodeOp::Const) input.constant=leaf.imm;
+                          else if (leaf.op==NodeOp::UserData) {input.kind=1;input.user_index=leaf.aux;}
+                          else if (leaf.op==NodeOp::ShaderBase) input.kind=2;
+                          else valid=false;
                       }
-                      std::printf("run44-plan: shader=%016llx runs=%zu multi-candidates=%u max-dwords=%u\n",
-                          static_cast<unsigned long long>(program.shader_hash),compiled->flat_runs.size(),multi,maximum);
-                      std::fflush(stdout);
+                      if (!valid) continue;
+                      node.aux=static_cast<uint32_t>(compiled->addresses47.size());
+                      compiled->addresses47.push_back(inputs);
+                      node.op=NodeOp::DirectAddress47;
+                      ++lowered;
                   }
-              }''')
+                  if (program.shader_hash==0x3b809f9d156a95ddull || program.shader_hash==0xf112e0ba527945adull) {
+                      static thread_local uint32_t printed=0;
+                      if (printed++<16u) {
+                          std::printf("address47-plan: shader=%016llx lowered=%u\n",static_cast<unsigned long long>(program.shader_hash),lowered);
+                          std::fflush(stdout);
+                      }
+                  }
+              }
+          \tprogram.compiled = std::move(compiled);'''.replace('\\tprogram','\tprogram'))
 
-          p='src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp'
-          f=Path(p);f.write_text('#include "graphics/guest_gpu/graphicsRun.h"\n'+f.read_text(),encoding='utf-8',newline='\n')
+          needle='bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {'
+          replace(p,needle,r'''bool SrtEvaluator::AddressInputs47(const ResourceNode& node,uint64_t& low,uint64_t& high,uint64_t& offset) {
+              if (node.op!=NodeOp::DirectAddress47)
+                  return EvaluateWide(node.args[0],low) && EvaluateWide(node.args[1],high) && EvaluateWide(node.args[2],offset);
+              const auto& inputs=m_compiled.addresses47[node.aux];
+              std::array<uint64_t*,3> values {&low,&high,&offset};
+              for (uint32_t i=0;i<3u;++i) {
+                  const auto& input=inputs[i];
+                  if (input.kind==1u) {
+                      if (input.user_index>=m_runtime.user_data.size()) return false;
+                      *values[i]=m_runtime.user_data[input.user_index];
+                  } else if (input.kind==2u) *values[i]=m_runtime.shader_base;
+                  else *values[i]=input.constant;
+              }
+              return true;
+          }
 
-          # Remove trailing whitespace introduced at replacement boundaries.
-          modified_files = [
-              'src/graphics/guest_gpu/graphicsRun.cpp',
-              'src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp',
+          ''' + needle)
+
+          old='\tif (!EvaluateWide(node.args[0], low) || !EvaluateWide(node.args[1], high) ||\n\t    !EvaluateWide(node.args[2], offset)) {'
+          s=Path(p).read_text()
+          assert s.count(old)==2
+          s=s.replace(old,'\tif (!AddressInputs47(node,low,high,offset)) {')
+          Path(p).write_text(s)
+          replace(p,'\t\tcase NodeOp::RawAddress:\n\t\tcase NodeOp::RawBuffer: return EvaluateRawRead(node, result);','\t\tcase NodeOp::DirectAddress47:\n\t\tcase NodeOp::RawAddress:\n\t\tcase NodeOp::RawBuffer: return EvaluateRawRead(node, result);')
+          f=Path(p)
+          f.write_text('#include <cstdlib>\n#include <cstring>\n#include <cstdio>\n'+f.read_text())
+
+          p='src/graphics/guest_gpu/graphicsRun.cpp'
+          replace(p,'\tg_gpu_thread = true;',r'''    g_gpu_thread = true;
+              const auto* mode47=std::getenv("KYTY_DIRECT_ADDRESSES_47");
+              std::printf("address47: direct address operands %s\n",mode47!=nullptr && std::strcmp(mode47,"1")==0 ? "ON" : "OFF");
+              std::fflush(stdout);''')
+          f=Path(p)
+          f.write_text('#include <cstdlib>\n#include <cstring>\n'+f.read_text())
+
+          for filename in [
+              'src/graphics/shader/recompiler/ir/ShaderIR.h',
               'src/graphics/shader/recompiler/ir/passes/SrtWalker.h',
               'src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp',
-              'src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp',
-              'tests/ResourceMaterializationTests.cpp',
-          ]
-          for filename in modified_files:
-              file = Path(filename)
-              lines = file.read_text(encoding='utf-8').splitlines()
-              cleaned = '\n'.join(line.rstrip(' \t') for line in lines) + '\n'
-              file.write_text(cleaned, encoding='utf-8', newline='\n')
-          print('Trailing whitespace cleaned', flush=True)
+              'src/graphics/guest_gpu/graphicsRun.cpp',
+          ]:
+           f=Path(filename)
+           f.write_text('\n'.join(x.rstrip(' \t') for x in f.read_text().splitlines())+'\n')
+
+          print('Address47 adaptation installed')
+
+          p='tests/ResourceMaterializationTests.cpp'
+          f=Path(p)
+          f.write_text('#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"\n#include <cstdlib>\n#include <cstring>\n'+f.read_text())
+          replace(p,'  std::puts("ResourceMaterializationTests: all cases passed");',r'''
+            {
+              using namespace Libs::Graphics::ShaderRecompiler::IR;
+              auto plan=MemoPlan(MemoPlanExtra::DynamicRead,true);
+              const auto& compiled=CompileResourcePlan(plan);
+              const auto* mode=std::getenv("KYTY_DIRECT_ADDRESSES_47");
+              const bool enabled=mode!=nullptr && std::strcmp(mode,"1")==0;
+              Check(enabled ? !compiled.addresses47.empty() : compiled.addresses47.empty(),"address47 tested path missing");
+              MemoFixture fixture;
+              for (uint32_t epoch=0;epoch<256u;++epoch) {
+                fixture.memory.words[0]=0x1000u+epoch;
+                fixture.user_data[3]=(epoch&1u)!=0u ? 4u : 8u;
+                Check(fixture.Refresh(plan),"address47 fresh operand refresh failed");
+                Check(fixture.snapshot.buffers[0].dwords[0]==fixture.memory.words[0],"address47 reused old memory");
+              }
+              fixture.user_data[1]=0xffffu;
+              Check(!fixture.Refresh(plan),"address47 ignored rejected address read");
+              std::puts("Address47: fresh memory, changing operands and rejected reader passed");
+            }
+            std::puts("ResourceMaterializationTests: all cases passed");''')
+          f=Path(p)
+          f.write_text('\n'.join(x.rstrip(' \t') for x in f.read_text().splitlines())+'\n')
 
           '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "Clean runs adaptation failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Address 47 adaptation failed" }
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
@@ -386,14 +275,14 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected build step")
               if step["name"] == "Configure CMake":
-                  flags = os.environ["KYTY_FLAGS_44"]
+                  flags = os.environ["KYTY_FLAGS_47"]
                   args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
                           "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang-cl",
                           "-DCMAKE_CXX_COMPILER=clang-cl",
                           "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
                           "-DCMAKE_C_FLAGS_INIT=" + flags, "-DCMAKE_CXX_FLAGS_INIT=" + flags,
                           "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
-                  print("Configuring profile:", os.environ["KYTY_PROFILE_44"], flags, flush=True)
+                  print("Configuring profile:", os.environ["KYTY_PROFILE_47"], flags, flush=True)
                   subprocess.run(args, check=True)
                   cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
                   cpp_flags = next((line.split("=", 1)[1] for line in cache.splitlines()
@@ -404,7 +293,7 @@ jobs:
                       raise RuntimeError("Selected CPU flags are missing from CMAKE_CXX_FLAGS")
                   print("Verified C++ flags:", cpp_flags, flush=True)
                   continue
-              script = Path(f"_build44_{index}.ps1")
+              script = Path(f"_build47_{index}.ps1")
               source = step["run"]
               if step["name"] == "Install glslang":
                   api_call = '$release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers'
@@ -425,7 +314,7 @@ jobs:
               os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
               if step["name"] == "Test memory and shader paths":
                   for mode in ("0", "1"):
-                      os.environ["KYTY_CLEAN_RUNS_44"] = mode
+                      os.environ["KYTY_DIRECT_ADDRESSES_47"] = mode
                       subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
               else:
                   subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -440,13 +329,16 @@ jobs:
           $install = "_Build/windows/install"
           if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
           foreach ($mode in @(0, 1)) {
-              $name = if ($mode -eq 1) { "Prueba-44.cmd" } else { "Comparacion-44.cmd" }
+              $name = if ($mode -eq 1) { "Prueba-47.cmd" } else { "Comparacion-47.cmd" }
               @(
                   '@echo off',
                   'setlocal',
                   'cd /d "%~dp0"',
-                  "set KYTY_CLEAN_RUNS_44=$mode",
+                  "set KYTY_DIRECT_ADDRESSES_47=$mode",
+                  'set KYTY_PHASES_40=',
+                  'set KYTY_CLEAN_RUNS_44=0',
                   'set KYTY_IMMEDIATE_CONDITIONS_42=0',
+                  'set KYTY_DEBUG_AB=',
                   'set KYTY_REDUNDANT_SOURCES_38=0',
                   'set KYTY_RESOURCE_COSTS_37=0',
                   'set KYTY_FROZEN_DIAGNOSTIC_36=0',
@@ -497,21 +389,18 @@ jobs:
           if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
           Copy-Item $pdb $install -Force
           @(
-              "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-              "Prueba-44.cmd: optional clean multi-block reads; fallback retained.",
-              "Comparacion-44.cmd: same executable, grouped reads OFF.",
-              "Warm cache first. Compare the same heavy view for 60 seconds in each mode.",
-              "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
-              "Copy your working _Patches and select THIS interpreter.",
-              "Do not delete the pipeline cache. Report FPS, stalls and graphical errors.",
-              "Copy Prueba-44 console including run44, run44-plan and run44-used lines.",
-              "Close emulator and launcher completely before changing mode."
-          ) | Set-Content "$install/PRUEBA-44.txt" -Encoding ascii
+              "Prueba-47.cmd: prepared address operands ON.",
+              "Comparacion-47.cmd: same executable, original evaluation.",
+              "Keep _Patches, _PipelineCache and kyty_settings.ini.",
+              "AMD CPU patch OFF; shader validation OFF; red-zone ON.",
+              "Select THIS interpreter. Heavy view 60 seconds each mode.",
+              "Report full Prueba console including address47 and address47-plan."
+          ) | Set-Content "$install/PRUEBA-47.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Prueba-44.zip"
+          $zip = "KytyPS5-Prueba-47.zip"
           Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
               throw "Packaging failed: missing or empty ZIP"
@@ -520,7 +409,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Prueba-44
-          path: KytyPS5-Prueba-44.zip
+          name: KytyPS5-Prueba-47
+          path: KytyPS5-Prueba-47.zip
           if-no-files-found: error
           retention-days: 7
