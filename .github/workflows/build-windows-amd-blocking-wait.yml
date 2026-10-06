@@ -314,6 +314,22 @@ jobs:
           p='src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp'
           f=Path(p);f.write_text('#include "graphics/guest_gpu/graphicsRun.h"\n'+f.read_text(),encoding='utf-8',newline='\n')
 
+          # Remove trailing whitespace introduced at replacement boundaries.
+          modified_files = [
+              'src/graphics/guest_gpu/graphicsRun.cpp',
+              'src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp',
+              'src/graphics/shader/recompiler/ir/passes/SrtWalker.h',
+              'src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp',
+              'src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp',
+              'tests/ResourceMaterializationTests.cpp',
+          ]
+          for filename in modified_files:
+              file = Path(filename)
+              lines = file.read_text(encoding='utf-8').splitlines()
+              cleaned = '\n'.join(line.rstrip(' \t') for line in lines) + '\n'
+              file.write_text(cleaned, encoding='utf-8', newline='\n')
+          print('Trailing whitespace cleaned', flush=True)
+
           '@ | & $env:KYTY_PYTHON -
           if ($LASTEXITCODE -ne 0) { throw "Clean runs adaptation failed" }
           git diff --check
