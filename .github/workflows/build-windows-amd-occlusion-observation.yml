@@ -1,0 +1,411 @@
+name: Windows AMD - Diagnostico 51 - Consultas de oclusion
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+    - name: Checkout fixed AMD base
+      uses: actions/checkout@v4
+      with:
+        ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+        submodules: recursive
+        fetch-depth: 1
+    - name: Checkout pinned working diagnostic 20
+      uses: actions/checkout@v4
+      with:
+        ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+        path: _patch_source
+        sparse-checkout: |-
+          patches
+          .github/workflows
+        fetch-depth: 1
+        submodules: false
+    - name: Setup fixed Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Pin Python executable and install YAML parser
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+        if (-not $pythonExe) { throw "Python executable missing" }
+        "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        & $pythonExe -m pip install PyYAML==6.0.2
+        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+        & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+    - name: Reproduce working AMD source and retained optimizations
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON -m pip install PyYAML==6.0.2
+        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+        @'
+        from pathlib import Path
+        import subprocess
+        import yaml
+        baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
+        steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+        started = False
+        finished = False
+        for index, step in enumerate(steps):
+            if step.get("name") == "Setup MSVC environment":
+                finished = True
+                break
+            if step.get("name") == "Verify AMD base":
+                started = True
+            if not started:
+                continue
+            if "uses" in step or "run" not in step:
+                raise RuntimeError("Unexpected baseline preparation step")
+            script = Path(f"_prepare51_{index}.ps1")
+            script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
+            print("Preparing:", step["name"], flush=True)
+            subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+        if not started or not finished:
+            raise RuntimeError("Baseline preparation boundaries missing")
+        '@ | & $env:KYTY_PYTHON -
+        if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
+    - name: Install optional occlusion observation
+      run: |
+        $ErrorActionPreference = "Stop"
+        @'
+        from pathlib import Path
+        import base64, hashlib, json, subprocess, sys, zlib
+        payload = """
+        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
+        """
+        bundle = zlib.decompress(base64.b64decode("".join(payload.split()), validate=True))
+        if hashlib.sha256(bundle).hexdigest() != "8332bb91afc95386f8785ae7c903bfc1279131439bbca6b273121545352890cf":
+            raise RuntimeError("Incomplete observation source bundle")
+        root = Path("_occlusion51")
+        for name, source in json.loads(bundle).items():
+            path = root/name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source, encoding="utf-8", newline="\n")
+        for name in ["adapt_occlusion_register51.py", "adapt_occlusion_scopes51.py", "adapt_occlusion_probe51.py"]:
+            subprocess.run([sys.executable, str(root/"patches"/name)], check=True)
+        changed = subprocess.check_output(["git", "diff", "--name-only"], text=True).splitlines()
+        for name in changed:
+            path = Path(name)
+            if path.suffix in {".h", ".cpp"}:
+                path.write_text("\n".join(line.rstrip(" \t") for line in path.read_text(encoding="utf-8").splitlines())+"\n", encoding="utf-8", newline="\n")
+        '@ | & $env:KYTY_PYTHON -
+        if ($LASTEXITCODE -ne 0) { throw "Occlusion observation adaptation failed" }
+        git diff --check
+        if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+    - name: Setup Clang
+      uses: egor-tensin/setup-clang@v1
+      with:
+        version: 18
+        platform: x64
+        cygwin: 0
+    - name: Setup Ninja
+      uses: seanmiddleditch/gha-setup-ninja@v5
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: 6.8.3
+        host: windows
+        target: desktop
+        arch: win64_msvc2022_64
+        modules: qt5compat
+        cache: true
+    - name: Test isolated query components on Windows
+      run: |
+        $ErrorActionPreference = "Stop"
+        $checks = "_Build/occlusion51"
+        New-Item -ItemType Directory -Path $checks -Force | Out-Null
+        foreach ($name in @("Timeline", "VulkanPool", "Segments")) {
+            $source = "_occlusion51/experiments/occlusion/${name}Tests.cpp"
+            clang-cl /nologo /std:c++20 /EHsc /O2 /I"3rdparty/Vulkan-Headers/include" $source "/Fe:$checks/$name.exe" "/Fo:$checks/$name.obj"
+            if ($LASTEXITCODE -ne 0) { throw "Query component build failed: $name" }
+            & "$checks/$name.exe"
+            if ($LASTEXITCODE -ne 0) { throw "Query component test failed: $name" }
+        }
+    - name: Build and test using pinned working workflow
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "Pinned Python YAML verification failed" }
+        @'
+        from pathlib import Path
+        import subprocess
+        import os
+        import yaml
+        steps = yaml.safe_load(Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml").read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+        started = False
+        finished = False
+        for index, step in enumerate(steps):
+            if step.get("name") == "Package launchers and symbols":
+                finished = True
+                break
+            if step.get("name") == "Install glslang":
+                started = True
+            if not started:
+                continue
+            if "uses" in step or "run" not in step:
+                raise RuntimeError("Unexpected build step")
+            if step["name"] == "Configure CMake":
+                flags = os.environ["KYTY_FLAGS_51"]
+                args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
+                        "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang-cl",
+                        "-DCMAKE_CXX_COMPILER=clang-cl",
+                        "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
+                        "-DCMAKE_C_FLAGS_INIT=" + flags, "-DCMAKE_CXX_FLAGS_INIT=" + flags,
+                        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
+                print("Configuring profile:", os.environ["KYTY_PROFILE_51"], flags, flush=True)
+                subprocess.run(args, check=True)
+                cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
+                cpp_flags = next((line.split("=", 1)[1] for line in cache.splitlines()
+                                  if line.startswith("CMAKE_CXX_FLAGS:STRING=")), None)
+                if cpp_flags is None or "/ehsc" not in cpp_flags.lower():
+                    raise RuntimeError("CMake lost /EHsc: C++ exceptions must remain enabled")
+                if not all(option in cpp_flags for option in flags.split()):
+                    raise RuntimeError("Selected CPU flags are missing from CMAKE_CXX_FLAGS")
+                print("Verified C++ flags:", cpp_flags, flush=True)
+                continue
+            script = Path(f"_build51_{index}.ps1")
+            source = step["run"]
+            if step["name"] == "Install glslang":
+                api_call = '$release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers'
+                if source.count(api_call) != 1:
+                    raise RuntimeError("Unexpected glslang API call")
+                authenticated = '\n'.join([
+                    'if (-not $env:GH_TOKEN) { throw "GitHub Actions token missing" }',
+                    '$apiHeaders = $headers.Clone()',
+                    '$apiHeaders["Authorization"] = "Bearer $env:GH_TOKEN"',
+                    '$apiHeaders["X-GitHub-Api-Version"] = "2022-11-28"',
+                    api_call.replace('-Headers $headers', '-Headers $apiHeaders'),
+                ])
+                source = source.replace(api_call, authenticated)
+            script.write_text('$ErrorActionPreference = "Stop"\n' + source, encoding="utf-8")
+            print("Running:", step["name"], flush=True)
+            path_file = Path(os.environ["GITHUB_PATH"])
+            entries = path_file.read_text(encoding="utf-8-sig").splitlines() if path_file.exists() else []
+            os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
+            if step["name"] == "Test memory and shader paths":
+                for mode in ("0", "1"):
+                    os.environ["KYTY_OCCLUSION_PROBE"] = mode
+                    subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+            else:
+                subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+        if not started or not finished:
+            raise RuntimeError("Build boundaries missing")
+        '@ | & $env:KYTY_PYTHON -
+        if ($LASTEXITCODE -ne 0) { throw "Build or tests failed" }
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Package launchers and symbols
+      run: |
+        $ErrorActionPreference = "Stop"
+        $install = "_Build/windows/install"
+        if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
+        foreach ($mode in @(0, 1)) {
+            $name = if ($mode -eq 1) { "Diagnostico-51.cmd" } else { "Comparacion-51.cmd" }
+            @(
+                '@echo off',
+                'setlocal',
+                'cd /d "%~dp0"',
+                "set KYTY_OCCLUSION_PROBE=$mode",
+                'set KYTY_TEXTURE_REUSE_48=0',
+                'set KYTY_DIRECT_ADDRESSES_47=0',
+                'set KYTY_PHASES_40=',
+                'set KYTY_CLEAN_RUNS_44=0',
+                'set KYTY_IMMEDIATE_CONDITIONS_42=0',
+                'set KYTY_DEBUG_AB=',
+                'set KYTY_REDUNDANT_SOURCES_38=0',
+                'set KYTY_RESOURCE_COSTS_37=0',
+                'set KYTY_FROZEN_DIAGNOSTIC_36=0',
+                'set KYTY_DESCRIPTOR_MEMO_35=0',
+                'set KYTY_DESCRIPTOR_STATS_35=0',
+                'set KYTY_DESCRIPTOR_RECIPES_34=0',
+                'set KYTY_TRACKING_PAUSE=',
+                'set KYTY_BDA_SLICE_FILTER=',
+                'set KYTY_TRACKING_DIAGNOSTICS=',
+                'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
+                'set KYTY_TRACKING_BLOCKING_WAIT=1',
+                'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
+                'set KYTY_DIRECT_COLOR_METADATA=1',
+                'set KYTY_RECORD_THREAD=0',
+                'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
+                'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
+                'set KYTY_DEBUG_SHADER_CPU=0',
+                'set KYTY_RESOURCE_BLOCKS_32=0',
+                'set KYTY_HOST_PRIORITY_26=0',
+                'set KYTY_REFRESH_DIAGNOSTIC_27=0',
+                'set KYTY_SRT_ALIASES_32=0',
+                'set KYTY_DIRECT_FLAT_31=0',
+                'set KYTY_DIRECT_INPUTS_29=0',
+                'set KYTY_ACTIVE_MASK_VIEW_28=0',
+                'set KYTY_DEBUG_QUEUES=',
+                'set KYTY_SRT_STATS=',
+                'set KYTY_DEBUG_SRT_RUNS=',
+                'set KYTY_VERIFY_SRT=',
+                'set KYTY_VERIFY_SPEC=',
+                'set KYTY_VERIFY_SPEC_READS=',
+                'set KYTY_SPECULATE_DRAWS=0',
+                'set KYTY_LIGHT_DRAIN_STATS=1',
+                'set KYTY_DEBUG_SAMPLE_GPU=',
+                'set KYTY_DEBUG_DUMP_THREADS=',
+                'set KYTY_DEBUG_DRAW_PHASES=',
+                'set KYTY_DEBUG_DRAW_STATS=',
+                'set KYTY_DEBUG_SPEC_STATS=',
+                'set KYTY_DEBUG_STREAM_STATS=',
+                'set KYTY_DEBUG_UPLOADS=',
+                'set KYTY_GPU_ZONES=',
+                '"%~dp0launcher.exe" %*'
+            ) | Set-Content "$install/$name" -Encoding ascii
+        }
+        $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
+        if (-not $maps) { throw "Emulator map missing" }
+        foreach ($map in $maps) { Copy-Item $map.FullName $install -Force }
+        $pdb = "_Build/windows/kyty_emulator.pdb"
+        if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
+        Copy-Item $pdb $install -Force
+        @(
+            "Diagnostico-51.cmd: Vulkan occlusion observation ON; guest counters unchanged.",
+            "Comparacion-51.cmd: same executable, diagnostic OFF.",
+            "Keep _Patches, _PipelineCache and kyty_settings.ini.",
+            "AMD CPU patch OFF; shader validation OFF; red-zone ON.",
+            "Select THIS interpreter. Warm up, heavy view 60 seconds, then light view 60 seconds.",
+            "Send full consoles containing occlusion51-stats and occlusion51-control lines. Diagnostic FPS may be lower."
+        ) | Set-Content "$install/DIAGNOSTICO-51.txt" -Encoding ascii
+    - name: Create Windows ZIP
+      run: |
+        $ErrorActionPreference = "Stop"
+        $zip = "KytyPS5-Diagnostico-51.zip"
+        Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+        if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+            throw "Packaging failed: missing or empty ZIP"
+        }
+    - name: Upload KytyPS5
+      uses: actions/upload-artifact@v4
+      with:
+        name: KytyPS5-Diagnostico-51
+        path: KytyPS5-Diagnostico-51.zip
+        if-no-files-found: error
+        retention-days: 7
+    name: Windows x64 - Observacion 51
+    env:
+      KYTY_FLAGS_51: /clang:-ffp-contract=off
+      KYTY_PROFILE_51: Generica
