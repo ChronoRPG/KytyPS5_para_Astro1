@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 47 - Direcciones preparadas
+name: Windows AMD - Diagnostico 48 - Reutilizacion de texturas
 
 on:
   workflow_dispatch:
@@ -8,14 +8,15 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - Prueba 47
+    name: Windows x64 - Diagnostico 48
     runs-on: windows-2022
     env:
-      KYTY_FLAGS_47: /clang:-ffp-contract=off
-      KYTY_PROFILE_47: Generica
+      KYTY_FLAGS_48: /clang:-ffp-contract=off
+      KYTY_PROFILE_48: Generica
     defaults:
       run:
         shell: pwsh
+
     steps:
       - name: Checkout fixed AMD base
         uses: actions/checkout@v4
@@ -74,7 +75,7 @@ jobs:
                   continue
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
-              script = Path(f"_prepare47_{index}.ps1")
+              script = Path(f"_prepare48_{index}.ps1")
               script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
               print("Preparing:", step["name"], flush=True)
               subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -83,7 +84,7 @@ jobs:
           '@ | & $env:KYTY_PYTHON -
           if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-      - name: Prepare direct address operands and tests
+      - name: Add texture reuse counters
         run: |
           $ErrorActionPreference = "Stop"
           @'
@@ -91,136 +92,114 @@ jobs:
 
           def replace(path,old,new):
            p=Path(path);s=p.read_text(encoding='utf-8')
-           if s.count(old)!=1:raise RuntimeError('Unexpected address47 boundary: '+path)
+           if s.count(old)!=1:raise RuntimeError('Unexpected textures48 boundary: '+path)
            p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
 
-          p='src/graphics/shader/recompiler/ir/ShaderIR.h'
-          replace(p,'\t\tLogicalNot,','\t\tLogicalNot,\n        DirectAddress47,')
-          replace(p,'\tstd::vector<ResourceNode>            nodes;', '''    struct AddressInput47 {
-                  uint64_t constant=0;
-                  uint32_t user_index=0;
-                  uint8_t kind=0; // 0 constant, 1 user data, 2 shader base
-              };
-              std::vector<std::array<AddressInput47,3>> addresses47;
-          \tstd::vector<ResourceNode>            nodes;''')
-
-          p='src/graphics/shader/recompiler/ir/passes/SrtWalker.h'
-          replace(p,'\tbool EvaluateRawRead(const ResourceNode& node, uint64_t& result);','\tbool EvaluateRawRead(const ResourceNode& node, uint64_t& result);\n    bool AddressInputs47(const ResourceNode& node,uint64_t& low,uint64_t& high,uint64_t& offset);')
-
-          p='src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp'
-          replace(p,'\tprogram.compiled = std::move(compiled);',r'''
-              // Lower only side-effect-free address operands, after all plan analyses and flat-run construction.
-              const auto* mode47=std::getenv("KYTY_DIRECT_ADDRESSES_47");
-              if (mode47!=nullptr && std::strcmp(mode47,"1")==0) {
-                  uint32_t lowered=0;
-                  for (auto& node:compiled->nodes) {
-                      if (node.op!=NodeOp::RawAddress) continue;
-                      std::array<CompiledResourcePlan::AddressInput47,3> inputs {};
-                      bool valid=true;
-                      for (uint32_t operand=0;operand<3u && valid;++operand) {
-                          auto index=node.args[operand];
-                          uint32_t steps=0;
-                          while (index<compiled->nodes.size() && compiled->nodes[index].op==NodeOp::Forward && steps++<compiled->nodes.size())
-                              index=compiled->nodes[index].args[0];
-                          if (index>=compiled->nodes.size() || steps>compiled->nodes.size()) {valid=false;break;}
-                          const auto& leaf=compiled->nodes[index];
-                          auto& input=inputs[operand];
-                          if (leaf.op==NodeOp::Const) input.constant=leaf.imm;
-                          else if (leaf.op==NodeOp::UserData) {input.kind=1;input.user_index=leaf.aux;}
-                          else if (leaf.op==NodeOp::ShaderBase) input.kind=2;
-                          else valid=false;
-                      }
-                      if (!valid) continue;
-                      node.aux=static_cast<uint32_t>(compiled->addresses47.size());
-                      compiled->addresses47.push_back(inputs);
-                      node.op=NodeOp::DirectAddress47;
-                      ++lowered;
-                  }
-                  if (program.shader_hash==0x3b809f9d156a95ddull || program.shader_hash==0xf112e0ba527945adull) {
-                      static thread_local uint32_t printed=0;
-                      if (printed++<16u) {
-                          std::printf("address47-plan: shader=%016llx lowered=%u\n",static_cast<unsigned long long>(program.shader_hash),lowered);
-                          std::fflush(stdout);
-                      }
-                  }
-              }
-          \tprogram.compiled = std::move(compiled);'''.replace('\\tprogram','\tprogram'))
-
-          needle='bool SrtEvaluator::EvaluateRawRead(const ResourceNode& node, uint64_t& result) {'
-          replace(p,needle,r'''bool SrtEvaluator::AddressInputs47(const ResourceNode& node,uint64_t& low,uint64_t& high,uint64_t& offset) {
-              if (node.op!=NodeOp::DirectAddress47)
-                  return EvaluateWide(node.args[0],low) && EvaluateWide(node.args[1],high) && EvaluateWide(node.args[2],offset);
-              const auto& inputs=m_compiled.addresses47[node.aux];
-              std::array<uint64_t*,3> values {&low,&high,&offset};
-              for (uint32_t i=0;i<3u;++i) {
-                  const auto& input=inputs[i];
-                  if (input.kind==1u) {
-                      if (input.user_index>=m_runtime.user_data.size()) return false;
-                      *values[i]=m_runtime.user_data[input.user_index];
-                  } else if (input.kind==2u) *values[i]=m_runtime.shader_base;
-                  else *values[i]=input.constant;
-              }
-              return true;
+          header=r'''#pragma once
+          #include <array>
+          #include <chrono>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <cstdint>
+          namespace TextureDiagnostic48 {
+          inline bool Enabled() {
+           static const bool enabled=[]{const char* v=std::getenv("KYTY_TEXTURE_REUSE_48");return v!=nullptr && std::strcmp(v,"1")==0;}();
+           return enabled;
           }
-
-          ''' + needle)
-
-          old='\tif (!EvaluateWide(node.args[0], low) || !EvaluateWide(node.args[1], high) ||\n\t    !EvaluateWide(node.args[2], offset)) {'
-          s=Path(p).read_text()
-          assert s.count(old)==2
-          s=s.replace(old,'\tif (!AddressInputs47(node,low,high,offset)) {')
-          Path(p).write_text(s)
-          replace(p,'\t\tcase NodeOp::RawAddress:\n\t\tcase NodeOp::RawBuffer: return EvaluateRawRead(node, result);','\t\tcase NodeOp::DirectAddress47:\n\t\tcase NodeOp::RawAddress:\n\t\tcase NodeOp::RawBuffer: return EvaluateRawRead(node, result);')
+          struct Counters {
+           std::array<uint64_t,11> prepare {},recheck {};
+           uint64_t stages=0,checks=0;
+           void Prepare(uint32_t reason){++stages;++prepare[reason];}
+           void Recheck(uint32_t reason){++checks;++recheck[reason];}
+          };
+          inline void Record(bool second,uint32_t reason,bool has_images) {
+           if (!has_images) return;
+           static thread_local Counters stats;
+           static thread_local auto start=std::chrono::steady_clock::now();
+           static thread_local uint64_t poll=0;
+           if(second) stats.Recheck(reason);else stats.Prepare(reason);
+           if ((++poll&1023u)!=0u) return;
+           const auto now=std::chrono::steady_clock::now();
+           const auto seconds=std::chrono::duration<double>(now-start).count();
+           if(seconds<5.0) return;
+           constexpr std::array names {"kept","disabled","no-group","program","descriptors","image-set","tick","gc-tick","association","dirty","color-clear"};
+           std::printf("texture48: %.2fs stages-with-images=%llu rechecks=%llu\n",seconds,(unsigned long long)stats.stages,(unsigned long long)stats.checks);
+           for(uint32_t phase=0;phase<2u;++phase) {
+            const auto& counts=phase==0u ? stats.prepare : stats.recheck;
+            std::printf("texture48-%s:",phase==0u ? "prepare" : "recheck");
+            for(uint32_t i=0;i<counts.size();++i) std::printf(" %s=%llu",names[i],(unsigned long long)counts[i]);
+            std::printf("\n");
+           }
+           std::fflush(stdout);stats={};start=now;
+          }
+          }
+          '''
+          Path('src/graphics/host_gpu/renderer/pipeline/textureDiagnostic48.h').write_text(header)
+          p='src/graphics/host_gpu/renderer/pipeline/descriptors.cpp'
           f=Path(p)
-          f.write_text('#include <cstdlib>\n#include <cstring>\n#include <cstdio>\n'+f.read_text())
+          f.write_text('#include "graphics/host_gpu/renderer/pipeline/textureDiagnostic48.h"\n'+f.read_text())
+
+          replace(p,'static bool ImageGroupStands(TextureCache& cache, const PreparedBindings& prepared) {','static bool ImageGroupStands(TextureCache& cache, const PreparedBindings& prepared, uint32_t* reason48=nullptr) {')
+
+          replace(p,'\tif (!(prepared.image_group.state == cache.CurrentTargetState())) {\n\t\treturn false;\n\t}',r'''    const auto current48=cache.CurrentTargetState();
+              const auto& previous48=prepared.image_group.state;
+              if (!(previous48==current48)) {
+                  if(reason48!=nullptr) *reason48=previous48.image_set!=current48.image_set ? 5u : previous48.tick!=current48.tick ? 6u : 7u;
+                  return false;
+              }''')
+
+          replace(p,'\t\tif ((depth ? depth : source.found) != bound || !cache.IsTextureClean(bound) ||\n\t\t    !cache.IsColorClearCurrent(source.found, prepared.images[i].desc,\n\t\t                               source.metadata_base_layer)) {\n\t\t\treturn false;\n\t\t}',r'''        if ((depth ? depth : source.found)!=bound) {
+                      if(reason48!=nullptr) *reason48=8u;
+                      return false;
+                  }
+                  if(!cache.IsTextureClean(bound)) {
+                      if(reason48!=nullptr) *reason48=9u;
+                      return false;
+                  }
+                  if(!cache.IsColorClearCurrent(source.found,prepared.images[i].desc,source.metadata_base_layer)) {
+                      if(reason48!=nullptr) *reason48=10u;
+                      return false;
+                  }''')
+
+          replace(p,'\tprepared.image_group_kept =\n\t    ImageGroupsEnabled() && group.program == &program &&\n\t    std::ranges::equal(snapshot.images, group.images) && ImageGroupStands(texture_cache, prepared);',r'''    if (!TextureDiagnostic48::Enabled()) {
+                  prepared.image_group_kept=ImageGroupsEnabled() && group.program==&program &&
+                      std::ranges::equal(snapshot.images,group.images) && ImageGroupStands(texture_cache,prepared);
+              } else {
+                  uint32_t reason48=0;
+                  if(!ImageGroupsEnabled()) reason48=1;
+                  else if(group.program!=&program) reason48=group.program==nullptr ? 2u : 3u;
+                  else if(!std::ranges::equal(snapshot.images,group.images)) reason48=4;
+                  else ImageGroupStands(texture_cache,prepared,&reason48);
+                  prepared.image_group_kept=reason48==0u;
+                  TextureDiagnostic48::Record(false,reason48,!program.info.images.empty());
+              }''')
+
+          replace(p,'\tif (group_kept && ImageGroupStands(texture_cache, prepared)) {',r'''    uint32_t recheck48=0;
+              const bool diagnostic48=TextureDiagnostic48::Enabled();
+              const bool stands48=group_kept && ImageGroupStands(texture_cache,prepared,diagnostic48 ? &recheck48 : nullptr);
+              if(diagnostic48 && group_kept) TextureDiagnostic48::Record(true,recheck48,!program.info.images.empty());
+              if (stands48) {''')
 
           p='src/graphics/guest_gpu/graphicsRun.cpp'
-          replace(p,'\tg_gpu_thread = true;',r'''    g_gpu_thread = true;
-              const auto* mode47=std::getenv("KYTY_DIRECT_ADDRESSES_47");
-              std::printf("address47: direct address operands %s\n",mode47!=nullptr && std::strcmp(mode47,"1")==0 ? "ON" : "OFF");
-              std::fflush(stdout);''')
           f=Path(p)
-          f.write_text('#include <cstdlib>\n#include <cstring>\n'+f.read_text())
+          f.write_text('#include "graphics/host_gpu/renderer/pipeline/textureDiagnostic48.h"\n'+f.read_text())
+          replace(p,'\tg_gpu_thread = true;',r'''    g_gpu_thread = true;
+              if(TextureDiagnostic48::Enabled()) {
+                  std::printf("texture48: diagnostic active; original checks retained\n");
+                  std::fflush(stdout);
+              }''')
 
-          for filename in [
-              'src/graphics/shader/recompiler/ir/ShaderIR.h',
-              'src/graphics/shader/recompiler/ir/passes/SrtWalker.h',
-              'src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp',
+          for name in [
+              'src/graphics/host_gpu/renderer/pipeline/descriptors.cpp',
               'src/graphics/guest_gpu/graphicsRun.cpp',
           ]:
-           f=Path(filename)
+           f=Path(name)
            f.write_text('\n'.join(x.rstrip(' \t') for x in f.read_text().splitlines())+'\n')
-
-          print('Address47 adaptation installed')
-
-          p='tests/ResourceMaterializationTests.cpp'
-          f=Path(p)
-          f.write_text('#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"\n#include <cstdlib>\n#include <cstring>\n'+f.read_text())
-          replace(p,'  std::puts("ResourceMaterializationTests: all cases passed");',r'''
-            {
-              using namespace Libs::Graphics::ShaderRecompiler::IR;
-              auto plan=MemoPlan(MemoPlanExtra::DynamicRead,true);
-              const auto& compiled=CompileResourcePlan(plan);
-              const auto* mode=std::getenv("KYTY_DIRECT_ADDRESSES_47");
-              const bool enabled=mode!=nullptr && std::strcmp(mode,"1")==0;
-              Check(enabled ? !compiled.addresses47.empty() : compiled.addresses47.empty(),"address47 tested path missing");
-              MemoFixture fixture;
-              for (uint32_t epoch=0;epoch<256u;++epoch) {
-                fixture.memory.words[0]=0x1000u+epoch;
-                fixture.user_data[3]=(epoch&1u)!=0u ? 4u : 8u;
-                Check(fixture.Refresh(plan),"address47 fresh operand refresh failed");
-                Check(fixture.snapshot.buffers[0].dwords[0]==fixture.memory.words[0],"address47 reused old memory");
-              }
-              fixture.user_data[1]=0xffffu;
-              Check(!fixture.Refresh(plan),"address47 ignored rejected address read");
-              std::puts("Address47: fresh memory, changing operands and rejected reader passed");
-            }
-            std::puts("ResourceMaterializationTests: all cases passed");''')
-          f=Path(p)
-          f.write_text('\n'.join(x.rstrip(' \t') for x in f.read_text().splitlines())+'\n')
+          print('Texture reuse diagnostic48 installed')
 
           '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "Address 47 adaptation failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Texture 48 adaptation failed" }
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
@@ -275,14 +254,14 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected build step")
               if step["name"] == "Configure CMake":
-                  flags = os.environ["KYTY_FLAGS_47"]
+                  flags = os.environ["KYTY_FLAGS_48"]
                   args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
                           "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang-cl",
                           "-DCMAKE_CXX_COMPILER=clang-cl",
                           "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
                           "-DCMAKE_C_FLAGS_INIT=" + flags, "-DCMAKE_CXX_FLAGS_INIT=" + flags,
                           "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
-                  print("Configuring profile:", os.environ["KYTY_PROFILE_47"], flags, flush=True)
+                  print("Configuring profile:", os.environ["KYTY_PROFILE_48"], flags, flush=True)
                   subprocess.run(args, check=True)
                   cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
                   cpp_flags = next((line.split("=", 1)[1] for line in cache.splitlines()
@@ -293,7 +272,7 @@ jobs:
                       raise RuntimeError("Selected CPU flags are missing from CMAKE_CXX_FLAGS")
                   print("Verified C++ flags:", cpp_flags, flush=True)
                   continue
-              script = Path(f"_build47_{index}.ps1")
+              script = Path(f"_build48_{index}.ps1")
               source = step["run"]
               if step["name"] == "Install glslang":
                   api_call = '$release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers'
@@ -314,7 +293,7 @@ jobs:
               os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
               if step["name"] == "Test memory and shader paths":
                   for mode in ("0", "1"):
-                      os.environ["KYTY_DIRECT_ADDRESSES_47"] = mode
+                      os.environ["KYTY_TEXTURE_REUSE_48"] = mode
                       subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
               else:
                   subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -329,12 +308,13 @@ jobs:
           $install = "_Build/windows/install"
           if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
           foreach ($mode in @(0, 1)) {
-              $name = if ($mode -eq 1) { "Prueba-47.cmd" } else { "Comparacion-47.cmd" }
+              $name = if ($mode -eq 1) { "Diagnostico-48.cmd" } else { "Comparacion-48.cmd" }
               @(
                   '@echo off',
                   'setlocal',
                   'cd /d "%~dp0"',
-                  "set KYTY_DIRECT_ADDRESSES_47=$mode",
+                  "set KYTY_TEXTURE_REUSE_48=$mode",
+                  'set KYTY_DIRECT_ADDRESSES_47=0',
                   'set KYTY_PHASES_40=',
                   'set KYTY_CLEAN_RUNS_44=0',
                   'set KYTY_IMMEDIATE_CONDITIONS_42=0',
@@ -389,18 +369,18 @@ jobs:
           if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
           Copy-Item $pdb $install -Force
           @(
-              "Prueba-47.cmd: prepared address operands ON.",
-              "Comparacion-47.cmd: same executable, original evaluation.",
+              "Diagnostico-48.cmd: texture reuse rejection counters ON.",
+              "Comparacion-48.cmd: same executable, diagnostic OFF.",
               "Keep _Patches, _PipelineCache and kyty_settings.ini.",
               "AMD CPU patch OFF; shader validation OFF; red-zone ON.",
-              "Select THIS interpreter. Heavy view 60 seconds each mode.",
-              "Report full Prueba console including address47 and address47-plan."
-          ) | Set-Content "$install/PRUEBA-47.txt" -Encoding ascii
+              "Select THIS interpreter.",
+              "Report full diagnostic console including texture48 lines."
+          ) | Set-Content "$install/DIAGNOSTICO-48.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Prueba-47.zip"
+          $zip = "KytyPS5-Diagnostico-48.zip"
           Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
               throw "Packaging failed: missing or empty ZIP"
@@ -409,7 +389,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Prueba-47
-          path: KytyPS5-Prueba-47.zip
+          name: KytyPS5-Diagnostico-48
+          path: KytyPS5-Diagnostico-48.zip
           if-no-files-found: error
           retention-days: 7
