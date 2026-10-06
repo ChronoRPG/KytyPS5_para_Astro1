@@ -76,125 +76,650 @@ jobs:
         $ErrorActionPreference = "Stop"
         @'
         from pathlib import Path
-        import base64, hashlib, json, subprocess, sys, zlib
-        payload = """
-        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
+        import subprocess
+        import sys
+        files = {}
+        files['patches/adapt_occlusion_register51.py'] = r"""# Development foundation only: preserve guest query control, without changing renderer behavior.
+        from pathlib import Path
+
+        def replace(path,old,new):
+         p=Path(path);s=p.read_text()
+         if s.count(old)!=1:raise RuntimeError('Unexpected occlusion state boundary: '+path)
+         p.write_text(s.replace(old,new),newline='\n')
+        p='src/graphics/guest_gpu/hardwareContext.h'
+        replace(p,'\tDepthRenderOverride m_depth_render_override;',
+                  '\tDepthRenderOverride m_depth_render_override;\n\tuint32_t m_depth_count_control = 0;')
+        replace(p,'\t[[nodiscard]] const DepthRenderOverride& GetDepthRenderOverride() const {',
+        '''    // Preserve every guest bit; decoding and host query behavior are separate work.
+            [[nodiscard]] uint32_t GetDepthCountControl() const { return m_depth_count_control; }
+            void SetDepthCountControl(uint32_t value) { m_depth_count_control = value; }
+        \t[[nodiscard]] const DepthRenderOverride& GetDepthRenderOverride() const {''')
+        p='src/graphics/guest_gpu/command_processor/pm4Handlers.cpp'
+        replace(p,'\tif (cmd_offset == Pm4::DB_RENDER_OVERRIDE) {',
+        '''    if (cmd_offset == Pm4::DB_COUNT_CONTROL) {
+                cp.GetCtx().SetDepthCountControl(value);
+                return;
+            }
+        \tif (cmd_offset == Pm4::DB_RENDER_OVERRIDE) {''')
+        print('Guest DB_COUNT_CONTROL preserved; host queries unchanged')
         """
-        bundle = zlib.decompress(base64.b64decode("".join(payload.split()), validate=True))
-        if hashlib.sha256(bundle).hexdigest() != "8332bb91afc95386f8785ae7c903bfc1279131439bbca6b273121545352890cf":
-            raise RuntimeError("Incomplete observation source bundle")
+        files['patches/adapt_occlusion_scopes51.py'] = r"""from pathlib import Path
+
+        def replace(path, old, new):
+            p = Path(path)
+            s = p.read_text()
+            if s.count(old) != 1:
+                raise RuntimeError('Unexpected occlusion scope boundary: ' + path)
+            p.write_text(s.replace(old, new), newline='\n')
+
+        p = 'src/graphics/host_gpu/renderer/render.h'
+        replace(p, 'class CommandBuffer {\npublic:', '''class CommandBuffer {
+        public:
+            // Optional experimental hooks; owner must outlive the command buffer.
+            // prepare runs outside rendering; begin/end run inside the same scope.
+            // A failed prepare means incomplete counting, never a valid zero result.
+            struct OcclusionScopeHooks {
+                void* context = nullptr;
+                bool (*prepare)(void*, vk::CommandBuffer) = nullptr;
+                void (*begin)(void*, vk::CommandBuffer) = nullptr;
+                void (*end)(void*, vk::CommandBuffer) = nullptr;
+                // Owner-thread, nonblocking completion/publication pump; no new recording.
+                void (*poll)(void*) = nullptr;
+            };
+            void SetOcclusionScopeHooks(const OcclusionScopeHooks* hooks) {
+                EXIT_IF(m_rendering || m_occlusion_query_active || m_occlusion_polling);
+                EXIT_IF(hooks != nullptr && (!hooks->prepare || !hooks->begin || !hooks->end));
+                m_occlusion_scope_hooks = hooks;
+            }
+            void PollOcclusionResults() const {
+                if (m_occlusion_scope_hooks == nullptr || m_occlusion_scope_hooks->poll == nullptr) {
+                    return;
+                }
+                EXIT_IF(m_occlusion_polling);
+                struct PollScope {
+                    bool& active;
+                    explicit PollScope(bool& value): active(value) { active = true; }
+                    ~PollScope() { active = false; }
+                } scope(m_occlusion_polling);
+                m_occlusion_scope_hooks->poll(m_occlusion_scope_hooks->context);
+            }''')
+        replace(p, '\tmutable bool        m_rendering   = false;', '''\tmutable bool        m_rendering   = false;
+            const OcclusionScopeHooks* m_occlusion_scope_hooks = nullptr;
+            mutable bool m_occlusion_query_active = false;
+            mutable bool m_occlusion_polling = false;''')
+        p = 'src/graphics/host_gpu/renderer/context.cpp'
+        replace(p, '\trendering.renderArea.extent    = {state.width, state.height};',
+                '\trendering.renderArea.extent    = vk::Extent2D {state.width, state.height};')
+        replace(p, '\tEXIT_IF(m_rendering || m_pending_shader_writes || IsInvalid());',
+                '\tEXIT_IF(m_rendering || m_occlusion_query_active || m_pending_shader_writes || IsInvalid());')
+        replace(p, '\tEndRendering();\n\n\tstd::array<vk::RenderingAttachmentInfo', '''\tEndRendering();
+            const bool count_occlusion = m_occlusion_scope_hooks != nullptr &&
+                m_occlusion_scope_hooks->prepare(m_occlusion_scope_hooks->context, Handle());
+
+        \tstd::array<vk::RenderingAttachmentInfo''')
+        replace(p, '\tm_rendering    = true;\n}', '''\tm_rendering    = true;
+            if (count_occlusion) {
+                m_occlusion_scope_hooks->begin(m_occlusion_scope_hooks->context, Handle());
+                m_occlusion_query_active = true;
+            }
+        }''')
+        replace(p, '\tif (m_rendering) {\n\t\tHandle().endRendering();', '''\tif (m_rendering) {
+                if (m_occlusion_query_active) {
+                    m_occlusion_scope_hooks->end(m_occlusion_scope_hooks->context, Handle());
+                    m_occlusion_query_active = false;
+                }
+        \t\tHandle().endRendering();''')
+        p = 'src/graphics/guest_gpu/graphicsRun.cpp'
+        replace(p, '''void CommandProcessor::BufferInit() {
+        \tGetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
+        }''', '''void CommandProcessor::BufferInit() {
+        \tGetScheduler().Begin(m_ctx, m_ucfg, m_sh_ctx);
+            // Runs on the GPU owner thread for each initial or resumed PM4 slice.
+            // Optional hook must only collect completed queries; never wait globally.
+            GetScheduler().Current().PollOcclusionResults();
+        }''')
+        print('Optional render-scope and PM4-resume hooks installed; no query backend enabled')
+        """
+        files['patches/adapt_occlusion_probe51.py'] = r"""from pathlib import Path
+        import shutil
+
+        changes = {}
+        if 'occlusion_query_precise_enabled' in Path('src/graphics/host_gpu/graphicContext.h').read_text():
+            raise RuntimeError('Occlusion probe already adapted; refusing to apply twice')
+
+        def replace(path, old, new):
+            p = Path(path)
+            s = changes.get(path, p.read_text())
+            if s.count(old) != 1:
+                raise RuntimeError('Unexpected occlusion probe boundary: ' + path)
+            changes[path] = s.replace(old, new)
+
+        p = 'src/graphics/host_gpu/graphicContext.h'
+        replace(p, '\tbool                               sample_rate_shading_enabled           = false;',
+        '''\tbool                               sample_rate_shading_enabled           = false;
+            bool occlusion_query_precise_enabled = false;''')
+        p = 'src/graphics/presentation/window/vulkanWindow.cpp'
+        replace(p, '\tgraphics.sample_rate_shading_enabled                 = true;',
+        '''\tgraphics.sample_rate_shading_enabled                 = true;
+            const char* occlusion_probe = std::getenv("KYTY_OCCLUSION_PROBE");
+            const bool request_occlusion_probe = occlusion_probe != nullptr &&
+                occlusion_probe[0] == '1' && occlusion_probe[1] == '\\0';
+            graphics.occlusion_query_precise_enabled = request_occlusion_probe &&
+                supported_features2.features.occlusionQueryPrecise == VK_TRUE;
+            device_features.occlusionQueryPrecise = graphics.occlusion_query_precise_enabled;
+            if (request_occlusion_probe && !graphics.occlusion_query_precise_enabled) {
+                std::printf("occlusion51: precise query feature unsupported; observation OFF\\n");
+            }''')
+        p = 'src/graphics/host_gpu/renderer/commandScheduler.h'
+        replace(p, 'class CommandScheduler {', 'class OcclusionProbe;\n\nclass CommandScheduler {')
+        replace(p, '\tvoid           EndRendering();', '''\tvoid           EndRendering();
+            void ObserveOcclusionDump(uint64_t address, uint32_t control);
+            void ObserveOcclusionPredicate(uint32_t op);''')
+        replace(p, '\tCommandBuffer                m_command;',
+        '''\tCommandBuffer                m_command;
+            std::unique_ptr<OcclusionProbe> m_occlusion_probe;''')
+        p = 'src/graphics/host_gpu/renderer/commandScheduler.cpp'
+        replace(p, '#include <algorithm>', '#include "graphics/host_gpu/renderer/occlusionProbe.h"\n\n#include <algorithm>')
+        replace(p, '\tShutdown();\n\tif (GpuZones::g_context == this)', '''\tShutdown();
+            // Shutdown submitted and waited for every buffer using the pool.
+            if (m_occlusion_probe) {
+                m_command.SetOcclusionScopeHooks(nullptr);
+                m_occlusion_probe.reset();
+            }
+        \tif (GpuZones::g_context == this)''')
+        replace(p, 'void CommandScheduler::EndRendering() {', '''void CommandScheduler::ObserveOcclusionDump(uint64_t address, uint32_t control) {
+            if (m_occlusion_probe) { m_occlusion_probe->Dump(address, control); }
+        }
+
+        void CommandScheduler::ObserveOcclusionPredicate(uint32_t op) {
+            if (m_occlusion_probe) { m_occlusion_probe->Predicate(op); }
+        }
+
+        void CommandScheduler::EndRendering() {''')
+        replace(p, '''\tif (CommandRecordingDeferred()) {
+        \t\tm_stream = std::make_unique<CommandStream>();
+        \t}''', '''\tif (CommandRecordingDeferred()) {
+        \t\tm_stream = std::make_unique<CommandStream>();
+        \t}
+            if (m_graphics.occlusion_query_precise_enabled) {
+                if (m_stream != nullptr) {
+                    std::printf("occlusion51: requires KYTY_RECORD_THREAD=0; observation OFF\\n");
+                } else {
+                    try {
+                        m_occlusion_probe = std::make_unique<OcclusionProbe>(*this, m_graphics);
+                        m_command.SetOcclusionScopeHooks(m_occlusion_probe->Hooks());
+                    } catch (const std::exception& error) {
+                        std::printf("occlusion51: backend unavailable: %s; observation OFF\\n", error.what());
+                        m_occlusion_probe.reset();
+                    }
+                }
+            }''')
+        p = 'src/graphics/guest_gpu/graphicsRun.cpp'
+        replace(p, '\t\t\tDrainStats::Record(DrainStats::Kind::OcclusionQuery, 1);',
+        '''\t\t\tDrainStats::Record(DrainStats::Kind::OcclusionQuery, 1);
+                    GetScheduler().ObserveOcclusionDump(event_address, m_ctx.GetDepthCountControl());''')
+        replace(p, '''\tuint64_t value = 0;
+        \tif (op != 0) {''', '''\tuint64_t value = 0;
+            GetScheduler().ObserveOcclusionPredicate(op);
+        \tif (op != 0) {''')
+        source = Path(__file__).resolve().parent.parent/'experiments/occlusion'
+        target = Path('src/graphics/host_gpu/renderer')
+        for name in ['OcclusionProbe.h', 'VulkanPool.h', 'Timeline.h', 'Segments.h']:
+            if not (source/name).is_file():
+                raise RuntimeError('Missing observation backend component: ' + name)
+        # Validate all replacement boundaries and components before modifying any source.
+        for path, text in changes.items():
+            Path(path).write_text(text, newline='\n')
+        shutil.copyfile(source/'OcclusionProbe.h', target/'occlusionProbe.h')
+        (target/'occlusion').mkdir(exist_ok=True)
+        for name in ['VulkanPool.h', 'Timeline.h', 'Segments.h']:
+            shutil.copyfile(source/name, target/'occlusion'/name)
+        print('Opt-in Vulkan observation installed; synthetic guest results and predication unchanged')
+        """
+        files['experiments/occlusion/Timeline.h'] = r"""#pragma once
+        // Development component, not connected to Vulkan or guest memory yet.
+        // Tracks a logical cumulative sample counter; guest per-DB encoding is deliberately separate.
+        // Single-owner-thread component: backend callbacks must marshal results to that owner.
+        // Forget each snapshot after guest publication; this class does not own guest address lifetime.
+        #include <cstdint>
+        #include <cstddef>
+        #include <deque>
+        #include <optional>
+        #include <unordered_map>
+        #include <vector>
+        namespace KytyOcclusionExperiment {
+        class Timeline {
+        public:
+         static constexpr uint64_t Mask=(uint64_t{1}<<63)-1;
+         struct Lease {uint32_t slot=0;uint64_t generation=0,serial=0;};
+         struct Snapshot {uint64_t address=0,generation=0;};
+         explicit Timeline(uint32_t max_slots=4096):m_max_slots(max_slots){}
+         std::optional<Lease> Issue(uint64_t submission_tick) {
+          if(m_pending.size()>=m_max_slots)return std::nullopt;
+          uint32_t index=0;
+          for(;index<m_slots.size();++index)if(!m_slots[index].busy)break;
+          if(index==m_slots.size()) {
+           if(m_slots.size()>=m_max_slots)return std::nullopt;
+           m_slots.emplace_back();
+          }
+          auto& slot=m_slots[index];slot.busy=true;slot.resolved=false;
+          slot.submission_tick=submission_tick;slot.serial=++m_serial;++slot.generation;
+          m_pending.push_back({slot.serial,{},index,slot.generation});
+          return Lease{index,slot.generation,slot.serial};
+         }
+         bool Resolve(Lease lease,uint64_t samples) {
+          if(lease.slot>=m_slots.size())return false;
+          auto& slot=m_slots[lease.slot];
+          if(!slot.busy || slot.generation!=lease.generation || slot.serial!=lease.serial || slot.resolved)return false;
+          bool found=false;
+          for(auto& pending:m_pending)if(pending.serial==lease.serial){pending.samples=samples&Mask;found=true;break;}
+          if(!found)return false;
+          slot.resolved=true;
+          Drain();Reclaim();return true;
+         }
+         Snapshot Capture(uint64_t address) {
+          // At most one pending publication per guest address; replacing it invalidates older tokens.
+          auto& snapshot=m_snapshots[address];snapshot.generation=++m_publication_generation;
+          snapshot.serial=m_serial;snapshot.value.reset();
+          if(m_completed_serial>=snapshot.serial)snapshot.value=m_total;
+          return {address,snapshot.generation};
+         }
+         std::optional<uint64_t> Poll(Snapshot token) const {
+          const auto it=m_snapshots.find(token.address);
+          if(it==m_snapshots.end() || it->second.generation!=token.generation)return std::nullopt;
+          return it->second.value;
+         }
+         bool Forget(Snapshot token) {
+          auto it=m_snapshots.find(token.address);
+          if(it==m_snapshots.end() || it->second.generation!=token.generation)return false;
+          m_snapshots.erase(it);return true;
+         }
+         void CompletedTick(uint64_t tick) {if(tick>m_completed_tick)m_completed_tick=tick;Reclaim();}
+         std::size_t Slots() const {return m_slots.size();}
+         std::size_t Pending() const {return m_pending.size();}
+        private:
+         struct Slot {uint64_t generation=0,serial=0,submission_tick=0;bool busy=false,resolved=false;};
+         struct PendingQuery {uint64_t serial;std::optional<uint64_t> samples;uint32_t slot;uint64_t generation;};
+         struct Publication {uint64_t generation=0,serial=0;std::optional<uint64_t> value;};
+         void Drain() {
+          while(!m_pending.empty() && m_pending.front().samples.has_value()) {
+           const auto query=m_pending.front();m_pending.pop_front();
+           m_total=(m_total+*query.samples)&Mask;m_completed_serial=query.serial;
+           for(auto& [address,snapshot]:m_snapshots) {
+            (void)address;
+            if(!snapshot.value.has_value() && snapshot.serial==m_completed_serial)snapshot.value=m_total;
+           }
+          }
+         }
+         void Reclaim() {
+          for(auto& slot:m_slots)if(slot.busy && slot.resolved && slot.submission_tick<=m_completed_tick)slot.busy=false;
+         }
+         uint32_t m_max_slots;
+         uint64_t m_serial=0,m_completed_serial=0,m_total=0,m_completed_tick=0,m_publication_generation=0;
+         std::vector<Slot> m_slots;
+         std::deque<PendingQuery> m_pending;
+         std::unordered_map<uint64_t,Publication> m_snapshots;
+        };
+        }
+        """
+        files['experiments/occlusion/VulkanPool.h'] = r"""#pragma once
+        // Experimental backend. Caller owns slot generations, command-buffer scopes and
+        // synchronization. Reset before entering rendering; begin/end in the same scope.
+        // Destroy only after all submissions referring to this pool have completed.
+        #include <vulkan/vulkan_core.h>
+        #include <cstdint>
+        #include <stdexcept>
+        namespace KytyOcclusionExperiment {
+        class VulkanPool {
+        public:
+         struct Dispatch {
+          PFN_vkCreateQueryPool create;
+          PFN_vkDestroyQueryPool destroy;
+          PFN_vkCmdResetQueryPool reset;
+          PFN_vkCmdBeginQuery begin;
+          PFN_vkCmdEndQuery end;
+          PFN_vkGetQueryPoolResults results;
+         };
+         enum class Status { Pending, Available, Error };
+         struct Result { Status status; uint64_t samples; VkResult error; };
+         VulkanPool(VkDevice device, Dispatch dispatch, uint32_t capacity,
+                    bool precise_feature_enabled):m_device(device),m_dispatch(dispatch),m_capacity(capacity) {
+          if(!capacity || !precise_feature_enabled || !dispatch.create || !dispatch.destroy ||
+             !dispatch.reset || !dispatch.begin || !dispatch.end || !dispatch.results)
+           throw std::invalid_argument("occlusion backend requires enabled precise queries and valid dispatch");
+          VkQueryPoolCreateInfo info{};info.sType=VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+          info.queryType=VK_QUERY_TYPE_OCCLUSION;info.queryCount=capacity;
+          if(dispatch.create(device,&info,nullptr,&m_pool)!=VK_SUCCESS)
+           throw std::runtime_error("occlusion query pool creation failed");
+         }
+         ~VulkanPool(){m_dispatch.destroy(m_device,m_pool,nullptr);}
+         VulkanPool(const VulkanPool&)=delete;
+         VulkanPool& operator=(const VulkanPool&)=delete;
+         uint32_t Capacity()const{return m_capacity;}
+         void Reset(VkCommandBuffer command,uint32_t slot){Check(slot);m_dispatch.reset(command,m_pool,slot,1);}
+         void Begin(VkCommandBuffer command,uint32_t slot){Check(slot);m_dispatch.begin(command,m_pool,slot,VK_QUERY_CONTROL_PRECISE_BIT);}
+         void End(VkCommandBuffer command,uint32_t slot){Check(slot);m_dispatch.end(command,m_pool,slot);}
+         Result Read(uint32_t slot) {
+          Check(slot);
+          struct {uint64_t samples=0,available=0;} data;
+          const auto result=m_dispatch.results(m_device,m_pool,slot,1,sizeof(data),&data,sizeof(data),
+              VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+          if(result!=VK_SUCCESS && result!=VK_NOT_READY)return {Status::Error,0,result};
+          if(result==VK_NOT_READY || !data.available)return {Status::Pending,0,VK_NOT_READY};
+          return {Status::Available,data.samples,VK_SUCCESS};
+         }
+        private:
+         void Check(uint32_t slot)const{if(slot>=m_capacity)throw std::out_of_range("occlusion query slot");}
+         VkDevice m_device;
+         Dispatch m_dispatch;
+         uint32_t m_capacity;
+         VkQueryPool m_pool=VK_NULL_HANDLE;
+        };
+        }
+        """
+        files['experiments/occlusion/Segments.h'] = r"""#pragma once
+        // Experimental connection between the Vulkan pool and cumulative timeline.
+        // Single owner thread. Caller must close rendering through Finish before submission,
+        // event snapshots, control changes, or any implicit render-scope termination.
+        #include "Timeline.h"
+        #include "VulkanPool.h"
+        #include <functional>
+        #include <vector>
+        namespace KytyOcclusionExperiment {
+        class Segments {
+        public:
+         using Observer=std::function<void(uint64_t)>;
+         explicit Segments(VulkanPool& pool,Observer observer={}):m_pool(pool),m_timeline(pool.Capacity()),m_observer(std::move(observer)){}
+         // Must be called outside rendering. open_rendering must begin the render scope
+         // synchronously and must not throw; it must not submit or change command buffers.
+         bool Start(VkCommandBuffer command,uint64_t tick,const std::function<void()>& open_rendering){
+          if(!Prepare(command,tick))return false;
+          open_rendering();
+          Begin(command);return true;
+         }
+         // Separate prepare/begin for the central CommandBuffer scope hooks.
+         bool Prepare(VkCommandBuffer command,uint64_t tick){
+          if(m_active || m_prepared)throw std::logic_error("nested occlusion segment");
+          if(m_incomplete)return false;
+          auto lease=m_timeline.Issue(tick);
+          if(!lease){m_incomplete=true;return false;}
+          m_pool.Reset(command,lease->slot);m_prepared=Entry{*lease,tick,command};return true;
+         }
+         void Begin(VkCommandBuffer command){
+          if(!m_prepared || m_active || command!=m_prepared->command)
+           throw std::logic_error("occlusion begin without matching preparation");
+          m_pool.Begin(command,m_prepared->lease.slot);m_active=m_prepared;m_prepared.reset();
+         }
+         // Called while still inside the same rendering scope, before endRendering.
+         void Finish(VkCommandBuffer command){
+          if(!m_active)return;
+          if(command!=m_active->command)throw std::logic_error("occlusion segment crossed command buffers");
+          m_pool.End(command,m_active->lease.slot);
+          m_ended.push_back(*m_active);m_active.reset();
+         }
+         Timeline::Snapshot Capture(uint64_t address){
+          if(m_active || m_prepared)throw std::logic_error("snapshot requires closing the active segment");
+          if(m_incomplete)throw std::logic_error("incomplete occlusion counting cannot produce snapshots");
+          return m_timeline.Capture(address);
+         }
+         std::optional<uint64_t> Poll(Timeline::Snapshot snapshot)const{return m_timeline.Poll(snapshot);}
+         bool Forget(Timeline::Snapshot snapshot){return m_timeline.Forget(snapshot);}
+         // Called on the owner thread with a tick known completed by the scheduler.
+         // No global wait. Not-ready queries remain queued, even after a tick notification.
+         VkResult Collect(uint64_t completed_tick){
+          for(auto it=m_ended.begin();it!=m_ended.end();){
+           if(it->tick>completed_tick){++it;continue;}
+           const auto result=m_pool.Read(it->lease.slot);
+           if(result.status==VulkanPool::Status::Error)return result.error;
+           if(result.status==VulkanPool::Status::Pending){++it;continue;}
+           if(!m_timeline.Resolve(it->lease,result.samples))throw std::logic_error("stale occlusion lease");
+           if(m_observer)m_observer(result.samples);
+           it=m_ended.erase(it);
+          }
+          m_timeline.CompletedTick(completed_tick);return VK_SUCCESS;
+         }
+         bool Active()const{return m_active.has_value();}
+         bool CompleteCounting()const{return !m_incomplete;}
+         std::size_t Pending()const{return m_timeline.Pending();}
+        private:
+         struct Entry {Timeline::Lease lease;uint64_t tick;VkCommandBuffer command;};
+         VulkanPool& m_pool;
+         Timeline m_timeline;
+         std::optional<Entry> m_prepared;
+         std::optional<Entry> m_active;
+         std::vector<Entry> m_ended;
+         bool m_incomplete=false;
+         Observer m_observer;
+        };
+        }
+        """
+        files['experiments/occlusion/OcclusionProbe.h'] = r"""#pragma once
+        // Observation only: never publishes query results or changes guest predication.
+        // Installed only with precise queries enabled and deferred recording disabled.
+        #include "graphics/host_gpu/renderer/commandScheduler.h"
+        #include "graphics/host_gpu/graphicContext.h"
+        #include "occlusion/Segments.h"
+        #include <chrono>
+        #include <cinttypes>
+        #include <cstdio>
+        #include <functional>
+        #include <unordered_map>
+        namespace Libs::Graphics {
+        class OcclusionProbe {
+        public:
+         using Clock=std::chrono::steady_clock;
+         using Now=std::function<Clock::time_point()>;
+         explicit OcclusionProbe(CommandScheduler& scheduler,GraphicContext& graphics,
+                                 Now now=[] {return Clock::now();})
+             :m_scheduler(scheduler),m_pool(static_cast<VkDevice>(graphics.device),Dispatch(graphics),4096,
+                                           graphics.occlusion_query_precise_enabled),
+              m_segments(m_pool,[this](uint64_t samples){++m_resolved_segments;if(samples==0)++m_zero_segments;m_samples+=samples;}),
+              m_now(std::move(now)) {
+          m_last_report=m_last_poll=m_now();
+          m_hooks={this,&PrepareThunk,&BeginThunk,&EndThunk,&PollThunk};
+          std::printf("occlusion51: observation only; guest counters unchanged; precise queries ON; natural rendering scopes\n");
+         }
+         const CommandBuffer::OcclusionScopeHooks* Hooks()const{return &m_hooks;}
+         void Dump(uint64_t address,uint32_t control){
+          (void)address;
+          ++m_dumps;
+          if(m_controls.contains(control) || m_controls.size()<64)++m_controls[control];
+          // Do not split rendering at a dump: restarting a clear attachment could change
+          // its contents. These samples cover natural scopes, NOT exact guest dump intervals.
+          Poll();
+         }
+         void Predicate(uint32_t op){if(op==1)++m_zpass_predicates;else if(op==3)++m_boolean_predicates;}
+         void Poll(){
+          const auto now=m_now();
+          // This diagnostic does not publish guest results: 1 ms batching is sufficient.
+          // Avoid reading every pending query again at every render-scope transition.
+          if(now-m_last_poll<std::chrono::milliseconds(1))return;
+          m_last_poll=now;
+          if(!m_error){
+           auto& master=m_scheduler.GetMasterSemaphore();master.Refresh();
+           const auto result=m_segments.Collect(master.KnownGpuTick());
+           if(result!=VK_SUCCESS){m_error=true;std::printf("occlusion51: read error=%d; observation stopped\n",int(result));}
+          }
+          if(now-m_last_report>=std::chrono::seconds(5))Report();
+         }
+         void Report(){
+          std::printf("occlusion51-stats: dumps=%" PRIu64 " resolved-scopes=%" PRIu64
+                      " pending=%zu issued-scopes=%" PRIu64 " zero-sample-scopes=%" PRIu64 " samples=%" PRIu64
+                      " predicate-zpass=%" PRIu64 " predicate-bool=%" PRIu64
+                      " incomplete=%u error=%u\n",
+                      m_dumps,m_resolved_segments,m_segments.Pending(),m_counted_segments,m_zero_segments,m_samples,
+                      m_zpass_predicates,m_boolean_predicates,
+                      m_segments.CompleteCounting()?0u:1u,m_error?1u:0u);
+          for(const auto& [control,count]:m_controls)
+           std::printf("occlusion51-control: raw=0x%08" PRIx32 " dumps=%" PRIu64 "\n",control,count);
+          std::fflush(stdout);m_last_report=m_now();
+         }
+         uint64_t ResolvedSegments()const{return m_resolved_segments;}
+        private:
+         using Pool=KytyOcclusionExperiment::VulkanPool;
+         using Segments=KytyOcclusionExperiment::Segments;
+         static Pool::Dispatch Dispatch(GraphicContext& graphics){
+          return {
+           reinterpret_cast<PFN_vkCreateQueryPool>(graphics.device.getProcAddr("vkCreateQueryPool")),
+           reinterpret_cast<PFN_vkDestroyQueryPool>(graphics.device.getProcAddr("vkDestroyQueryPool")),
+           reinterpret_cast<PFN_vkCmdResetQueryPool>(graphics.device.getProcAddr("vkCmdResetQueryPool")),
+           reinterpret_cast<PFN_vkCmdBeginQuery>(graphics.device.getProcAddr("vkCmdBeginQuery")),
+           reinterpret_cast<PFN_vkCmdEndQuery>(graphics.device.getProcAddr("vkCmdEndQuery")),
+           reinterpret_cast<PFN_vkGetQueryPoolResults>(graphics.device.getProcAddr("vkGetQueryPoolResults"))
+          };
+         }
+         static bool PrepareThunk(void* context,vk::CommandBuffer command){
+          auto& self=*static_cast<OcclusionProbe*>(context);self.Poll();
+          if(self.m_error)return false;
+          const bool prepared=self.m_segments.Prepare(static_cast<VkCommandBuffer>(command),self.m_scheduler.CurrentTick());
+          if(prepared)++self.m_counted_segments;
+          return prepared;
+         }
+         static void BeginThunk(void* context,vk::CommandBuffer command){static_cast<OcclusionProbe*>(context)->m_segments.Begin(static_cast<VkCommandBuffer>(command));}
+         static void EndThunk(void* context,vk::CommandBuffer command){static_cast<OcclusionProbe*>(context)->m_segments.Finish(static_cast<VkCommandBuffer>(command));}
+         static void PollThunk(void* context){static_cast<OcclusionProbe*>(context)->Poll();}
+         CommandScheduler& m_scheduler;
+         Pool m_pool;
+         Segments m_segments;
+         CommandBuffer::OcclusionScopeHooks m_hooks;
+         std::unordered_map<uint32_t,uint64_t> m_controls;
+         uint64_t m_dumps=0,m_resolved_segments=0,m_zero_segments=0,m_counted_segments=0,m_samples=0;
+         uint64_t m_zpass_predicates=0,m_boolean_predicates=0;
+         bool m_error=false;
+         Now m_now;
+         Clock::time_point m_last_report{},m_last_poll{};
+        };
+        }
+        """
+        files['experiments/occlusion/TimelineTests.cpp'] = r"""#include "Timeline.h"
+        #include <cassert>
+        #include <cstdio>
+        #include <random>
+        using KytyOcclusionExperiment::Timeline;
+        int main(){
+         Timeline t(2);auto zero=t.Capture(0x1000);assert(t.Poll(zero)==0);assert(t.Forget(zero));
+         auto a=*t.Issue(10);auto first=t.Capture(0x1000);auto b=*t.Issue(11);auto second=t.Capture(0x2000);
+         assert(!t.Poll(first));assert(!t.Poll(second));assert(!t.Issue(12));
+         assert(t.Resolve(b,8));assert(!t.Poll(second));assert(!t.Issue(12));
+         assert(t.Resolve(a,3));assert(t.Poll(first)==3);assert(t.Poll(second)==11);
+         assert(!t.Resolve(a,99));assert(!t.Issue(12)); // Availability alone must not reclaim slots.
+         t.CompletedTick(10);auto c=*t.Issue(12);assert(c.slot==a.slot && c.generation!=a.generation);
+         assert(!t.Resolve(a,99));auto replacement=t.Capture(0x1000);assert(!t.Poll(first));assert(!t.Poll(replacement));
+         assert(t.Resolve(c,0));assert(t.Poll(replacement)==11);assert(!t.Forget(first));assert(t.Forget(replacement));
+         // A missing early result must bound the pending queue even when later slots retire.
+         Timeline bounded(2);auto gap=*bounded.Issue(1);auto later=*bounded.Issue(2);
+         assert(bounded.Resolve(later,5));bounded.CompletedTick(2);assert(!bounded.Issue(3));
+         assert(bounded.Resolve(gap,2));assert(bounded.Pending()==0);assert(bounded.Issue(3));
+         // Completed count wraps independently of the guest ready bit.
+         Timeline wrap;auto w=*wrap.Issue(1);auto ws=wrap.Capture(1);assert(wrap.Resolve(w,Timeline::Mask));assert(wrap.Poll(ws)==Timeline::Mask);
+         auto w2=*wrap.Issue(2);auto ws2=wrap.Capture(2);assert(wrap.Resolve(w2,2));assert(wrap.Poll(ws2)==1);
+         // Random out-of-order completion must preserve every serial prefix snapshot.
+         std::mt19937 random(51);
+         for(unsigned round=0;round<200;++round){
+          Timeline timeline(64);std::vector<Timeline::Lease> leases;std::vector<Timeline::Snapshot> snapshots;
+          std::vector<uint64_t> prefix;
+          for(unsigned i=0;i<64;++i){leases.push_back(*timeline.Issue(100+i));snapshots.push_back(timeline.Capture(0x1000+i*8));auto samples=random()%100;prefix.push_back(samples);}
+          std::vector<unsigned> order;for(unsigned i=0;i<64;++i)order.push_back(i);
+          for(unsigned i=64;i>1;--i)std::swap(order[i-1],order[random()%i]);
+          std::vector<bool> ready(64);unsigned complete=0;
+          for(auto i:order){assert(timeline.Resolve(leases[i],prefix[i]));ready[i]=true;while(complete<64 && ready[complete])++complete;
+           uint64_t sum=0;for(unsigned j=0;j<64;++j){sum=(sum+prefix[j])&Timeline::Mask;auto result=timeline.Poll(snapshots[j]);assert(result.has_value()==(j<complete));if(result)assert(*result==sum);}
+          }
+          assert(timeline.Pending()==0);assert(!timeline.Issue(200));timeline.CompletedTick(200);assert(timeline.Issue(201));
+          assert(timeline.Slots()==64);
+         }
+         std::puts("Timeline: delayed/out-of-order results, zero counts, wrap, stale tokens, bounded slots and tick retirement passed");
+        }
+        """
+        files['experiments/occlusion/VulkanPoolTests.cpp'] = r"""#include "VulkanPool.h"
+        #include <cassert>
+        #include <cstdio>
+        using KytyOcclusionExperiment::VulkanPool;
+        static VkResult response=VK_NOT_READY;
+        static uint64_t availability=0,samples=0;
+        static unsigned creates=0,destroys=0,resets=0,begins=0,ends=0;
+        static VKAPI_ATTR VkResult VKAPI_CALL Create(VkDevice,const VkQueryPoolCreateInfo* info,const VkAllocationCallbacks*,VkQueryPool* pool){
+         assert(info->queryType==VK_QUERY_TYPE_OCCLUSION && info->queryCount==2);
+         ++creates;*pool=reinterpret_cast<VkQueryPool>(uintptr_t{1});return VK_SUCCESS;
+        }
+        static VKAPI_ATTR void VKAPI_CALL Destroy(VkDevice,VkQueryPool,const VkAllocationCallbacks*){++destroys;}
+        static VKAPI_ATTR void VKAPI_CALL Reset(VkCommandBuffer,VkQueryPool,uint32_t slot,uint32_t count){assert(slot==1 && count==1);++resets;}
+        static VKAPI_ATTR void VKAPI_CALL Begin(VkCommandBuffer,VkQueryPool,uint32_t slot,VkQueryControlFlags flags){assert(slot==1 && flags==VK_QUERY_CONTROL_PRECISE_BIT);++begins;}
+        static VKAPI_ATTR void VKAPI_CALL End(VkCommandBuffer,VkQueryPool,uint32_t slot){assert(slot==1);++ends;}
+        static VKAPI_ATTR VkResult VKAPI_CALL Results(VkDevice,VkQueryPool,uint32_t slot,uint32_t count,size_t size,void* data,VkDeviceSize stride,VkQueryResultFlags flags){
+         assert(slot==1 && count==1 && size==16 && stride==16);
+         assert(flags==(VK_QUERY_RESULT_64_BIT|VK_QUERY_RESULT_WITH_AVAILABILITY_BIT));
+         auto* words=static_cast<uint64_t*>(data);words[0]=samples;words[1]=availability;return response;
+        }
+        int main(){
+         const VulkanPool::Dispatch dispatch{Create,Destroy,Reset,Begin,End,Results};
+         bool rejected=false;try{VulkanPool pool(nullptr,dispatch,2,false);}catch(const std::invalid_argument&){rejected=true;}
+         assert(rejected && creates==0);
+         {
+          VulkanPool pool(nullptr,dispatch,2,true);
+          pool.Reset(nullptr,1);pool.Begin(nullptr,1);pool.End(nullptr,1);
+          assert(pool.Read(1).status==VulkanPool::Status::Pending);
+          response=VK_SUCCESS;assert(pool.Read(1).status==VulkanPool::Status::Pending);
+          availability=1;samples=0;auto zero=pool.Read(1);assert(zero.status==VulkanPool::Status::Available && zero.samples==0);
+          samples=123;assert(pool.Read(1).samples==123);
+          response=VK_ERROR_DEVICE_LOST;auto error=pool.Read(1);assert(error.status==VulkanPool::Status::Error && error.error==VK_ERROR_DEVICE_LOST && error.samples==0);
+          rejected=false;try{pool.Read(2);}catch(const std::out_of_range&){rejected=true;}assert(rejected);
+         }
+         assert(creates==1 && destroys==1 && resets==1 && begins==1 && ends==1);
+         std::puts("VulkanPool dispatch contract passed (mock dispatch, no GPU execution)");
+        }
+        """
+        files['experiments/occlusion/SegmentsTests.cpp'] = r"""#include "Segments.h"
+        #include <array>
+        #include <cassert>
+        #include <cstdio>
+        using namespace KytyOcclusionExperiment;
+        static bool rendering=false;
+        static std::array<bool,2> available{},active{};
+        static std::array<uint64_t,2> samples{};
+        static VkResult injected_error=VK_SUCCESS;
+        static VKAPI_ATTR VkResult VKAPI_CALL Create(VkDevice,const VkQueryPoolCreateInfo*,const VkAllocationCallbacks*,VkQueryPool* pool){*pool=reinterpret_cast<VkQueryPool>(uintptr_t{1});return VK_SUCCESS;}
+        static VKAPI_ATTR void VKAPI_CALL Destroy(VkDevice,VkQueryPool,const VkAllocationCallbacks*){assert(!active[0] && !active[1]);}
+        static VKAPI_ATTR void VKAPI_CALL Reset(VkCommandBuffer,VkQueryPool,uint32_t slot,uint32_t){assert(!rendering && !active[slot]);available[slot]=false;}
+        static VKAPI_ATTR void VKAPI_CALL Begin(VkCommandBuffer,VkQueryPool,uint32_t slot,VkQueryControlFlags){assert(rendering && !active[slot]);active[slot]=true;}
+        static VKAPI_ATTR void VKAPI_CALL End(VkCommandBuffer,VkQueryPool,uint32_t slot){assert(rendering && active[slot]);active[slot]=false;}
+        static VKAPI_ATTR VkResult VKAPI_CALL Results(VkDevice,VkQueryPool,uint32_t slot,uint32_t,size_t,void* output,VkDeviceSize,VkQueryResultFlags flags){
+         assert(!(flags&VK_QUERY_RESULT_WAIT_BIT));
+         auto* data=static_cast<uint64_t*>(output);data[0]=samples[slot];data[1]=available[slot];
+         return injected_error!=VK_SUCCESS?injected_error:(available[slot]?VK_SUCCESS:VK_NOT_READY);
+        }
+        int main(){
+         VulkanPool pool(nullptr,{Create,Destroy,Reset,Begin,End,Results},2,true);Segments segments(pool);
+         const auto command=reinterpret_cast<VkCommandBuffer>(uintptr_t{1});
+         const auto open=[] {assert(!rendering);rendering=true;};
+         assert(segments.Start(command,10,open));assert(segments.Active());
+         bool rejected=false;try{segments.Capture(0x1000);}catch(const std::logic_error&){rejected=true;}assert(rejected);
+         rejected=false;try{segments.Finish(nullptr);}catch(const std::logic_error&){rejected=true;}assert(rejected && segments.Active());
+         segments.Finish(command);rendering=false;auto first=segments.Capture(0x1000);
+         assert(segments.Start(command,11,open));segments.Finish(command);rendering=false;auto second=segments.Capture(0x2000);
+         assert(!segments.Start(command,12,open));assert(!rendering);
+         assert(!segments.CompleteCounting());
+         rejected=false;try{segments.Capture(0x9999);}catch(const std::logic_error&){rejected=true;}assert(rejected);
+         // Later completion cannot publish a cumulative count across an earlier hole.
+         samples[1]=9;available[1]=true;assert(segments.Collect(10)==VK_SUCCESS);assert(!segments.Poll(second));
+         assert(segments.Collect(11)==VK_SUCCESS);assert(!segments.Poll(second));
+         assert(!segments.Start(command,12,open));
+         samples[0]=4;available[0]=true;assert(segments.Collect(11)==VK_SUCCESS);
+         assert(segments.Poll(first)==4 && segments.Poll(second)==13);
+         assert(segments.Forget(first) && segments.Forget(second));
+         assert(!segments.Start(command,12,open)); // Missing counted work cannot be repaired by freeing slots.
+         // Slot reuse resets availability; a genuine zero is not confused with pending.
+         Segments fresh(pool); // All previous pool submissions have completed and resolved.
+         assert(fresh.Start(command,12,open));fresh.Finish(command);rendering=false;auto zero=fresh.Capture(0x3000);
+         assert(fresh.Collect(12)==VK_SUCCESS && !fresh.Poll(zero));
+         injected_error=VK_ERROR_DEVICE_LOST;assert(fresh.Collect(12)==VK_ERROR_DEVICE_LOST);assert(!fresh.Poll(zero));
+         injected_error=VK_SUCCESS;available[0]=true;samples[0]=0;
+         assert(fresh.Collect(12)==VK_SUCCESS && fresh.Poll(zero)==0);assert(fresh.Forget(zero));
+         std::puts("Segments: scope order, delayed/out-of-order availability, bounded reuse and errors passed (mock Vulkan)");
+        }
+        """
         root = Path("_occlusion51")
-        for name, source in json.loads(bundle).items():
+        for name, source in files.items():
             path = root/name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(source, encoding="utf-8", newline="\n")
