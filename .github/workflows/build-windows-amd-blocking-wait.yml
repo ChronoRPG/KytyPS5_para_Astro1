@@ -231,7 +231,6 @@ jobs:
                 }
             }
 
-            // A descendant can introduce a source absent from the current block.
             for (const uint32_t value:{0u,1u}) {
                 auto plan=MemoPlan(MemoPlanExtra::DynamicRead,true);
                 plan.control_flow[0].condition=plan.descriptor_sources[2].dwords[0];
@@ -289,6 +288,8 @@ jobs:
         cache: true
 
     - name: Build and test using pinned working workflow
+      env:
+        GH_TOKEN: ${{ github.token }}
       run: |
         $ErrorActionPreference = "Stop"
         & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
@@ -341,7 +342,22 @@ jobs:
                 continue
 
             script = Path(f"_build38_{index}.ps1")
-            script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
+            source = step["run"]
+
+            if step["name"] == "Install glslang":
+                api_call = '$release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers'
+                if source.count(api_call) != 1:
+                    raise RuntimeError("Unexpected glslang API call")
+                authenticated = '\n'.join([
+                    'if (-not $env:GH_TOKEN) { throw "GitHub Actions token missing" }',
+                    '$apiHeaders = $headers.Clone()',
+                    '$apiHeaders["Authorization"] = "Bearer $env:GH_TOKEN"',
+                    '$apiHeaders["X-GitHub-Api-Version"] = "2022-11-28"',
+                    api_call.replace('-Headers $headers', '-Headers $apiHeaders'),
+                ])
+                source = source.replace(api_call, authenticated)
+
+            script.write_text('$ErrorActionPreference = "Stop"\n' + source, encoding="utf-8")
             print("Running:", step["name"], flush=True)
 
             path_file = Path(os.environ["GITHUB_PATH"])
