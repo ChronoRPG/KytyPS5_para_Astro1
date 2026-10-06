@@ -1,6 +1,6 @@
-name: Windows AMD - Diagnostico 39 - Fases de dos shaders
+name: Windows AMD - Diagnostico 40 - Coste de lecturas
 
-'on':
+on:
   workflow_dispatch:
 
 permissions:
@@ -8,419 +8,481 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - Diagnostico 39
+    name: Windows x64 - Diagnostico 40
     runs-on: windows-2022
 
     env:
-      KYTY_FLAGS_39: /clang:-ffp-contract=off
-      KYTY_PROFILE_39: Generica
+      KYTY_FLAGS_40: /clang:-ffp-contract=off
+      KYTY_PROFILE_40: Generica
 
     defaults:
       run:
         shell: pwsh
 
     steps:
-    - name: Checkout fixed AMD base
-      uses: actions/checkout@v4
-      with:
-        ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
-        submodules: recursive
-        fetch-depth: 1
+      - name: Checkout fixed AMD base
+        uses: actions/checkout@v4
+        with:
+          ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+          submodules: recursive
+          fetch-depth: 1
 
-    - name: Checkout pinned working diagnostic 20
-      uses: actions/checkout@v4
-      with:
-        ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
-        path: _patch_source
-        sparse-checkout: |
-          patches
-          .github/workflows
-        fetch-depth: 1
-        submodules: false
+      - name: Checkout pinned working diagnostic 20
+        uses: actions/checkout@v4
+        with:
+          ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+          path: _patch_source
+          sparse-checkout: |
+            patches
+            .github/workflows
+          fetch-depth: 1
+          submodules: false
 
-    - name: Setup fixed Python
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.12'
+      - name: Setup fixed Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-    - name: Pin Python executable and install YAML parser
-      run: |
-        $ErrorActionPreference = "Stop"
-        $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
-        if (-not $pythonExe) { throw "Python executable missing" }
-        "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-        & $pythonExe -m pip install PyYAML==6.0.2
-        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
-        & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
-        if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+      - name: Pin Python executable and install YAML parser
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+          if (-not $pythonExe) { throw "Python executable missing" }
+          "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $pythonExe -m pip install PyYAML==6.0.2
+          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+          & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
 
-    - name: Reproduce working AMD source and retained optimizations
-      run: |
-        $ErrorActionPreference = "Stop"
-        & $env:KYTY_PYTHON -m pip install PyYAML==6.0.2
-        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
-        @'
-        from pathlib import Path
-        import subprocess
-        import yaml
+      - name: Reproduce working AMD source and retained optimizations
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON -m pip install PyYAML==6.0.2
+          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+          @'
+          from pathlib import Path
+          import subprocess
+          import yaml
+          baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
+          steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+          started = False
+          finished = False
+          for index, step in enumerate(steps):
+              if step.get("name") == "Setup MSVC environment":
+                  finished = True
+                  break
+              if step.get("name") == "Verify AMD base":
+                  started = True
+              if not started:
+                  continue
+              if "uses" in step or "run" not in step:
+                  raise RuntimeError("Unexpected baseline preparation step")
+              script = Path(f"_prepare40_{index}.ps1")
+              script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
+              print("Preparing:", step["name"], flush=True)
+              subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+          if not started or not finished:
+              raise RuntimeError("Baseline preparation boundaries missing")
+          '@ | & $env:KYTY_PYTHON -
+          if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-        baseline = Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
-        steps = yaml.safe_load(baseline.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
-        started = False
-        finished = False
+      - name: Add sampled original-reader timings
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
 
-        for index, step in enumerate(steps):
-            if step.get("name") == "Setup MSVC environment":
-                finished = True
-                break
-            if step.get("name") == "Verify AMD base":
-                started = True
-            if not started:
-                continue
-            if "uses" in step or "run" not in step:
-                raise RuntimeError("Unexpected baseline preparation step")
+          def replace(path,old,new):
+              p=Path(path);s=p.read_text(encoding='utf-8')
+              if s.count(old)!=1:
+                  raise RuntimeError('Unexpected phase 40 boundary: '+path)
+              p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
 
-            script = Path(f"_prepare39_{index}.ps1")
-            script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
-            print("Preparing:", step["name"], flush=True)
-            subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+          Path('src/graphics/shader/recompiler/ir/passes/ResourcePhases40.h').write_text(
+              '#pragma once\nnamespace Libs::Graphics::ShaderRecompiler::IR { inline thread_local bool t_phases40=false; }\n',
+              encoding='utf-8'
+          )
 
-        if not started or not finished:
-            raise RuntimeError("Baseline preparation boundaries missing")
-        '@ | & $env:KYTY_PYTHON -
-        if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
+          p=Path('src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp')
+          p.write_text(
+              '#include "graphics/shader/recompiler/ir/passes/ResourcePhases40.h"\n#include <chrono>\n'+p.read_text(encoding='utf-8'),
+              encoding='utf-8'
+          )
 
-    - name: Add targeted resource phase timings
-      run: |
-        $ErrorActionPreference = "Stop"
-        @'
-        from pathlib import Path
+          helper=r'''
+          using PhaseClock40=std::chrono::steady_clock;
+          struct PhaseState40 {
+              bool active=false;
+              uint32_t phase=0;
+              std::array<double,6> us {};
+              std::array<std::array<double,3>,6> read_us {};
+              std::array<std::array<uint64_t,3>,6> reads {}, failed_reads {}, bytes {};
+              PhaseClock40::time_point last;
+          };
+          thread_local PhaseState40 phase40;
 
-        def replace(path,old,new):
-            p=Path(path)
-            s=p.read_text(encoding='utf-8')
-            if s.count(old)!=1:
-                raise RuntimeError('Unexpected phase 39 boundary: '+path)
-            p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
+          void MarkPhase40(uint32_t next) {
+              if (!phase40.active) return;
+              const auto now=PhaseClock40::now();
+              phase40.us[phase40.phase]+=std::chrono::duration<double,std::micro>(now-phase40.last).count();
+              phase40.phase=next;
+              phase40.last=now;
+          }
 
-        Path('src/graphics/shader/recompiler/ir/passes/ResourcePhases39.h').write_text(
-            '#pragma once\nnamespace Libs::Graphics::ShaderRecompiler::IR { inline thread_local bool t_phases39=false; }\n',
-            encoding='utf-8')
+          struct ReadProbe40 {
+              SrtRuntime source;
 
-        p=Path('src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp')
-        p.write_text('#include "graphics/shader/recompiler/ir/passes/ResourcePhases39.h"\n#include <chrono>\n'+p.read_text(encoding='utf-8'),encoding='utf-8')
+              static bool Read(void* data,uint64_t address,std::span<uint32_t> values) {
+                  return static_cast<ReadProbe40*>(data)->Call(0,address,values);
+              }
 
-        helper=r'''
-        using PhaseClock39=std::chrono::steady_clock;
+              static bool Strict(void* data,uint64_t address,std::span<uint32_t> values) {
+                  return static_cast<ReadProbe40*>(data)->Call(1,address,values);
+              }
 
-        struct PhaseState39 {
-            bool active=false;
-            uint32_t phase=0;
-            std::array<double,6> us {};
-            PhaseClock39::time_point last;
-        };
+              static bool Block(void* data,uint64_t address,std::span<uint32_t> values) {
+                  return static_cast<ReadProbe40*>(data)->Call(2,address,values);
+              }
 
-        thread_local PhaseState39 phase39;
+              bool Call(uint32_t kind,uint64_t address,std::span<uint32_t> values) {
+                  const auto reader=kind==0 ? source.read_memory : kind==1 ? source.read_specialization_memory : source.read_memory_block;
+                  auto* data=kind==1 ? SpecializationUserdata(source) : source.userdata;
+                  const auto phase=phase40.phase;
+                  const auto start=PhaseClock40::now();
+                  const bool ok=reader(data,address,values);
+                  const auto stop=PhaseClock40::now();
+                  phase40.read_us[phase][kind]+=std::chrono::duration<double,std::micro>(stop-start).count();
+                  ++phase40.reads[phase][kind];
+                  phase40.failed_reads[phase][kind]+=ok ? 0u : 1u;
+                  phase40.bytes[phase][kind]+=values.size_bytes();
+                  return ok;
+              }
 
-        void MarkPhase39(uint32_t next) {
-            if (!phase39.active) return;
-            const auto now=PhaseClock39::now();
-            phase39.us[phase39.phase]+=std::chrono::duration<double,std::micro>(now-phase39.last).count();
-            phase39.phase=next;
-            phase39.last=now;
-        }
+              SrtRuntime Runtime() {
+                  auto r=source;
+                  if (source.read_memory!=nullptr) r.read_memory=Read;
+                  if (source.read_memory_block!=nullptr) r.read_memory_block=Block;
+                  r.userdata=this;
+                  if (source.read_specialization_memory!=nullptr) {
+                      r.read_specialization_memory=Strict;
+                      r.specialization_userdata=this;
+                  }
+                  return r;
+              }
+          };
 
-        bool BeginPhase39(const ResourcePlan& p) {
-            if (!t_phases39) return false;
-            const int target=p.shader_hash==0x3b809f9d156a95ddull ? 0 :
-                p.shader_hash==0xf112e0ba527945adull ? 1 : -1;
-            if (target<0) return false;
+          bool BeginPhase40(const ResourcePlan& p) {
+              if (!t_phases40) return false;
+              const int target=p.shader_hash==0x3b809f9d156a95ddull ? 0 : p.shader_hash==0xf112e0ba527945adull ? 1 : -1;
+              if (target<0) return false;
+              thread_local std::array<uint64_t,2> calls {};
+              thread_local std::array<uint32_t,2> slots {519u,519u};
+              const auto n=++calls[target];
+              if ((n&1023u)==0u) slots[target]=(slots[target]+487u)&1023u;
+              if ((n&1023u)!=(slots[target]&1023u)) return false;
+              phase40.us.fill(0);
+              phase40.read_us={};
+              phase40.reads={};
+              phase40.failed_reads={};
+              phase40.bytes={};
+              phase40.phase=0;
+              phase40.last=PhaseClock40::now();
+              phase40.active=true;
+              return true;
+          }
 
-            thread_local std::array<uint64_t,2> calls {};
-            thread_local std::array<uint32_t,2> slots {519u,519u};
-            const auto n=++calls[target];
-            if ((n&1023u)==0u) slots[target]=(slots[target]+487u)&1023u;
-            if ((n&1023u)!=(slots[target]&1023u)) return false;
+          void EndPhase40(const ResourcePlan& p,bool ok,bool hit) {
+              MarkPhase40(0);
+              phase40.active=false;
+              struct Row {
+                  uint64_t samples=0,failed=0;
+                  std::array<double,6> us {};
+                  std::array<std::array<double,3>,6> read_us {};
+                  std::array<std::array<uint64_t,3>,6> reads {}, failed_reads {}, bytes {};
+              };
+              static std::array<Row,4> rows;
+              const uint32_t target=p.shader_hash==0x3b809f9d156a95ddull ? 0u : 1u;
+              auto& r=rows[target*2u+(hit ? 1u : 0u)];
+              ++r.samples;
+              r.failed+=ok ? 0u : 1u;
+              for (size_t i=0;i<6u;++i) r.us[i]+=phase40.us[i];
+              for (size_t i=0;i<6u;++i) for (size_t k=0;k<3u;++k) {
+                  r.read_us[i][k]+=phase40.read_us[i][k];
+                  r.reads[i][k]+=phase40.reads[i][k];
+                  r.failed_reads[i][k]+=phase40.failed_reads[i][k];
+                  r.bytes[i][k]+=phase40.bytes[i][k];
+              }
+              if (r.samples!=1u && r.samples%64u!=0u) return;
+              const double n=static_cast<double>(r.samples);
+              double total=0;
+              for (const auto v:r.us) total+=v;
+              std::printf("phase40: shader=%016llx memo-hit=%u samples=%llu failed=%llu total-us=%.3f setup-us=%.3f activity-us=%.3f flat-us=%.3f memo-us=%.3f descriptors-us=%.3f specialization-us=%.3f\n",
+                  static_cast<unsigned long long>(p.shader_hash),hit ? 1u : 0u,
+                  static_cast<unsigned long long>(r.samples),static_cast<unsigned long long>(r.failed),
+                  total/n,r.us[0]/n,r.us[1]/n,r.us[2]/n,r.us[3]/n,r.us[4]/n,r.us[5]/n);
+              constexpr std::array phases {"setup","activity","flat","memo","descriptors","specialization"};
+              constexpr std::array kinds {"ordinary","strict","ordinary-block"};
+              for (size_t i=0;i<6u;++i) for (size_t k=0;k<3u;++k) {
+                  if (r.reads[i][k]==0u) continue;
+                  std::printf("read40: shader=%016llx memo-hit=%u samples=%llu phase=%s kind=%s calls-per-sample=%.3f callback-us=%.3f requested-bytes-per-sample=%.1f failed-calls=%llu\n",
+                      static_cast<unsigned long long>(p.shader_hash),hit ? 1u : 0u,
+                      static_cast<unsigned long long>(r.samples),phases[i],kinds[k],
+                      static_cast<double>(r.reads[i][k])/n,r.read_us[i][k]/n,
+                      static_cast<double>(r.bytes[i][k])/n,static_cast<unsigned long long>(r.failed_reads[i][k]));
+              }
+              std::fflush(stdout);
+          }
+          '''
 
-            phase39.us.fill(0);
-            phase39.phase=0;
-            phase39.last=PhaseClock39::now();
-            phase39.active=true;
-            return true;
-        }
+          replace(str(p),'constexpr uint64_t AddressMask',helper+'\nconstexpr uint64_t AddressMask')
+          replace(str(p),'\tconst auto active = walker.FindActiveSources();',
+              '\tMarkPhase40(1);\n\tconst auto active = walker.FindActiveSources();\n\tMarkPhase40(2);')
+          replace(str(p),'\tsnapshot.uniform_fill = {};',
+              '\tMarkPhase40(3);\n\tsnapshot.uniform_fill = {};')
+          replace(str(p),'\t\t\t\tmemo->reused = true;\n\t\t\t\treturn true;',
+              '\t\t\t\tmemo->reused = true;\n\t\t\t\tMarkPhase40(0);\n\t\t\t\treturn true;')
+          replace(str(p),'\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {',
+              '\tMarkPhase40(4);\n\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {')
+          replace(str(p),'\tif (!BuildResourceSpecialization(program, snapshot, specialization)) {',
+              '\tMarkPhase40(5);\n\tif (!BuildResourceSpecialization(program, snapshot, specialization)) {')
+          replace(str(p),'\t\t\tmemo->valid = true;\n\t\t}\n\t}\n\treturn true;',
+              '\t\t\tmemo->valid = true;\n\t\t}\n\t}\n\tMarkPhase40(0);\n\treturn true;')
 
-        void EndPhase39(const ResourcePlan& p,bool ok,bool hit) {
-            MarkPhase39(0);
-            phase39.active=false;
+          replace(str(p),'\tconst bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);',r'''
+              const bool sampled40=BeginPhase40(program);
+              bool result;
+              if (sampled40) {
+                  ReadProbe40 probe40 {runtime};
+                  const auto measured40=probe40.Runtime();
+                  result=MaterializeCompiled(program,measured40,snapshot,specialization,memo);
+                  EndPhase40(program,result,memo!=nullptr && memo->reused);
+              } else {
+                  result=MaterializeCompiled(program,runtime,snapshot,specialization,memo);
+              }''')
 
-            struct Row {
-                uint64_t samples=0,failed=0;
-                std::array<double,6> us {};
-            };
-            static std::array<Row,4> rows;
-            const uint32_t target=p.shader_hash==0x3b809f9d156a95ddull ? 0u : 1u;
-            auto& r=rows[target*2u+(hit ? 1u : 0u)];
-            ++r.samples;
-            r.failed+=ok ? 0u : 1u;
-            for (size_t i=0;i<6u;++i) r.us[i]+=phase39.us[i];
+          p=Path('src/graphics/guest_gpu/graphicsRun.cpp')
+          p.write_text(
+              '#include "graphics/shader/recompiler/ir/passes/ResourcePhases40.h"\n'+p.read_text(encoding='utf-8'),
+              encoding='utf-8'
+          )
+          replace(str(p),'\tg_gpu_thread = true;',r'''
+              g_gpu_thread = true;
+              const auto* v40=std::getenv("KYTY_PHASES_40");
+              ShaderRecompiler::IR::t_phases40=v40!=nullptr && v40[0]=='1' && v40[1]=='\0';
+              if (ShaderRecompiler::IR::t_phases40) {
+                  std::printf("phase40: diagnostic active; sampled original calls; reader timings active\n");
+                  std::fflush(stdout);
+              }''')
 
-            if (r.samples!=1u && r.samples%64u!=0u) return;
-            const double n=static_cast<double>(r.samples);
-            double total=0;
-            for (const auto v:r.us) total+=v;
+          p=Path('tests/ResourceMaterializationTests.cpp')
+          p.write_text(
+              '#include "graphics/shader/recompiler/ir/passes/ResourcePhases40.h"\n'+p.read_text(encoding='utf-8'),
+              encoding='utf-8'
+          )
+          replace(str(p),'  std::puts("ResourceMaterializationTests: all cases passed");',r'''
+            {
+              using namespace Libs::Graphics::ShaderRecompiler::IR;
+              auto plan=MemoPlan(MemoPlanExtra::None,true);
+              MemoFixture fixture;
+              t_phases40=true;
+              for (const uint64_t hash:{0x3b809f9d156a95ddull,0xf112e0ba527945adull}) {
+                plan.shader_hash=hash;
+                for (uint32_t i=0;i<131072u;++i) {
+                  if (i%1024u==0u) fixture.memory.words[0]^=0x100u;
+                  if ((i&1u)==0u) fixture.memo.valid=false;
+                  Check(fixture.Refresh(plan),"sampled original-reader refresh failed");
+                }
+              }
+              t_phases40=false;
+            }
+            std::puts("ResourceMaterializationTests: all cases passed");''')
 
-            std::printf("phase39: shader=%016llx memo-hit=%u samples=%llu failed=%llu total-us=%.3f setup-us=%.3f activity-us=%.3f flat-us=%.3f memo-us=%.3f descriptors-us=%.3f specialization-us=%.3f\n",
-                static_cast<unsigned long long>(p.shader_hash),hit ? 1u : 0u,
-                static_cast<unsigned long long>(r.samples),
-                static_cast<unsigned long long>(r.failed),
-                total/n,r.us[0]/n,r.us[1]/n,r.us[2]/n,
-                r.us[3]/n,r.us[4]/n,r.us[5]/n);
-            std::fflush(stdout);
-        }
-        '''
+          print('Diagnostic 40 installed: targeted phase and original-reader timings only',flush=True)
+          '@ | & $env:KYTY_PYTHON -
+          if ($LASTEXITCODE -ne 0) { throw "Diagnostic 40 adaptation failed" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
-        replace(str(p),'constexpr uint64_t AddressMask',helper+'\nconstexpr uint64_t AddressMask')
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
 
-        replace(str(p),
-            '\tconst auto active = walker.FindActiveSources();',
-            '\tMarkPhase39(1);\n\tconst auto active = walker.FindActiveSources();\n\tMarkPhase39(2);')
+      - name: Setup Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: 18
+          platform: x64
+          cygwin: 0
 
-        replace(str(p),
-            '\tsnapshot.uniform_fill = {};',
-            '\tMarkPhase39(3);\n\tsnapshot.uniform_fill = {};')
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
 
-        replace(str(p),
-            '\t\t\t\tmemo->reused = true;\n\t\t\t\treturn true;',
-            '\t\t\t\tmemo->reused = true;\n\t\t\t\tMarkPhase39(0);\n\t\t\t\treturn true;')
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.8.3
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qt5compat
+          cache: true
 
-        replace(str(p),
-            '\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {',
-            '\tMarkPhase39(4);\n\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {')
+      - name: Build and test using pinned working workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Pinned Python YAML verification failed" }
+          @'
+          from pathlib import Path
+          import subprocess
+          import os
+          import yaml
+          steps = yaml.safe_load(Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml").read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+          started = False
+          finished = False
+          for index, step in enumerate(steps):
+              if step.get("name") == "Package launchers and symbols":
+                  finished = True
+                  break
+              if step.get("name") == "Install glslang":
+                  started = True
+              if not started:
+                  continue
+              if "uses" in step or "run" not in step:
+                  raise RuntimeError("Unexpected build step")
+              if step["name"] == "Configure CMake":
+                  flags = os.environ["KYTY_FLAGS_40"]
+                  args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
+                          "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang-cl",
+                          "-DCMAKE_CXX_COMPILER=clang-cl",
+                          "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
+                          "-DCMAKE_C_FLAGS_INIT=" + flags, "-DCMAKE_CXX_FLAGS_INIT=" + flags,
+                          "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
+                  print("Configuring profile:", os.environ["KYTY_PROFILE_40"], flags, flush=True)
+                  subprocess.run(args, check=True)
+                  cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
+                  cpp_flags = next((line.split("=", 1)[1] for line in cache.splitlines()
+                                    if line.startswith("CMAKE_CXX_FLAGS:STRING=")), None)
+                  if cpp_flags is None or "/ehsc" not in cpp_flags.lower():
+                      raise RuntimeError("CMake lost /EHsc: C++ exceptions must remain enabled")
+                  if not all(option in cpp_flags for option in flags.split()):
+                      raise RuntimeError("Selected CPU flags are missing from CMAKE_CXX_FLAGS")
+                  print("Verified C++ flags:", cpp_flags, flush=True)
+                  continue
+              script = Path(f"_build40_{index}.ps1")
+              source = step["run"]
+              if step["name"] == "Install glslang":
+                  api_call = '$release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers'
+                  if source.count(api_call) != 1:
+                      raise RuntimeError("Unexpected glslang API call")
+                  authenticated = '\n'.join([
+                      'if (-not $env:GH_TOKEN) { throw "GitHub Actions token missing" }',
+                      '$apiHeaders = $headers.Clone()',
+                      '$apiHeaders["Authorization"] = "Bearer $env:GH_TOKEN"',
+                      '$apiHeaders["X-GitHub-Api-Version"] = "2022-11-28"',
+                      api_call.replace('-Headers $headers', '-Headers $apiHeaders'),
+                  ])
+                  source = source.replace(api_call, authenticated)
+              script.write_text('$ErrorActionPreference = "Stop"\n' + source, encoding="utf-8")
+              print("Running:", step["name"], flush=True)
+              path_file = Path(os.environ["GITHUB_PATH"])
+              entries = path_file.read_text(encoding="utf-8-sig").splitlines() if path_file.exists() else []
+              os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
+              subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+          if not started or not finished:
+              raise RuntimeError("Build boundaries missing")
+          '@ | & $env:KYTY_PYTHON -
+          if ($LASTEXITCODE -ne 0) { throw "Build or tests failed" }
 
-        replace(str(p),
-            '\tif (!BuildResourceSpecialization(program, snapshot, specialization)) {',
-            '\tMarkPhase39(5);\n\tif (!BuildResourceSpecialization(program, snapshot, specialization)) {')
+      - name: Package launchers and symbols
+        run: |
+          $ErrorActionPreference = "Stop"
+          $install = "_Build/windows/install"
+          if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
+          foreach ($mode in @(0, 1)) {
+              $name = if ($mode -eq 1) { "Diagnostico-40.cmd" } else { "Comparacion-40.cmd" }
+              @(
+                  '@echo off',
+                  'setlocal',
+                  'cd /d "%~dp0"',
+                  "set KYTY_PHASES_40=$mode",
+                  'set KYTY_REDUNDANT_SOURCES_38=0',
+                  'set KYTY_RESOURCE_COSTS_37=0',
+                  'set KYTY_FROZEN_DIAGNOSTIC_36=0',
+                  'set KYTY_DESCRIPTOR_MEMO_35=0',
+                  'set KYTY_DESCRIPTOR_STATS_35=0',
+                  'set KYTY_DESCRIPTOR_RECIPES_34=0',
+                  'set KYTY_TRACKING_PAUSE=',
+                  'set KYTY_BDA_SLICE_FILTER=',
+                  'set KYTY_TRACKING_DIAGNOSTICS=',
+                  'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
+                  'set KYTY_TRACKING_BLOCKING_WAIT=1',
+                  'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
+                  'set KYTY_DIRECT_COLOR_METADATA=1',
+                  'set KYTY_RECORD_THREAD=0',
+                  'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
+                  'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
+                  'set KYTY_DEBUG_SHADER_CPU=0',
+                  'set KYTY_RESOURCE_BLOCKS_32=0',
+                  'set KYTY_HOST_PRIORITY_26=0',
+                  'set KYTY_REFRESH_DIAGNOSTIC_27=0',
+                  'set KYTY_SRT_ALIASES_32=0',
+                  'set KYTY_DIRECT_FLAT_31=0',
+                  'set KYTY_DIRECT_INPUTS_29=0',
+                  'set KYTY_ACTIVE_MASK_VIEW_28=0',
+                  'set KYTY_DEBUG_QUEUES=',
+                  'set KYTY_SRT_STATS=',
+                  'set KYTY_DEBUG_SRT_RUNS=',
+                  'set KYTY_VERIFY_SRT=',
+                  'set KYTY_VERIFY_SPEC=',
+                  'set KYTY_VERIFY_SPEC_READS=',
+                  'set KYTY_SPECULATE_DRAWS=0',
+                  'set KYTY_LIGHT_DRAIN_STATS=1',
+                  'set KYTY_DEBUG_SAMPLE_GPU=',
+                  'set KYTY_DEBUG_DUMP_THREADS=',
+                  'set KYTY_DEBUG_DRAW_PHASES=',
+                  'set KYTY_DEBUG_DRAW_STATS=',
+                  'set KYTY_DEBUG_SPEC_STATS=',
+                  'set KYTY_DEBUG_STREAM_STATS=',
+                  'set KYTY_DEBUG_UPLOADS=',
+                  'set KYTY_GPU_ZONES=',
+                  '"%~dp0launcher.exe" %*'
+              ) | Set-Content "$install/$name" -Encoding ascii
+          }
+          $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
+          if (-not $maps) { throw "Emulator map missing" }
+          foreach ($map in $maps) { Copy-Item $map.FullName $install -Force }
+          $pdb = "_Build/windows/kyty_emulator.pdb"
+          if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
+          Copy-Item $pdb $install -Force
+          @(
+              "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
+              "Diagnostico-40.cmd: samples original phase and reader timings.",
+              "Comparacion-40.cmd: same executable, diagnostic OFF.",
+              "Diagnostic only; timings include instrumentation overhead.",
+              "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
+              "Copy your working _Patches and select THIS interpreter.",
+              "Warm up, then remain in the fixed heavy view for 60 seconds.",
+              "Copy console including phase40 and read40 lines.",
+              "Close emulator and launcher completely before changing mode."
+          ) | Set-Content "$install/DIAGNOSTICO-40.txt" -Encoding ascii
 
-        replace(str(p),
-            '\t\t\tmemo->valid = true;\n\t\t}\n\t}\n\treturn true;',
-            '\t\t\tmemo->valid = true;\n\t\t}\n\t}\n\tMarkPhase39(0);\n\treturn true;')
+      - name: Create Windows ZIP
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "KytyPS5-Diagnostico-40.zip"
+          Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+              throw "Packaging failed: missing or empty ZIP"
+          }
 
-        replace(str(p),
-            '\tconst bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);',
-            r'''    const bool sampled39=BeginPhase39(program);
-            const bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);
-            if (sampled39) EndPhase39(program,result,memo!=nullptr && memo->reused);''')
-
-        p=Path('src/graphics/guest_gpu/graphicsRun.cpp')
-        p.write_text('#include "graphics/shader/recompiler/ir/passes/ResourcePhases39.h"\n'+p.read_text(encoding='utf-8'),encoding='utf-8')
-
-        replace(str(p),'\tg_gpu_thread = true;',r'''    g_gpu_thread = true;
-            const auto* v39=std::getenv("KYTY_PHASES_39");
-            ShaderRecompiler::IR::t_phases39=v39!=nullptr && v39[0]=='1' && v39[1]=='\0';
-            if (ShaderRecompiler::IR::t_phases39) {
-                std::printf("phase39: diagnostic active; targeted original calls; phases include their memory reads\n");
-                std::fflush(stdout);
-            }''')
-
-        print('Diagnostic 39 installed: targeted phase timings only',flush=True)
-        '@ | & $env:KYTY_PYTHON -
-        if ($LASTEXITCODE -ne 0) { throw "Diagnostic 39 adaptation failed" }
-        git diff --check
-        if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
-
-    - name: Setup MSVC environment
-      uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x64
-
-    - name: Setup Clang
-      uses: egor-tensin/setup-clang@v1
-      with:
-        version: 18
-        platform: x64
-        cygwin: 0
-
-    - name: Setup Ninja
-      uses: seanmiddleditch/gha-setup-ninja@v5
-
-    - name: Install Qt
-      uses: jurplel/install-qt-action@v4
-      with:
-        version: 6.8.3
-        host: windows
-        target: desktop
-        arch: win64_msvc2022_64
-        modules: qt5compat
-        cache: true
-
-    - name: Build and test using pinned working workflow
-      env:
-        GH_TOKEN: ${{ github.token }}
-      run: |
-        $ErrorActionPreference = "Stop"
-        & $env:KYTY_PYTHON -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
-        if ($LASTEXITCODE -ne 0) { throw "Pinned Python YAML verification failed" }
-        @'
-        from pathlib import Path
-        import subprocess
-        import os
-        import yaml
-
-        steps = yaml.safe_load(Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml").read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
-        started = False
-        finished = False
-
-        for index, step in enumerate(steps):
-            if step.get("name") == "Package launchers and symbols":
-                finished = True
-                break
-            if step.get("name") == "Install glslang":
-                started = True
-            if not started:
-                continue
-            if "uses" in step or "run" not in step:
-                raise RuntimeError("Unexpected build step")
-
-            if step["name"] == "Configure CMake":
-                flags = os.environ["KYTY_FLAGS_39"]
-                args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
-                        "-DCMAKE_BUILD_TYPE=Release",
-                        "-DCMAKE_C_COMPILER=clang-cl",
-                        "-DCMAKE_CXX_COMPILER=clang-cl",
-                        "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
-                        "-DCMAKE_C_FLAGS_INIT=" + flags,
-                        "-DCMAKE_CXX_FLAGS_INIT=" + flags,
-                        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
-
-                print("Configuring profile:", os.environ["KYTY_PROFILE_39"], flags, flush=True)
-                subprocess.run(args, check=True)
-                cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
-                cpp_flags = next((line.split("=", 1)[1] for line in cache.splitlines()
-                                  if line.startswith("CMAKE_CXX_FLAGS:STRING=")), None)
-                if cpp_flags is None or "/ehsc" not in cpp_flags.lower():
-                    raise RuntimeError("CMake lost /EHsc: C++ exceptions must remain enabled")
-                if not all(option in cpp_flags for option in flags.split()):
-                    raise RuntimeError("Selected CPU flags are missing from CMAKE_CXX_FLAGS")
-                print("Verified C++ flags:", cpp_flags, flush=True)
-                continue
-
-            script = Path(f"_build39_{index}.ps1")
-            source = step["run"]
-
-            if step["name"] == "Install glslang":
-                api_call = '$release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers'
-                if source.count(api_call) != 1:
-                    raise RuntimeError("Unexpected glslang API call")
-                authenticated = '\n'.join([
-                    'if (-not $env:GH_TOKEN) { throw "GitHub Actions token missing" }',
-                    '$apiHeaders = $headers.Clone()',
-                    '$apiHeaders["Authorization"] = "Bearer $env:GH_TOKEN"',
-                    '$apiHeaders["X-GitHub-Api-Version"] = "2022-11-28"',
-                    api_call.replace('-Headers $headers', '-Headers $apiHeaders'),
-                ])
-                source = source.replace(api_call, authenticated)
-
-            script.write_text('$ErrorActionPreference = "Stop"\n' + source, encoding="utf-8")
-            print("Running:", step["name"], flush=True)
-
-            path_file = Path(os.environ["GITHUB_PATH"])
-            entries = path_file.read_text(encoding="utf-8-sig").splitlines() if path_file.exists() else []
-            os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
-            subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
-
-        if not started or not finished:
-            raise RuntimeError("Build boundaries missing")
-        '@ | & $env:KYTY_PYTHON -
-        if ($LASTEXITCODE -ne 0) { throw "Build or tests failed" }
-
-    - name: Package launchers and symbols
-      run: |
-        $ErrorActionPreference = "Stop"
-        $install = "_Build/windows/install"
-        if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
-
-        foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Diagnostico-39.cmd" } else { "Comparacion-39.cmd" }
-            @(
-                '@echo off',
-                'setlocal',
-                'cd /d "%~dp0"',
-                "set KYTY_PHASES_39=$mode",
-                'set KYTY_REDUNDANT_SOURCES_38=0',
-                'set KYTY_RESOURCE_COSTS_37=0',
-                'set KYTY_FROZEN_DIAGNOSTIC_36=0',
-                'set KYTY_DESCRIPTOR_MEMO_35=0',
-                'set KYTY_DESCRIPTOR_STATS_35=0',
-                'set KYTY_DESCRIPTOR_RECIPES_34=0',
-                'set KYTY_TRACKING_PAUSE=',
-                'set KYTY_BDA_SLICE_FILTER=',
-                'set KYTY_TRACKING_DIAGNOSTICS=',
-                'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
-                'set KYTY_TRACKING_BLOCKING_WAIT=1',
-                'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
-                'set KYTY_DIRECT_COLOR_METADATA=1',
-                'set KYTY_RECORD_THREAD=0',
-                'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
-                'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
-                'set KYTY_DEBUG_SHADER_CPU=0',
-                'set KYTY_RESOURCE_BLOCKS_32=0',
-                'set KYTY_HOST_PRIORITY_26=0',
-                'set KYTY_REFRESH_DIAGNOSTIC_27=0',
-                'set KYTY_SRT_ALIASES_32=0',
-                'set KYTY_DIRECT_FLAT_31=0',
-                'set KYTY_DIRECT_INPUTS_29=0',
-                'set KYTY_ACTIVE_MASK_VIEW_28=0',
-                'set KYTY_DEBUG_QUEUES=',
-                'set KYTY_SRT_STATS=',
-                'set KYTY_DEBUG_SRT_RUNS=',
-                'set KYTY_VERIFY_SRT=',
-                'set KYTY_VERIFY_SPEC=',
-                'set KYTY_VERIFY_SPEC_READS=',
-                'set KYTY_SPECULATE_DRAWS=0',
-                'set KYTY_LIGHT_DRAIN_STATS=1',
-                'set KYTY_DEBUG_SAMPLE_GPU=',
-                'set KYTY_DEBUG_DUMP_THREADS=',
-                'set KYTY_DEBUG_DRAW_PHASES=',
-                'set KYTY_DEBUG_DRAW_STATS=',
-                'set KYTY_DEBUG_SPEC_STATS=',
-                'set KYTY_DEBUG_STREAM_STATS=',
-                'set KYTY_DEBUG_UPLOADS=',
-                'set KYTY_GPU_ZONES=',
-                '"%~dp0launcher.exe" %*'
-            ) | Set-Content "$install/$name" -Encoding ascii
-        }
-
-        $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
-        if (-not $maps) { throw "Emulator map missing" }
-        foreach ($map in $maps) { Copy-Item $map.FullName $install -Force }
-        $pdb = "_Build/windows/kyty_emulator.pdb"
-        if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
-        Copy-Item $pdb $install -Force
-
-        @(
-            "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Diagnostico-39.cmd: samples phases of the two target shaders.",
-            "Comparacion-39.cmd: diagnostic OFF.",
-            "Phase times include memory reads and instrumentation overhead.",
-            "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
-            "Copy your working _Patches and select THIS interpreter.",
-            "Warm up, then remain in the fixed heavy view for 60 seconds.",
-            "Copy console output including phase39 lines."
-        ) | Set-Content "$install/DIAGNOSTICO-39.txt" -Encoding ascii
-
-    - name: Create Windows ZIP
-      run: |
-        $ErrorActionPreference = "Stop"
-        $zip = "KytyPS5-Diagnostico-39.zip"
-        Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
-        if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
-            throw "Packaging failed: missing or empty ZIP"
-        }
-
-    - name: Upload KytyPS5
-      uses: actions/upload-artifact@v4
-      with:
-        name: KytyPS5-Diagnostico-39
-        path: KytyPS5-Diagnostico-39.zip
-        if-no-files-found: error
-        retention-days: 7
+      - name: Upload KytyPS5
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Diagnostico-40
+          path: KytyPS5-Diagnostico-40.zip
+          if-no-files-found: error
+          retention-days: 7
