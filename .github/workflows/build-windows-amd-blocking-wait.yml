@@ -1,4 +1,4 @@
-name: Windows AMD - Diagnostico 35 - Contadores en directo
+name: Windows AMD - Diagnostico 36 - Entradas independientes
 
 'on':
   workflow_dispatch:
@@ -8,11 +8,12 @@ permissions:
 
 jobs:
   build:
+    name: Windows x64 - Diagnostico 36
     runs-on: windows-2022
 
     env:
-      KYTY_FLAGS_35: /clang:-ffp-contract=off
-      KYTY_PROFILE_35: Generica
+      KYTY_FLAGS_36: /clang:-ffp-contract=off
+      KYTY_PROFILE_36: Generica
 
     defaults:
       run:
@@ -56,6 +57,8 @@ jobs:
     - name: Reproduce working AMD source and retained optimizations
       run: |
         $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON -m pip install PyYAML==6.0.2
+        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
         @'
         from pathlib import Path
         import subprocess
@@ -76,366 +79,309 @@ jobs:
                 continue
             if "uses" in step or "run" not in step:
                 raise RuntimeError("Unexpected baseline preparation step")
-
-            script = Path(f"_prepare35_{index}.ps1")
-            script.write_text(
-                '$ErrorActionPreference = "Stop"\n' + step["run"],
-                encoding="utf-8"
-            )
+            script = Path(f"_prepare36_{index}.ps1")
+            script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
             print("Preparing:", step["name"], flush=True)
-            subprocess.run(
-                ["pwsh", "-NoProfile", "-File", str(script.resolve())],
-                check=True
-            )
+            subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
 
         if not started or not finished:
             raise RuntimeError("Baseline preparation boundaries missing")
         '@ | & $env:KYTY_PYTHON -
         if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-    - name: Add descriptor set reuse and vertex push preference
+    - name: Add frozen-input diagnostic and isolation tests
       run: |
         $ErrorActionPreference = "Stop"
         @'
         from pathlib import Path
 
-        p = Path("src/graphics/host_gpu/renderer/pipeline/descriptorMemo35.h")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(r'''#pragma once
-        #include <cstdint>
-        #include <cstddef>
-        #include <span>
-        #include <unordered_map>
-        #include <vector>
+        Path('src/graphics/shader/recompiler/ir/passes/FrozenResourceInputs36.h').parent.mkdir(parents=True,exist_ok=True)
+        Path('src/graphics/shader/recompiler/ir/passes/FrozenResourceInputs36.h').write_text(r'''
+        #pragma once
+        #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
+        #include <algorithm>
+        #include <limits>
 
-        namespace Libs::Graphics {
-        template <typename Value> class DescriptorMemo35 {
+        namespace Libs::Graphics::ShaderRecompiler::IR {
+        inline thread_local bool t_frozen_probe36 = false;
+
+        // Conservative first subset. Eligibility does not imply a performance gain.
+        inline bool FrozenInputsEligible36(const ResourcePlan& plan) {
+          if (!plan.compiled || !plan.compiled->memoizable || !plan.srt_plan_complete ||
+              !plan.resource_tracking_complete || plan.has_address_writes ||
+              plan.uniform_fill.fill.words != 0u) return false;
+
+          if (std::ranges::any_of(plan.clean_flat_slots, [](auto value){return value != 0u;}) ||
+              std::ranges::any_of(plan.info.buffers, &BufferResource::written) ||
+              std::ranges::any_of(plan.info.images, &ImageResource::written) ||
+              std::ranges::any_of(plan.descriptor_sources, [](const auto& source){return source.indirect_image.has_value();}))
+            return false;
+
+          for (const auto& node : plan.compiled->nodes) {
+            if (node.op == ResourceNode::Op::Select || node.op == ResourceNode::Op::ReadFirstLane ||
+                (node.flags & ResourceNode::CleanSlot) != 0u) return false;
+          }
+
+          for (size_t i=0; i<plan.compiled->conditions.size(); ++i) {
+            if (plan.compiled->conditions[i] != ResourceNode::NoNode &&
+                (i >= plan.compiled->direct_conditions.size() || plan.compiled->direct_conditions[i] == 0u))
+              return false;
+          }
+          return true;
+        }
+
+        class FrozenResourceInputs36 {
          public:
-          const Value* Find(uint64_t layout, uint64_t tick, uint64_t epoch,
-                            std::span<const uint64_t> key) {
-            Begin(tick, epoch);
-            const auto it = entries.find(layout);
-            if (it == entries.end() || it->second.key.size() != key.size()) return nullptr;
-            for (std::size_t i = 0; i < key.size(); ++i)
-              if (it->second.key[i] != key[i]) return nullptr;
-            return &it->second.value;
+          bool Capture(const ResourcePlan& plan, const SrtRuntime& source) {
+            words.clear(); flat.clear(); valid=false;
+            if (!FrozenInputsEligible36(plan) || source.read_memory == nullptr) return false;
+            user_data.assign(source.user_data.begin(),source.user_data.end());
+            shader_base=source.shader_base;
+
+            CaptureContext context {source,this};
+            auto runtime=source;
+            runtime.user_data=user_data;
+            runtime.userdata=&context;
+            runtime.read_memory=CaptureRead;
+            runtime.read_memory_block=nullptr;
+            runtime.read_specialization_memory=nullptr;
+            runtime.specialization_block_reads=false;
+
+            SrtEvaluator evaluator(plan,*plan.compiled,runtime);
+            if (!evaluator.RefreshFlatBuffer(flat)) return false;
+
+            std::ranges::sort(words,{},&Word::address);
+            size_t kept=0;
+            for (const auto& word : words) {
+              if (kept != 0u && words[kept-1].address == word.address) {
+                if (words[kept-1].value != word.value) return false;
+              } else {
+                words[kept++]=word;
+              }
+            }
+            words.resize(kept); valid=true;
+            return true;
           }
 
-          void Store(uint64_t layout, uint64_t tick, uint64_t epoch,
-                     std::span<const uint64_t> key, Value value) {
-            Begin(tick, epoch);
-            if (entries.size() >= 64u && !entries.contains(layout)) entries.clear();
-            auto& entry = entries[layout];
-            entry.key.assign(key.begin(), key.end());
-            entry.value = value;
+          SrtRuntime Runtime() const {
+            return {.user_data=user_data,.shader_base=shader_base,.read_memory=Read,
+              .userdata=const_cast<FrozenResourceInputs36*>(this),.read_specialization_memory=Read};
           }
+
+          bool Valid() const {return valid;}
+          size_t WordCount() const {return words.size();}
 
          private:
-          struct Entry {
-            std::vector<uint64_t> key;
-            Value value {};
-          };
+          struct Word {uint64_t address; uint32_t value;};
+          struct CaptureContext {SrtRuntime source; FrozenResourceInputs36* packet;};
 
-          void Begin(uint64_t tick, uint64_t epoch) {
-            if (tick != last_tick || epoch != last_epoch) {
-              entries.clear();
-              last_tick = tick;
-              last_epoch = epoch;
-            }
+          static bool CaptureRead(void* opaque,uint64_t address,std::span<uint32_t> values) {
+            auto& ctx=*static_cast<CaptureContext*>(opaque);
+            if (values.size()>65536u || ctx.packet->words.size()>65536u-values.size() ||
+                values.size_bytes()>std::numeric_limits<uint64_t>::max()-address) return false;
+            if (!ctx.source.read_memory(ctx.source.userdata,address,values)) return false;
+            for (size_t i=0;i<values.size();++i) ctx.packet->words.push_back({address+i*4u,values[i]});
+            return true;
           }
 
-          uint64_t last_tick = UINT64_MAX;
-          uint64_t last_epoch = UINT64_MAX;
-          std::unordered_map<uint64_t, Entry> entries;
+          static bool Read(void* opaque,uint64_t address,std::span<uint32_t> values) {
+            const auto& packet=*static_cast<const FrozenResourceInputs36*>(opaque);
+            if (!packet.valid || values.size_bytes()>std::numeric_limits<uint64_t>::max()-address) return false;
+            for (size_t i=0;i<values.size();++i) {
+              const auto at=address+i*4u;
+              const auto found=std::ranges::lower_bound(packet.words,at,{},&Word::address);
+              if (found==packet.words.end() || found->address!=at) return false;
+              values[i]=found->value;
+            }
+            return true;
+          }
+
+          std::vector<Word> words;
+          std::vector<uint32_t> user_data,flat;
+          uint64_t shader_base=0;
+          bool valid=false;
         };
         }
-        ''', encoding="utf-8", newline="\n")
+        ''',encoding="utf-8",newline="\n")
 
-        p = Path("tests/DescriptorMemoTests35.cpp")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(r'''#include "graphics/host_gpu/renderer/pipeline/descriptorMemo35.h"
-        #include <array>
-        #include <cstdio>
-        #include <cstdlib>
+        Path('patches/probe36.txt').parent.mkdir(parents=True,exist_ok=True)
+        Path('patches/probe36.txt').write_text(r'''
+        namespace {
+        struct FrozenProbeStats36 {
+            uint64_t samples=0, eligible=0, captured=0, failures=0;
+            double serial_us=0, capture_us=0, replay_us=0;
+        };
 
-        using Libs::Graphics::DescriptorMemo35;
+        void ProbeFrozenInputs36(const ResourcePlan& plan, const SrtRuntime& runtime, double serial_us) {
+            static FrozenProbeStats36 stats;
+            static FrozenResourceInputs36 packet;
+            static ResourceSnapshot replay,reference;
+            static ResourceSpecialization replay_spec,reference_spec;
 
-        static void Check(bool ok) {
-          if (!ok) std::abort();
-        }
+            ++stats.samples;
+            if (FrozenInputsEligible36(plan)) {
+                ++stats.eligible;
+                const auto begin=std::chrono::steady_clock::now();
+                const bool captured=packet.Capture(plan,runtime);
+                const auto captured_at=std::chrono::steady_clock::now();
 
-        int main() {
-          DescriptorMemo35<uint64_t> memo;
-          std::array<uint64_t, 12> key {1,2,3,4,5,6,7,8,9,10,11,12};
+                if (captured) {
+                    ++stats.captured;
+                    stats.serial_us+=serial_us;
+                    stats.capture_us+=std::chrono::duration<double,std::micro>(captured_at-begin).count();
 
-          Check(memo.Find(1,10,20,key) == nullptr);
-          memo.Store(1,10,20,key,99);
-          Check(memo.Find(1,10,20,key) && *memo.Find(1,10,20,key) == 99);
-          Check(memo.Find(2,10,20,key) == nullptr);
+                    const auto frozen=packet.Runtime();
+                    const auto replay_begin=std::chrono::steady_clock::now();
+                    const bool replay_ok=MaterializeCompiled(plan,frozen,replay,replay_spec,nullptr);
+                    const auto replay_end=std::chrono::steady_clock::now();
+                    stats.replay_us+=std::chrono::duration<double,std::micro>(replay_end-replay_begin).count();
 
-          for (size_t i=0; i<key.size(); ++i) {
-            auto changed=key;
-            changed[i]++;
-            Check(memo.Find(1,10,20,changed) == nullptr);
-          }
-
-          Check(memo.Find(1,10,20,std::span(key).first(11)) == nullptr);
-          Check(memo.Find(1,11,20,key) == nullptr);
-
-          memo.Store(1,11,20,key,100);
-          Check(memo.Find(1,11,21,key) == nullptr);
-
-          memo.Store(1,11,21,key,101);
-          for (uint64_t layout=2; layout<80; ++layout)
-            memo.Store(layout,11,21,key,layout);
-
-          Check(memo.Find(79,11,21,key) && *memo.Find(79,11,21,key) == 79);
-          memo.Store(79,11,21,key,200);
-          Check(*memo.Find(79,11,21,key) == 200);
-
-          std::puts("DescriptorMemo35: all cases passed");
-        }
-        ''', encoding="utf-8", newline="\n")
-
-        p = Path("patches/heap_impl35.txt")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(r'''vk::DescriptorSet DescriptorHeap::CommitCached35(
-            vk::DescriptorSetLayout layout,
-            std::span<vk::WriteDescriptorSet> writes) {
-
-            const auto fresh = [&] {
-                const auto set = Commit(layout);
-                for (auto& write : writes) write.dstSet = set;
-                m_graphics.device.updateDescriptorSets(
-                    static_cast<uint32_t>(writes.size()),
-                    writes.data(), 0, nullptr);
-                return set;
-            };
-
-            auto& key = m_memo_key35;
-            key.clear();
-            key.push_back(writes.size());
-
-            for (const auto& write : writes) {
-                if (write.pNext != nullptr || write.pTexelBufferView != nullptr ||
-                    (write.pImageInfo == nullptr) == (write.pBufferInfo == nullptr))
-                    return fresh();
-
-                key.push_back(write.dstBinding);
-                key.push_back(write.dstArrayElement);
-                key.push_back(static_cast<uint32_t>(write.descriptorType));
-                key.push_back(write.descriptorCount);
-                key.push_back(write.pImageInfo != nullptr ? 1u : 0u);
-
-                for (uint32_t i = 0; i < write.descriptorCount; ++i) {
-                    if (write.pImageInfo != nullptr) {
-                        const auto& info = write.pImageInfo[i];
-                        key.push_back(std::bit_cast<uint64_t>(
-                            static_cast<VkSampler>(info.sampler)));
-                        key.push_back(std::bit_cast<uint64_t>(
-                            static_cast<VkImageView>(info.imageView)));
-                        key.push_back(static_cast<uint32_t>(info.imageLayout));
-                    } else {
-                        const auto& info = write.pBufferInfo[i];
-                        key.push_back(std::bit_cast<uint64_t>(
-                            static_cast<VkBuffer>(info.buffer)));
-                        key.push_back(info.offset);
-                        key.push_back(info.range);
-                    }
+                    // Compare on the same frozen inputs; never adopt this diagnostic result in the game.
+                    const bool reference_ok=MaterializeResourcesReference(plan,frozen,reference,reference_spec);
+                    if (!replay_ok || !reference_ok || replay.buffers!=reference.buffers ||
+                        replay.images!=reference.images || replay.samplers!=reference.samplers ||
+                        replay.user_data!=reference.user_data || replay.flattened_srt!=reference.flattened_srt ||
+                        replay.uniform_fill!=reference.uniform_fill || replay_spec!=reference_spec) ++stats.failures;
+                } else {
+                    ++stats.failures;
                 }
             }
 
-            const auto layout_key = std::bit_cast<uint64_t>(
-                static_cast<VkDescriptorSetLayout>(layout));
-            const auto tick = m_master_semaphore.CurrentTick();
-
-            if (const auto* found = m_memo35.Find(layout_key, tick, m_pool_epoch35, key)) return *found;
-
-            const auto set = fresh();
-            m_memo35.Store(layout_key, tick, m_pool_epoch35, key, set);
-            return set;
-        }
-        ''', encoding="utf-8", newline="\n")
-
-        def replace(path, old, new):
-            p = Path(path)
-            text = p.read_text(encoding="utf-8")
-            if text.count(old) != 1:
-                raise RuntimeError("Unexpected source boundary: " + path)
-            p.write_text(text.replace(old, new), encoding="utf-8", newline="\n")
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.h",
-            '#include "common/common.h"',
-            '#include "common/common.h"\n'
-            '#include "graphics/host_gpu/renderer/pipeline/descriptorMemo35.h"\n'
-            '#include <span>\n#include <vector>'
-        )
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.h",
-            '\t[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);',
-            '\t[[nodiscard]] vk::DescriptorSet Commit(vk::DescriptorSetLayout layout);\n'
-            '\t[[nodiscard]] vk::DescriptorSet CommitCached35('
-            'vk::DescriptorSetLayout layout, std::span<vk::WriteDescriptorSet> writes);'
-        )
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.h",
-            '\tstatic constexpr uint32_t DescriptorSetBatch = 32;',
-            '''    DescriptorMemo35<vk::DescriptorSet> m_memo35;
-            std::vector<uint64_t> m_memo_key35;
-            uint64_t m_pool_epoch35 = 0;
-            uint64_t m_attempts35 = 0, m_hits35 = 0;
-        \tstatic constexpr uint32_t DescriptorSetBatch = 32;'''
-        )
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.cpp",
-            '#include "common/assert.h"',
-            '#include "common/assert.h"\n#include <bit>\n#include <cstdio>'
-        )
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.cpp",
-            '\tm_sets.clear();',
-            '\t++m_pool_epoch35;\n\tm_sets.clear();'
-        )
-
-        impl = Path("patches/heap_impl35.txt").read_text(encoding="utf-8")
-        impl = impl.replace(
-            '    const auto fresh = [&] {',
-            '    ++m_attempts35;\n    const auto fresh = [&] {'
-        )
-        impl = impl.replace(
-            'if (const auto* found = m_memo35.Find(layout_key, tick, m_pool_epoch35, key)) return *found;',
-            'if (const auto* found = m_memo35.Find(layout_key, tick, m_pool_epoch35, key)) '
-            '{ ++m_hits35; return *found; }'
-        )
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.cpp",
-            'bool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {',
-            impl + '\nbool DescriptorHeap::Allocate(vk::DescriptorSetLayout layout, Batch& batch) {'
-        )
-
-        old = '''\t\tconst auto set = m_context.GetDescriptorHeap().Commit(layout);
-        \t\tfor (auto& write: writes) {
-        \t\t\twrite.dstSet = set;
-        \t\t}
-        \t\tm_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
-        \t\t                                                    writes.data(), 0, nullptr);'''
-
-        new = '''        static const bool memo35 = [] {
-                    const auto* v = std::getenv("KYTY_DESCRIPTOR_MEMO_35");
-                    return v != nullptr && v[0] == '1' && v[1] == '\\0';
-                }();
-
-                const auto set = memo35
-                    ? m_context.GetDescriptorHeap().CommitCached35(layout, writes)
-                    : m_context.GetDescriptorHeap().Commit(layout);
-
-                if (!memo35) {
-                    for (auto& write : writes) write.dstSet = set;
-                    m_context.GetGraphics().device.updateDescriptorSets(
-                        static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-                }'''
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/descriptors.cpp",
-            old, new
-        )
-
-        old = '''\tstate.pixel_uses_push =
-        \t    !state.pixel_bindings.empty() && FitsPushDescriptors(graphics, state.pixel_bindings);
-        \tstate.vertex_uses_push = !state.pixel_uses_push && !state.vertex_bindings.empty() &&
-        \t                         FitsPushDescriptors(graphics, state.vertex_bindings);'''
-
-        new = '''    static const bool memo35 = [] {
-                const auto* v = std::getenv("KYTY_DESCRIPTOR_MEMO_35");
-                return v != nullptr && v[0] == '1' && v[1] == '\\0';
-            }();
-
-            if (memo35) {
-                state.vertex_uses_push = !state.vertex_bindings.empty() &&
-                                         FitsPushDescriptors(graphics, state.vertex_bindings);
-                state.pixel_uses_push = !state.vertex_uses_push &&
-                                        !state.pixel_bindings.empty() &&
-                                        FitsPushDescriptors(graphics, state.pixel_bindings);
-            } else {
-        ''' + old + '\n    }'
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/shaders.cpp",
-            old, new
-        )
-
-        p = Path("src/graphics/host_gpu/renderer/pipeline/shaders.cpp")
-        p.write_text(
-            '#include <cstdlib>\n' + p.read_text(encoding="utf-8"),
-            encoding="utf-8"
-        )
-        '@ | & $env:KYTY_PYTHON -
-        if ($LASTEXITCODE -ne 0) { throw "Descriptor set patch failed" }
-
-    - name: Print diagnostic counters during rendering
-      run: |
-        $ErrorActionPreference = "Stop"
-        @'
-        from pathlib import Path
-
-        def replace(path, old, new):
-            p = Path(path)
-            s = p.read_text(encoding="utf-8")
-            if s.count(old) != 1:
-                raise RuntimeError("Unexpected diagnostic boundary: " + path)
-            p.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.cpp",
-            "#include <cstdio>",
-            "#include <cstdio>\n#include <cstdlib>"
-        )
-
-        replace(
-            "src/graphics/host_gpu/renderer/pipeline/descriptorHeap.cpp",
-            "    ++m_attempts35;",
-            """
-            ++m_attempts35;
-            static const bool report35 = [] {
-                const char* v = std::getenv("KYTY_DESCRIPTOR_STATS_35");
-                return v != nullptr && v[0] == '1' && v[1] == '\\0';
-            }();
-
-            if (report35 && (m_attempts35 == 1u || (m_attempts35 & 262143u) == 0u)) {
-                std::printf("descriptor-memo35-live: attempts=%llu hits=%llu\\n",
-                    static_cast<unsigned long long>(m_attempts35),
-                    static_cast<unsigned long long>(m_hits35));
+            if (stats.samples==1u || stats.samples%64u==0u) {
+                const auto n=stats.captured!=0u ? static_cast<double>(stats.captured) : 1.0;
+                std::printf("frozen36: samples=%llu eligible=%llu captured=%llu failures=%llu serial-us=%.3f capture-us=%.3f replay-us=%.3f\n",
+                    static_cast<unsigned long long>(stats.samples),
+                    static_cast<unsigned long long>(stats.eligible),
+                    static_cast<unsigned long long>(stats.captured),
+                    static_cast<unsigned long long>(stats.failures),
+                    stats.serial_us/n,stats.capture_us/n,stats.replay_us/n);
                 std::fflush(stdout);
             }
-        """
-        )
+        }
+        }
+        ''',encoding="utf-8",newline="\n")
 
-        p = Path("src/graphics/host_gpu/renderer/pipeline/shaders.cpp")
-        s = "#include <cstdio>\n" + p.read_text(encoding="utf-8")
+        Path('patches/frozen_test36.txt').parent.mkdir(parents=True,exist_ok=True)
+        Path('patches/frozen_test36.txt').write_text(r'''
+        void TestFrozenInputs36() {
+          using namespace Libs::Graphics::ShaderRecompiler::IR;
+          SetResourceMaterializationVerification(false);
+          const auto plan=MemoPlan(MemoPlanExtra::None,true);
+          (void)CompileResourcePlan(plan);
+          Check(FrozenInputsEligible36(plan),"simple plan rejected");
 
-        old = """        return v != nullptr && v[0] == '1' && v[1] == '\\0';"""
+          struct Job {FrozenResourceInputs36 input; ResourceSnapshot expected; ResourceSpecialization spec;};
+          std::array<std::vector<Job>,2> jobs;
 
-        new = """        const bool enabled = v != nullptr && v[0] == '1' && v[1] == '\\0';
-                const char* diagnostic = std::getenv("KYTY_DESCRIPTOR_STATS_35");
-                if (diagnostic != nullptr && diagnostic[0] == '1' && diagnostic[1] == '\\0') {
-                    std::printf("descriptor-memo35: diagnostic build active; reuse=%u\\n",
-                        enabled ? 1u : 0u);
-                    std::fflush(stdout);
-                }
-                return enabled;"""
+          for(uint32_t stream=0;stream<2;stream++) {
+            jobs[stream].resize(128);
+            MemoFixture f;
+            for(uint32_t step=0;step<128;step++) {
+              f.user_data={static_cast<uint32_t>(TableMemory::Base),0u,0u,8u};
+              for (uint32_t word=0;word<f.memory.words.size();++word) f.memory.words[word]=0x1000u+word;
+              f.memory.words[3]=0;
+              f.memory.words[0]=(step+stream*512u)*16u;
+              f.memory.words[1]=0x100u+step+stream*512u;
+              f.memory.words[4]=(step+stream)&1u;
+              f.user_data[2]=0x200u+step+stream*512u;
 
-        if s.count(old) != 1:
-            raise RuntimeError("Diagnostic startup boundary missing")
+              const SrtRuntime runtime {.user_data=f.user_data,.read_memory=TableMemory::DirectRead,
+                .userdata=&f.memory,.read_specialization_memory=TableMemory::StrictRead};
 
-        p.write_text(s.replace(old, new), encoding="utf-8", newline="\n")
+              auto& job=jobs[stream][step];
+              Check(MaterializeResourcesReference(plan,runtime,job.expected,job.spec),"reference failed");
+              Check(job.input.Capture(plan,runtime),"freeze failed");
+              Check(job.input.Valid() && job.input.WordCount()==5,"capture lost flat inputs");
+              f.user_data.fill(0xffffffffu);f.memory.words.fill(0xffffffffu);
+
+              uint32_t missing=0;
+              const auto frozen=job.input.Runtime();
+              Check(!frozen.read_memory(frozen.userdata,0x40,{&missing,1}),"missing word accepted");
+            }
+          }
+
+          std::atomic<bool> start=false;
+          const auto run=[&](uint32_t stream) {
+            t_resource_scratch_slot=stream;
+            while(!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            ResourceSnapshot out;ResourceSpecialization spec;
+            for(uint32_t i=0;i<32768;i++) {
+              const auto& job=jobs[stream][i%128];
+              Check(MaterializeResources(plan,job.input.Runtime(),out,spec),"frozen replay failed");
+              const auto& e=job.expected;
+              Check(out.buffers==e.buffers && out.images==e.images && out.samplers==e.samplers &&
+                out.user_data==e.user_data && out.flattened_srt==e.flattened_srt &&
+                out.uniform_fill==e.uniform_fill && spec==job.spec,"frozen replay differs after source changed");
+            }
+          };
+
+          std::thread worker([&]{run(1);});
+          start.store(true,std::memory_order_release);
+          run(0);
+          worker.join();
+          t_resource_scratch_slot=0;
+
+          for(const auto extra:{MemoPlanExtra::DynamicRead,MemoPlanExtra::MemoryPredicate,MemoPlanExtra::ReadFirstLane}) {
+            const auto unsafe=MemoPlan(extra,true);
+            (void)CompileResourcePlan(unsafe);
+            Check(!FrozenInputsEligible36(unsafe),"unsupported plan accepted");
+          }
+
+          MemoFixture f;FrozenResourceInputs36 packet;
+          const SrtRuntime runtime {.user_data=f.user_data,.read_memory=TableMemory::DirectRead,
+            .userdata=&f.memory,.read_specialization_memory=TableMemory::StrictRead};
+          Check(packet.Capture(plan,runtime),"initial capture failed");
+          f.user_data[0]=0x40;
+          Check(!packet.Capture(plan,runtime) && !packet.Valid(),"failed recapture kept stale valid data");
+
+          std::puts("Frozen input tests: 65536 parallel replays match the pre-mutation reference; unsafe plans and reads rejected");
+        }
+        ''',encoding="utf-8",newline="\n")
+
+        def replace(path, old, new):
+            p=Path(path)
+            s=p.read_text(encoding="utf-8")
+            if s.count(old)!=1:
+                raise RuntimeError("Unexpected frozen input boundary: "+path)
+            p.write_text(s.replace(old,new),encoding="utf-8",newline="\n")
+
+        p=Path("src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp")
+        p.write_text('#include "graphics/shader/recompiler/ir/passes/FrozenResourceInputs36.h"\n#include <chrono>\n#include <cstdio>\n'+p.read_text(encoding="utf-8"),encoding="utf-8")
+
+        boundary='bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,'
+        replace(str(p),boundary,Path("patches/probe36.txt").read_text(encoding="utf-8")+'\n'+boundary)
+
+        replace(str(p),
+            '\tconst bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);',
+            '''    thread_local uint64_t calls36=0;
+            const bool sample36=t_frozen_probe36 && (++calls36%4096u==0u);
+            const auto begin36=sample36 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+        \tconst bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);
+            if (sample36 && result) {
+                const auto us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin36).count();
+                ProbeFrozenInputs36(program,runtime,us);
+            }''')
+
+        p=Path("src/graphics/guest_gpu/graphicsRun.cpp")
+        p.write_text('#include "graphics/shader/recompiler/ir/passes/FrozenResourceInputs36.h"\n#include <cstdio>\n#include <cstdlib>\n'+p.read_text(encoding="utf-8"),encoding="utf-8")
+
+        replace(str(p),'\tg_gpu_thread = true;', '''\tg_gpu_thread = true;
+            const auto* frozen36=std::getenv("KYTY_FROZEN_DIAGNOSTIC_36");
+            ShaderRecompiler::IR::t_frozen_probe36 = frozen36 != nullptr && frozen36[0]=='1' && frozen36[1]=='\\0';
+            if (ShaderRecompiler::IR::t_frozen_probe36) {
+                std::printf("frozen36: diagnostic active; game results unchanged; sample stride=4096\\n");
+                std::fflush(stdout);
+            }''')
+
+        p=Path("tests/ResourceMaterializationTests.cpp")
+        p.write_text('#include "graphics/shader/recompiler/ir/passes/FrozenResourceInputs36.h"\n#include <atomic>\n#include <thread>\n'+p.read_text(encoding="utf-8"),encoding="utf-8")
+        replace(str(p),'int main() {',Path("patches/frozen_test36.txt").read_text(encoding="utf-8")+'\nint main() {\n  TestFrozenInputs36();')
+
+        print("Diagnostic 36 installed; game results remain on the original path",flush=True)
         '@ | & $env:KYTY_PYTHON -
-        if ($LASTEXITCODE -ne 0) { throw "Live counter patch failed" }
+        if ($LASTEXITCODE -ne 0) { throw "Diagnostic 36 adaptation failed" }
+        git diff --check
+        if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
     - name: Setup MSVC environment
       uses: ilammy/msvc-dev-cmd@v1
@@ -462,18 +408,6 @@ jobs:
         modules: qt5compat
         cache: true
 
-    - name: Test descriptor memo lifetime and exact keys
-      run: |
-        $ErrorActionPreference = "Stop"
-        & clang-cl /nologo /std:c++20 /EHsc /O2 /I src tests/DescriptorMemoTests35.cpp "/Fe:$env:RUNNER_TEMP/descriptor_memo35.exe" "/Fo:$env:RUNNER_TEMP/descriptor_memo35.obj"
-        if ($LASTEXITCODE -ne 0) {
-          throw "Descriptor memo test compilation failed"
-        }
-        & "$env:RUNNER_TEMP/descriptor_memo35.exe"
-        if ($LASTEXITCODE -ne 0) {
-          throw "Descriptor memo tests failed"
-        }
-
     - name: Build and test using pinned working workflow
       run: |
         $ErrorActionPreference = "Stop"
@@ -485,11 +419,7 @@ jobs:
         import os
         import yaml
 
-        steps = yaml.safe_load(
-            Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml")
-            .read_text(encoding="utf-8")
-        )["jobs"]["build"]["steps"]
-
+        steps = yaml.safe_load(Path("_patch_source/.github/workflows/build-windows-amd-blocking-wait.yml").read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
         started = False
         finished = False
 
@@ -505,56 +435,38 @@ jobs:
                 raise RuntimeError("Unexpected build step")
 
             if step["name"] == "Configure CMake":
-                flags = os.environ["KYTY_FLAGS_35"]
-                args = [
-                    "cmake", "-S", ".", "-B", "_Build/windows",
-                    "-G", "Ninja",
-                    "-DCMAKE_BUILD_TYPE=Release",
-                    "-DCMAKE_C_COMPILER=clang-cl",
-                    "-DCMAKE_CXX_COMPILER=clang-cl",
-                    "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
-                    "-DCMAKE_C_FLAGS_INIT=" + flags,
-                    "-DCMAKE_CXX_FLAGS_INIT=" + flags,
-                    "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"
-                ]
+                flags = os.environ["KYTY_FLAGS_36"]
+                args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
+                        "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang-cl",
+                        "-DCMAKE_CXX_COMPILER=clang-cl",
+                        "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
+                        "-DCMAKE_C_FLAGS_INIT=" + flags, "-DCMAKE_CXX_FLAGS_INIT=" + flags,
+                        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
 
+                print("Configuring profile:", os.environ["KYTY_PROFILE_36"], flags, flush=True)
                 subprocess.run(args, check=True)
+
                 cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
-                cpp_flags = next(
-                    (
-                        line.split("=", 1)[1]
-                        for line in cache.splitlines()
-                        if line.startswith("CMAKE_CXX_FLAGS:STRING=")
-                    ),
-                    None
-                )
+                cpp_flags = next((line.split("=", 1)[1] for line in cache.splitlines()
+                                  if line.startswith("CMAKE_CXX_FLAGS:STRING=")), None)
 
                 if cpp_flags is None or "/ehsc" not in cpp_flags.lower():
-                    raise RuntimeError("CMake lost /EHsc: exceptions must remain enabled")
+                    raise RuntimeError("CMake lost /EHsc: C++ exceptions must remain enabled")
                 if not all(option in cpp_flags for option in flags.split()):
-                    raise RuntimeError("Selected compiler flags are missing")
+                    raise RuntimeError("Selected CPU flags are missing from CMAKE_CXX_FLAGS")
 
                 print("Verified C++ flags:", cpp_flags, flush=True)
                 continue
 
-            script = Path(f"_build35_{index}.ps1")
-            script.write_text(
-                '$ErrorActionPreference = "Stop"\n' + step["run"],
-                encoding="utf-8"
-            )
-
+            script = Path(f"_build36_{index}.ps1")
+            script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
             print("Running:", step["name"], flush=True)
+
             path_file = Path(os.environ["GITHUB_PATH"])
-            entries = (
-                path_file.read_text(encoding="utf-8-sig").splitlines()
-                if path_file.exists() else []
-            )
+            entries = path_file.read_text(encoding="utf-8-sig").splitlines() if path_file.exists() else []
             os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
 
-            subprocess.run(
-                ["pwsh", "-NoProfile", "-File", str(script.resolve())],
-                check=True
-            )
+            subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
 
         if not started or not finished:
             raise RuntimeError("Build boundaries missing")
@@ -565,97 +477,89 @@ jobs:
       run: |
         $ErrorActionPreference = "Stop"
         $install = "_Build/windows/install"
-        if (-not (Test-Path "$install/launcher.exe")) {
-          throw "launcher.exe missing"
-        }
+        if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
 
-        foreach ($mode in @(0, 1, 2)) {
-          $name = switch ($mode) {
-            0 { "Comparacion-35.cmd" }
-            1 { "Prueba-35.cmd" }
-            2 { "Diagnostico-35.cmd" }
-          }
-
-          $memoMode = if ($mode -eq 0) { 0 } else { 1 }
-          $statsMode = if ($mode -eq 2) { 1 } else { 0 }
-
-          @(
-            '@echo off',
-            'setlocal',
-            'cd /d "%~dp0"',
-            "set KYTY_DESCRIPTOR_MEMO_35=$memoMode",
-            "set KYTY_DESCRIPTOR_STATS_35=$statsMode",
-            'set KYTY_DESCRIPTOR_RECIPES_34=0',
-            'set KYTY_TRACKING_PAUSE=',
-            'set KYTY_BDA_SLICE_FILTER=',
-            'set KYTY_TRACKING_DIAGNOSTICS=',
-            'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
-            'set KYTY_TRACKING_BLOCKING_WAIT=1',
-            'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
-            'set KYTY_DIRECT_COLOR_METADATA=1',
-            'set KYTY_RECORD_THREAD=0',
-            'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
-            'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
-            'set KYTY_DEBUG_SHADER_CPU=0',
-            'set KYTY_RESOURCE_BLOCKS_32=0',
-            'set KYTY_HOST_PRIORITY_26=0',
-            'set KYTY_REFRESH_DIAGNOSTIC_27=0',
-            'set KYTY_SRT_ALIASES_32=0',
-            'set KYTY_DIRECT_FLAT_31=0',
-            'set KYTY_DIRECT_INPUTS_29=0',
-            'set KYTY_ACTIVE_MASK_VIEW_28=0',
-            'set KYTY_DEBUG_QUEUES=',
-            'set KYTY_SRT_STATS=',
-            'set KYTY_DEBUG_SRT_RUNS=',
-            'set KYTY_VERIFY_SRT=',
-            'set KYTY_VERIFY_SPEC=',
-            'set KYTY_VERIFY_SPEC_READS=',
-            'set KYTY_SPECULATE_DRAWS=0',
-            'set KYTY_LIGHT_DRAIN_STATS=1',
-            'set KYTY_DEBUG_SAMPLE_GPU=',
-            'set KYTY_DEBUG_DUMP_THREADS=',
-            'set KYTY_DEBUG_DRAW_PHASES=',
-            'set KYTY_DEBUG_DRAW_STATS=',
-            'set KYTY_DEBUG_SPEC_STATS=',
-            'set KYTY_DEBUG_STREAM_STATS=',
-            'set KYTY_DEBUG_UPLOADS=',
-            'set KYTY_GPU_ZONES=',
-            '"%~dp0launcher.exe" %*',
-            'pause'
-          ) | Set-Content "$install/$name" -Encoding ascii
+        foreach ($mode in @(0, 1)) {
+            $name = if ($mode -eq 1) { "Diagnostico-36.cmd" } else { "Comparacion-36.cmd" }
+            @(
+                '@echo off',
+                'setlocal',
+                'cd /d "%~dp0"',
+                "set KYTY_FROZEN_DIAGNOSTIC_36=$mode",
+                'set KYTY_DESCRIPTOR_MEMO_35=0',
+                'set KYTY_DESCRIPTOR_STATS_35=0',
+                'set KYTY_DESCRIPTOR_RECIPES_34=0',
+                'set KYTY_TRACKING_PAUSE=',
+                'set KYTY_BDA_SLICE_FILTER=',
+                'set KYTY_TRACKING_DIAGNOSTICS=',
+                'set KYTY_ADDRESS_SPACE_DIAGNOSTICS=',
+                'set KYTY_TRACKING_BLOCKING_WAIT=1',
+                'set KYTY_SHARED_SAMPLER_SNAPSHOTS=1',
+                'set KYTY_DIRECT_COLOR_METADATA=1',
+                'set KYTY_RECORD_THREAD=0',
+                'set KYTY_IMAGE_SPECIALIZATION_CACHE=',
+                'set KYTY_DEBUG_NO_PIXEL_TARGETS=0',
+                'set KYTY_DEBUG_SHADER_CPU=0',
+                'set KYTY_RESOURCE_BLOCKS_32=0',
+                'set KYTY_HOST_PRIORITY_26=0',
+                'set KYTY_REFRESH_DIAGNOSTIC_27=0',
+                'set KYTY_SRT_ALIASES_32=0',
+                'set KYTY_DIRECT_FLAT_31=0',
+                'set KYTY_DIRECT_INPUTS_29=0',
+                'set KYTY_ACTIVE_MASK_VIEW_28=0',
+                'set KYTY_DEBUG_QUEUES=',
+                'set KYTY_SRT_STATS=',
+                'set KYTY_DEBUG_SRT_RUNS=',
+                'set KYTY_VERIFY_SRT=',
+                'set KYTY_VERIFY_SPEC=',
+                'set KYTY_VERIFY_SPEC_READS=',
+                'set KYTY_SPECULATE_DRAWS=0',
+                'set KYTY_LIGHT_DRAIN_STATS=1',
+                'set KYTY_DEBUG_SAMPLE_GPU=',
+                'set KYTY_DEBUG_DUMP_THREADS=',
+                'set KYTY_DEBUG_DRAW_PHASES=',
+                'set KYTY_DEBUG_DRAW_STATS=',
+                'set KYTY_DEBUG_SPEC_STATS=',
+                'set KYTY_DEBUG_STREAM_STATS=',
+                'set KYTY_DEBUG_UPLOADS=',
+                'set KYTY_GPU_ZONES=',
+                '"%~dp0launcher.exe" %*'
+            ) | Set-Content "$install/$name" -Encoding ascii
         }
 
         $maps = Get-ChildItem "_Build/windows" -Filter "kyty_emulator_*.map" -File
         if (-not $maps) { throw "Emulator map missing" }
-        foreach ($map in $maps) {
-          Copy-Item $map.FullName $install -Force
-        }
+        foreach ($map in $maps) { Copy-Item $map.FullName $install -Force }
 
         $pdb = "_Build/windows/kyty_emulator.pdb"
         if (-not (Test-Path $pdb)) { throw "Emulator PDB missing" }
         Copy-Item $pdb $install -Force
 
         @(
-          "Diagnostico-35.cmd: live counters; do not use to benchmark FPS.",
-          "Comparacion-35.cmd: original Vulkan descriptor management.",
-          "Prueba-35.cmd: vertex push preference and regular descriptor set reuse.",
-          "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
-          "Copy your working _Patches and select THIS interpreter."
-        ) | Set-Content "$install/PRUEBA-35.txt" -Encoding ascii
+            "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
+            "Diagnostico-36.cmd: samples frozen inputs; diagnostic results are never adopted.",
+            "Comparacion-36.cmd: same executable, diagnostic OFF.",
+            "This is a measurement build, not a parallel rendering or FPS improvement build.",
+            "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
+            "Copy your working _Patches and select THIS interpreter.",
+            "Warm up, then remain in the fixed heavy view for 60 seconds.",
+            "Copy console output including frozen36 lines.",
+            "Close emulator and launcher completely before changing mode."
+        ) | Set-Content "$install/DIAGNOSTICO-36.txt" -Encoding ascii
 
     - name: Create Windows ZIP
       run: |
         $ErrorActionPreference = "Stop"
-        $zip = "KytyPS5-Diagnostico-35.zip"
+        $zip = "KytyPS5-Diagnostico-36.zip"
         Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
         if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
-          throw "Packaging failed: missing or empty ZIP"
+            throw "Packaging failed: missing or empty ZIP"
         }
 
     - name: Upload KytyPS5
       uses: actions/upload-artifact@v4
       with:
-        name: KytyPS5-Diagnostico-35
-        path: KytyPS5-Diagnostico-35.zip
+        name: KytyPS5-Diagnostico-36
+        path: KytyPS5-Diagnostico-36.zip
         if-no-files-found: error
         retention-days: 7
