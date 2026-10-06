@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 41 - Recorrido compacto
+name: Windows AMD - Prueba 42 - Comparaciones inmediatas
 
 on:
   workflow_dispatch:
@@ -8,12 +8,12 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - Prueba 41
+    name: Windows x64 - Prueba 42
     runs-on: windows-2022
 
     env:
-      KYTY_FLAGS_41: /clang:-ffp-contract=off
-      KYTY_PROFILE_41: Generica
+      KYTY_FLAGS_42: /clang:-ffp-contract=off
+      KYTY_PROFILE_42: Generica
 
     defaults:
       run:
@@ -77,7 +77,7 @@ jobs:
                   continue
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
-              script = Path(f"_prepare41_{index}.ps1")
+              script = Path(f"_prepare42_{index}.ps1")
               script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
               print("Preparing:", step["name"], flush=True)
               subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -86,7 +86,7 @@ jobs:
           '@ | & $env:KYTY_PYTHON -
           if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-      - name: Add optional compact flat traversal and regression tests
+      - name: Add optional immediate comparisons and regression tests
         run: |
           $ErrorActionPreference = "Stop"
           @'
@@ -95,17 +95,17 @@ jobs:
           def replace(path,old,new):
               p=Path(path);s=p.read_text(encoding='utf-8')
               if s.count(old)!=1:
-                  raise RuntimeError('Unexpected compact-flat boundary: '+path)
+                  raise RuntimeError('Unexpected condition42 boundary: '+path)
               p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
 
-          header='src/graphics/shader/recompiler/ir/passes/CompactFlat41.h'
+          header='src/graphics/shader/recompiler/ir/passes/ImmediateConditions42.h'
           Path(header).write_text(r'''#pragma once
           #include <cstdlib>
           #include <cstring>
           namespace Libs::Graphics::ShaderRecompiler::IR {
-          inline bool CompactFlat41Enabled() {
+          inline bool ImmediateConditions42Enabled() {
               static const bool enabled=[] {
-                  const auto* v=std::getenv("KYTY_COMPACT_FLAT_41");
+                  const auto* v=std::getenv("KYTY_IMMEDIATE_CONDITIONS_42");
                   return v!=nullptr && std::strcmp(v,"1")==0;
               }();
               return enabled;
@@ -114,137 +114,153 @@ jobs:
           ''',encoding='utf-8')
 
           p='src/graphics/shader/recompiler/ir/ShaderIR.h'
-          replace(p,'\tstd::vector<uint8_t>                 in_run; // Per srt_reads entry; empty without runs.',
-          '''\tstd::vector<uint8_t>                 in_run; // Per srt_reads entry; empty without runs.
-              // Original-order slots left after batched runs; immutable once compiled.
-              std::vector<uint32_t>                scalar_slots41;''')
+          replace(p,'\t\tLogicalNot,',
+              '\t\tLogicalNot,\n        CompareImmediate32,\n        MaskedCompareImmediate32,')
 
           p='src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp'
           f=Path(p)
-          f.write_text('#include "graphics/shader/recompiler/ir/passes/CompactFlat41.h"\n#include <atomic>\n#include <cstdio>\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
+          f.write_text('#include "graphics/shader/recompiler/ir/passes/ImmediateConditions42.h"\n#include <atomic>\n#include <cstdio>\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
+
+          replace(p,'\t\tnode.op = arithmetic;\n\t\treturn node;',r'''
+                  node.op = arithmetic;
+                  if (ImmediateConditions42Enabled() &&
+                      (arithmetic==NodeOp::IEqual32 || arithmetic==NodeOp::INotEqual32)) {
+                      for (uint32_t side=0;side<2u;++side) {
+                          const auto& constant=m_compiled.nodes[node.args[side]];
+                          if (constant.op!=NodeOp::Const) continue;
+                          const auto value=node.args[1u-side];
+                          node.flags=arithmetic==NodeOp::INotEqual32 ? 1u : 0u;
+                          node.imm=static_cast<uint32_t>(constant.imm);
+                          node.op=NodeOp::CompareImmediate32;
+                          node.args={value,ResourceNode::NoNode,ResourceNode::NoNode,ResourceNode::NoNode,ResourceNode::NoNode};
+                          const auto& masked=m_compiled.nodes[value];
+                          if (masked.op==NodeOp::BitwiseAnd32) {
+                              for (uint32_t mask_side=0;mask_side<2u;++mask_side) {
+                                  const auto& mask=m_compiled.nodes[masked.args[mask_side]];
+                                  if (mask.op!=NodeOp::Const) continue;
+                                  node.op=NodeOp::MaskedCompareImmediate32;
+                                  // Keep the original AND node for analyses and its evaluation memo.
+                                  node.args[1]=masked.args[1u-mask_side];
+                                  node.imm|=static_cast<uint64_t>(static_cast<uint32_t>(mask.imm))<<32u;
+                                  break;
+                              }
+                          }
+                          break;
+                      }
+                  }
+                  return node;''')
+
+          replace(p,'\t\tcase NodeOp::IEqual32:',r'''
+                  case NodeOp::CompareImmediate32:
+                      if (!unary()) return false;
+                      result=(static_cast<uint32_t>(a)==static_cast<uint32_t>(node.imm)) ^ (node.flags!=0u);
+                      return true;
+                  case NodeOp::MaskedCompareImmediate32: {
+                      auto& masked=m_memo[node.args[0]];
+                      if (masked.generation==m_generation) {
+                          a=masked.value;
+                      } else {
+                          if (masked.generation==(m_generation|1u)) return false;
+                          masked.generation=m_generation|1u;
+                          if (!EvaluateWide(node.args[1],a)) {
+                              masked.generation=0;
+                              return false;
+                          }
+                          a=static_cast<uint32_t>(a)&static_cast<uint32_t>(node.imm>>32u);
+                          masked.value=a;
+                          masked.generation=m_generation;
+                      }
+                      result=(static_cast<uint32_t>(a)==static_cast<uint32_t>(node.imm)) ^ (node.flags!=0u);
+                      return true;
+                  }
+                  case NodeOp::IEqual32:''')
+
           replace(p,'\tBuildFlatRuns(program, *compiled);',r'''
               BuildFlatRuns(program, *compiled);
-              if (CompactFlat41Enabled() && !compiled->flat_runs.empty()) {
-                  for (uint32_t slot=0;slot<program.srt_reads.size();++slot) {
-                      if (compiled->in_run[slot]==0u) compiled->scalar_slots41.push_back(slot);
+              if (ImmediateConditions42Enabled()) {
+                  uint32_t immediate=0,masked=0;
+                  for (const auto& node:compiled->nodes) {
+                      immediate+=node.op==NodeOp::CompareImmediate32 ? 1u : 0u;
+                      masked+=node.op==NodeOp::MaskedCompareImmediate32 ? 1u : 0u;
                   }
-                  static std::atomic<uint32_t> reports41 {0};
-                  if (reports41.fetch_add(1,std::memory_order_relaxed)<12u ||
-                      program.shader_hash==0x3b809f9d156a95ddull || program.shader_hash==0xf112e0ba527945adull) {
-                      std::printf("flat41-plan: shader=%016llx slots=%llu batched=%llu residual=%llu\n",
-                          static_cast<unsigned long long>(program.shader_hash),
-                          static_cast<unsigned long long>(program.srt_reads.size()),
-                          static_cast<unsigned long long>(program.srt_reads.size()-compiled->scalar_slots41.size()),
-                          static_cast<unsigned long long>(compiled->scalar_slots41.size()));
+                  static std::atomic<uint32_t> reports42 {0};
+                  const bool target=program.shader_hash==0x3b809f9d156a95ddull || program.shader_hash==0xf112e0ba527945adull;
+                  if (target || ((immediate+masked)!=0u && reports42.fetch_add(1,std::memory_order_relaxed)<12u)) {
+                      std::printf("condition42-plan: shader=%016llx immediate=%u masked=%u\n",
+                          static_cast<unsigned long long>(program.shader_hash),immediate,masked);
                       std::fflush(stdout);
                   }
               }''')
 
-          old=r'''\tfor (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
-          \t\tif (runs && m_compiled.in_run[slot] != 0u) {
-          \t\t\tcontinue;
-          \t\t}
-          \t\tconst auto offset = m_program.srt_reads[slot].flat_offset;
-          \t\tconst bool clean  = m_clean_flat_slots && offset < m_compiled.clean_slots.size() &&
-          \t\t                   m_compiled.clean_slots[offset] != 0u;
-          \t\tif (clean &&
-          \t\t    (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
-          \t\t\treturn false;
-          \t\t}
-          \t\tauto& evaluator = clean ? *m_clean_evaluator : *this;
-          \t\tif (offset >= flat.size() || !evaluator.Evaluate(m_compiled.slots[slot], flat[offset])) {
-          \t\t\treturn false;
-          \t\t}
-          \t}'''
-          old=old.replace('\\t','\t')
-          new=r'''
-              const auto refresh_slot41=[&](uint32_t slot) {
-                  const auto offset=m_program.srt_reads[slot].flat_offset;
-                  const bool clean=m_clean_flat_slots && offset<m_compiled.clean_slots.size() &&
-                                   m_compiled.clean_slots[offset]!=0u;
-                  if (clean && (m_clean_evaluator==nullptr || m_runtime.read_specialization_memory==nullptr)) return false;
-                  auto& evaluator=clean ? *m_clean_evaluator : *this;
-                  return offset<flat.size() && evaluator.Evaluate(m_compiled.slots[slot],flat[offset]);
-              };
-              if (runs && CompactFlat41Enabled()) {
-                  for (const auto slot:m_compiled.scalar_slots41) {
-                      if (!refresh_slot41(slot)) return false;
-                  }
-              } else {
-                  for (uint32_t slot=0;slot<m_program.srt_reads.size();++slot) {
-                      if (runs && m_compiled.in_run[slot]!=0u) continue;
-                      if (!refresh_slot41(slot)) return false;
-                  }
-              }'''
-          replace(p,old,new)
-
           p='src/graphics/guest_gpu/graphicsRun.cpp'
           f=Path(p)
-          f.write_text('#include "graphics/shader/recompiler/ir/passes/CompactFlat41.h"\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
+          f.write_text('#include "graphics/shader/recompiler/ir/passes/ImmediateConditions42.h"\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
           replace(p,'\tg_gpu_thread = true;',r'''
               g_gpu_thread = true;
-              std::printf("flat41: compact residual-slot traversal %s\n",
-                  ShaderRecompiler::IR::CompactFlat41Enabled() ? "ON" : "OFF");
+              std::printf("condition42: immediate comparisons %s\n",
+                  ShaderRecompiler::IR::ImmediateConditions42Enabled() ? "ON" : "OFF");
               std::fflush(stdout);''')
 
           p='tests/ResourceMaterializationTests.cpp'
           f=Path(p)
-          f.write_text('#include "graphics/shader/recompiler/ir/passes/CompactFlat41.h"\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
+          f.write_text('#include "graphics/shader/recompiler/ir/passes/ImmediateConditions42.h"\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
+
           tests=r'''
-          void TestCompactFlat41() {
+          void TestImmediateConditions42() {
               using namespace Libs::Graphics::ShaderRecompiler::IR;
               SetResourceMaterializationVerification(true);
-              // A clean scalar slot remains outside the ordinary four-dword run.
-              auto plan=MemoPlan(MemoPlanExtra::None,false);
-              // Encode adjacent dwords as instruction offsets with one shared dynamic offset.
-              for (uint32_t slot=0;slot<plan.srt_reads.size();++slot) {
-                  auto* raw=plan.srt_reads[slot].value.TryInstruction();
-                  auto flags=raw->Flags<MemoryFlags>();
-                  auto memory=plan.memory_info[flags.index];
-                  memory.offset=slot*4u;
-                  flags.index=static_cast<uint32_t>(plan.memory_info.size());
-                  plan.memory_info.push_back(memory);
-                  raw->SetFlags(flags);
-                  raw->SetArg(1,Value(0u));
+              for (const bool masked:{false,true}) for (const bool unequal:{false,true})
+              for (const bool reverse:{false,true}) for (const bool mask_reverse:{false,true}) {
+                  auto plan=MemoPlan(MemoPlanExtra::DynamicRead,true);
+                  const auto input=plan.descriptor_sources[2].dwords[0];
+                  Value value=input;
+                  if (masked) {
+                      auto& band=plan.value_storage.emplace_back(ValueOpcode::BitwiseAnd32);
+                      band.SetArg(mask_reverse ? 1u : 0u,input);
+                      band.SetArg(mask_reverse ? 0u : 1u,Value(0xffu));
+                      value=Value(&band);
+                  }
+                  auto& cmp=plan.value_storage.emplace_back(unequal ? ValueOpcode::INotEqual32 : ValueOpcode::IEqual32);
+                  cmp.SetArg(reverse ? 1u : 0u,value);
+                  cmp.SetArg(reverse ? 0u : 1u,Value(0x21u));
+                  plan.control_flow[0].condition=Value(&cmp);
+                  const auto& compiled=CompileResourcePlan(plan);
+                  const auto op=compiled.nodes[compiled.conditions[0]].op;
+                  const auto wanted=masked ? ResourceNode::Op::MaskedCompareImmediate32 : ResourceNode::Op::CompareImmediate32;
+                  Check((op==wanted)==ImmediateConditions42Enabled(),"immediate comparison did not follow selected mode");
+                  MemoFixture f;
+                  for (const bool reject:{false,true}) for (const uint32_t word:{0u,0x21u,0x121u,0xffffffffu}) {
+                      f.memory.reject_strict=reject;
+                      f.memory.words[2]=word;
+                      Check(f.Refresh(plan),"immediate condition refresh failed");
+                      const bool truth=(((masked ? word&0xffu : word)==0x21u)!=unequal);
+                      Check((f.snapshot.buffers[0].dwords[0]!=0u)==(reject || truth) &&
+                            (f.snapshot.buffers[1].dwords[0]!=0u)==(reject || !truth),
+                            "immediate comparison changed branch activity or failure handling");
+                  }
               }
-              plan.clean_flat_slots.assign(plan.srt_reads.size(),0u);
-              plan.clean_flat_slots[4]=1u;
-              MemoFixture f;
-              const auto& compiled=CompileResourcePlan(plan);
-              Check(!compiled.flat_runs.empty(),"compact-flat fixture has no batched run");
-              if (CompactFlat41Enabled()) {
-                  Check(compiled.scalar_slots41==std::vector<uint32_t>{4u},
-                        "compact traversal lost or reordered a residual clean slot");
+              // A cycle must keep the original in-progress failure behavior.
+              {
+                  auto plan=MemoPlan(MemoPlanExtra::DynamicRead,true);
+                  auto& band=plan.value_storage.emplace_back(ValueOpcode::BitwiseAnd32);
+                  auto& cmp=plan.value_storage.emplace_back(ValueOpcode::IEqual32);
+                  band.SetArg(0,Value(&cmp));
+                  band.SetArg(1,Value(0xffu));
+                  cmp.SetArg(0,Value(&band));
+                  cmp.SetArg(1,Value(0x21u));
+                  plan.control_flow[0].condition=Value(&cmp);
+                  MemoFixture f;
+                  Check(f.Refresh(plan) && f.snapshot.buffers[0].dwords[0]!=0u &&
+                        f.snapshot.buffers[1].dwords[0]!=0u,
+                        "immediate comparison changed cycle failure handling");
               }
-              for (uint32_t i=0;i<128u;++i) {
-                  f.memory.words[0]^=0x100u;
-                  f.memory.words[4]=i;
-                  Check(f.Refresh(plan) && f.snapshot.flattened_srt[4]==i,
-                        "compact traversal lost fresh input data");
-              }
-              f.memory.reject_strict=true;
-              Check(!f.Refresh(plan),"compact traversal ignored a rejected clean slot");
-              f.memory.reject_strict=false;
-              // A rejected broad read must fall back to the original dword reads.
-              const auto exact=+[](void* data,uint64_t address,std::span<uint32_t> values) {
-                  return values.size()==1u && TableMemory::Read(data,address,values);
-              };
-              const SrtRuntime rt {.user_data=f.user_data,.read_memory=exact,.userdata=&f.memory,
-                  .read_specialization_memory=TableMemory::StrictRead};
-              Check(MaterializeResources(plan,rt,f.snapshot,f.specialization),
-                    "compact traversal broke grouped-read fallback");
-              SetFlatRunReads(false);
-              auto scalar=MemoPlan(MemoPlanExtra::None,false);
-              Check(CompileResourcePlan(scalar).flat_runs.empty() && f.Refresh(scalar),
-                    "compact traversal broke a plan without runs");
-              SetFlatRunReads(true);
-              std::puts("CompactFlat41: residual slots, fresh inputs, clean rejection and fallback passed");
+              std::puts("ImmediateConditions42: equality, inequality, masks, operand order, fresh reads, strict failures and cycles passed");
           }
           '''
-          replace(p,'int main() {',tests+'\nint main() {\n  TestCompactFlat41();')
-          print('Compact flat traversal 41 installed',flush=True)
+          replace(p,'int main() {',tests+'\nint main() {\n  TestImmediateConditions42();')
+          print('Immediate condition optimization 42 installed',flush=True)
           '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "Compact flat adaptation failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Immediate comparisons adaptation failed" }
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
@@ -299,14 +315,14 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected build step")
               if step["name"] == "Configure CMake":
-                  flags = os.environ["KYTY_FLAGS_41"]
+                  flags = os.environ["KYTY_FLAGS_42"]
                   args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
                           "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang-cl",
                           "-DCMAKE_CXX_COMPILER=clang-cl",
                           "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
                           "-DCMAKE_C_FLAGS_INIT=" + flags, "-DCMAKE_CXX_FLAGS_INIT=" + flags,
                           "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
-                  print("Configuring profile:", os.environ["KYTY_PROFILE_41"], flags, flush=True)
+                  print("Configuring profile:", os.environ["KYTY_PROFILE_42"], flags, flush=True)
                   subprocess.run(args, check=True)
                   cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
                   cpp_flags = next((line.split("=", 1)[1] for line in cache.splitlines()
@@ -317,7 +333,7 @@ jobs:
                       raise RuntimeError("Selected CPU flags are missing from CMAKE_CXX_FLAGS")
                   print("Verified C++ flags:", cpp_flags, flush=True)
                   continue
-              script = Path(f"_build41_{index}.ps1")
+              script = Path(f"_build42_{index}.ps1")
               source = step["run"]
               if step["name"] == "Install glslang":
                   api_call = '$release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers'
@@ -338,7 +354,7 @@ jobs:
               os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
               if step["name"] == "Test memory and shader paths":
                   for mode in ("0", "1"):
-                      os.environ["KYTY_COMPACT_FLAT_41"] = mode
+                      os.environ["KYTY_IMMEDIATE_CONDITIONS_42"] = mode
                       subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
               else:
                   subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -353,12 +369,12 @@ jobs:
           $install = "_Build/windows/install"
           if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
           foreach ($mode in @(0, 1)) {
-              $name = if ($mode -eq 1) { "Prueba-41.cmd" } else { "Comparacion-41.cmd" }
+              $name = if ($mode -eq 1) { "Prueba-42.cmd" } else { "Comparacion-42.cmd" }
               @(
                   '@echo off',
                   'setlocal',
                   'cd /d "%~dp0"',
-                  "set KYTY_COMPACT_FLAT_41=$mode",
+                  "set KYTY_IMMEDIATE_CONDITIONS_42=$mode",
                   'set KYTY_REDUNDANT_SOURCES_38=0',
                   'set KYTY_RESOURCE_COSTS_37=0',
                   'set KYTY_FROZEN_DIAGNOSTIC_36=0',
@@ -410,20 +426,20 @@ jobs:
           Copy-Item $pdb $install -Force
           @(
               "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-              "Prueba-41.cmd: optional compact traversal; original reads retained.",
-              "Comparacion-41.cmd: same executable, compact traversal OFF.",
+              "Prueba-42.cmd: optional immediate comparisons; original reads retained.",
+              "Comparacion-42.cmd: same executable, immediate comparisons OFF.",
               "Compare the same heavy view for 60 seconds in each mode.",
               "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
               "Copy your working _Patches and select THIS interpreter.",
               "Warm up, then remain in the fixed heavy view for 60 seconds.",
-              "Copy Prueba-41 console including flat41 and flat41-plan lines.",
+              "Copy Prueba-42 console including condition42 and condition42-plan lines.",
               "Close emulator and launcher completely before changing mode."
-          ) | Set-Content "$install/PRUEBA-41.txt" -Encoding ascii
+          ) | Set-Content "$install/PRUEBA-42.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Prueba-41.zip"
+          $zip = "KytyPS5-Prueba-42.zip"
           Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
               throw "Packaging failed: missing or empty ZIP"
@@ -432,7 +448,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Prueba-41
-          path: KytyPS5-Prueba-41.zip
+          name: KytyPS5-Prueba-42
+          path: KytyPS5-Prueba-42.zip
           if-no-files-found: error
           retention-days: 7
