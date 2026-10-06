@@ -1,4 +1,4 @@
-name: Windows AMD - Diagnostico 36 - Entradas independientes
+name: Windows AMD - Diagnostico 37 - Coste por shader
 
 'on':
   workflow_dispatch:
@@ -8,12 +8,12 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - Diagnostico 36
+    name: Windows x64 - Diagnostico 37
     runs-on: windows-2022
 
     env:
-      KYTY_FLAGS_36: /clang:-ffp-contract=off
-      KYTY_PROFILE_36: Generica
+      KYTY_FLAGS_37: /clang:-ffp-contract=off
+      KYTY_PROFILE_37: Generica
 
     defaults:
       run:
@@ -79,7 +79,8 @@ jobs:
                 continue
             if "uses" in step or "run" not in step:
                 raise RuntimeError("Unexpected baseline preparation step")
-            script = Path(f"_prepare36_{index}.ps1")
+
+            script = Path(f"_prepare37_{index}.ps1")
             script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
             print("Preparing:", step["name"], flush=True)
             subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -89,297 +90,143 @@ jobs:
         '@ | & $env:KYTY_PYTHON -
         if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-    - name: Add frozen-input diagnostic and isolation tests
+    - name: Add resource timing by shader
       run: |
         $ErrorActionPreference = "Stop"
         @'
         from pathlib import Path
 
-        Path('src/graphics/shader/recompiler/ir/passes/FrozenResourceInputs36.h').parent.mkdir(parents=True,exist_ok=True)
-        Path('src/graphics/shader/recompiler/ir/passes/FrozenResourceInputs36.h').write_text(r'''
-        #pragma once
-        #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
-        #include <algorithm>
-        #include <limits>
-
-        namespace Libs::Graphics::ShaderRecompiler::IR {
-        inline thread_local bool t_frozen_probe36 = false;
-
-        // Conservative first subset. Eligibility does not imply a performance gain.
-        inline bool FrozenInputsEligible36(const ResourcePlan& plan) {
-          if (!plan.compiled || !plan.compiled->memoizable || !plan.srt_plan_complete ||
-              !plan.resource_tracking_complete || plan.has_address_writes ||
-              plan.uniform_fill.fill.words != 0u) return false;
-
-          if (std::ranges::any_of(plan.clean_flat_slots, [](auto value){return value != 0u;}) ||
-              std::ranges::any_of(plan.info.buffers, &BufferResource::written) ||
-              std::ranges::any_of(plan.info.images, &ImageResource::written) ||
-              std::ranges::any_of(plan.descriptor_sources, [](const auto& source){return source.indirect_image.has_value();}))
-            return false;
-
-          for (const auto& node : plan.compiled->nodes) {
-            if (node.op == ResourceNode::Op::Select || node.op == ResourceNode::Op::ReadFirstLane ||
-                (node.flags & ResourceNode::CleanSlot) != 0u) return false;
-          }
-
-          for (size_t i=0; i<plan.compiled->conditions.size(); ++i) {
-            if (plan.compiled->conditions[i] != ResourceNode::NoNode &&
-                (i >= plan.compiled->direct_conditions.size() || plan.compiled->direct_conditions[i] == 0u))
-              return false;
-          }
-          return true;
-        }
-
-        class FrozenResourceInputs36 {
-         public:
-          bool Capture(const ResourcePlan& plan, const SrtRuntime& source) {
-            words.clear(); flat.clear(); valid=false;
-            if (!FrozenInputsEligible36(plan) || source.read_memory == nullptr) return false;
-            user_data.assign(source.user_data.begin(),source.user_data.end());
-            shader_base=source.shader_base;
-
-            CaptureContext context {source,this};
-            auto runtime=source;
-            runtime.user_data=user_data;
-            runtime.userdata=&context;
-            runtime.read_memory=CaptureRead;
-            runtime.read_memory_block=nullptr;
-            runtime.read_specialization_memory=nullptr;
-            runtime.specialization_block_reads=false;
-
-            SrtEvaluator evaluator(plan,*plan.compiled,runtime);
-            if (!evaluator.RefreshFlatBuffer(flat)) return false;
-
-            std::ranges::sort(words,{},&Word::address);
-            size_t kept=0;
-            for (const auto& word : words) {
-              if (kept != 0u && words[kept-1].address == word.address) {
-                if (words[kept-1].value != word.value) return false;
-              } else {
-                words[kept++]=word;
-              }
-            }
-            words.resize(kept); valid=true;
-            return true;
-          }
-
-          SrtRuntime Runtime() const {
-            return {.user_data=user_data,.shader_base=shader_base,.read_memory=Read,
-              .userdata=const_cast<FrozenResourceInputs36*>(this),.read_specialization_memory=Read};
-          }
-
-          bool Valid() const {return valid;}
-          size_t WordCount() const {return words.size();}
-
-         private:
-          struct Word {uint64_t address; uint32_t value;};
-          struct CaptureContext {SrtRuntime source; FrozenResourceInputs36* packet;};
-
-          static bool CaptureRead(void* opaque,uint64_t address,std::span<uint32_t> values) {
-            auto& ctx=*static_cast<CaptureContext*>(opaque);
-            if (values.size()>65536u || ctx.packet->words.size()>65536u-values.size() ||
-                values.size_bytes()>std::numeric_limits<uint64_t>::max()-address) return false;
-            if (!ctx.source.read_memory(ctx.source.userdata,address,values)) return false;
-            for (size_t i=0;i<values.size();++i) ctx.packet->words.push_back({address+i*4u,values[i]});
-            return true;
-          }
-
-          static bool Read(void* opaque,uint64_t address,std::span<uint32_t> values) {
-            const auto& packet=*static_cast<const FrozenResourceInputs36*>(opaque);
-            if (!packet.valid || values.size_bytes()>std::numeric_limits<uint64_t>::max()-address) return false;
-            for (size_t i=0;i<values.size();++i) {
-              const auto at=address+i*4u;
-              const auto found=std::ranges::lower_bound(packet.words,at,{},&Word::address);
-              if (found==packet.words.end() || found->address!=at) return false;
-              values[i]=found->value;
-            }
-            return true;
-          }
-
-          std::vector<Word> words;
-          std::vector<uint32_t> user_data,flat;
-          uint64_t shader_base=0;
-          bool valid=false;
-        };
-        }
-        ''',encoding="utf-8",newline="\n")
-
-        Path('patches/probe36.txt').parent.mkdir(parents=True,exist_ok=True)
-        Path('patches/probe36.txt').write_text(r'''
-        namespace {
-        struct FrozenProbeStats36 {
-            uint64_t samples=0, eligible=0, captured=0, failures=0;
-            double serial_us=0, capture_us=0, replay_us=0;
-        };
-
-        void ProbeFrozenInputs36(const ResourcePlan& plan, const SrtRuntime& runtime, double serial_us) {
-            static FrozenProbeStats36 stats;
-            static FrozenResourceInputs36 packet;
-            static ResourceSnapshot replay,reference;
-            static ResourceSpecialization replay_spec,reference_spec;
-
-            ++stats.samples;
-            if (FrozenInputsEligible36(plan)) {
-                ++stats.eligible;
-                const auto begin=std::chrono::steady_clock::now();
-                const bool captured=packet.Capture(plan,runtime);
-                const auto captured_at=std::chrono::steady_clock::now();
-
-                if (captured) {
-                    ++stats.captured;
-                    stats.serial_us+=serial_us;
-                    stats.capture_us+=std::chrono::duration<double,std::micro>(captured_at-begin).count();
-
-                    const auto frozen=packet.Runtime();
-                    const auto replay_begin=std::chrono::steady_clock::now();
-                    const bool replay_ok=MaterializeCompiled(plan,frozen,replay,replay_spec,nullptr);
-                    const auto replay_end=std::chrono::steady_clock::now();
-                    stats.replay_us+=std::chrono::duration<double,std::micro>(replay_end-replay_begin).count();
-
-                    // Compare on the same frozen inputs; never adopt this diagnostic result in the game.
-                    const bool reference_ok=MaterializeResourcesReference(plan,frozen,reference,reference_spec);
-                    if (!replay_ok || !reference_ok || replay.buffers!=reference.buffers ||
-                        replay.images!=reference.images || replay.samplers!=reference.samplers ||
-                        replay.user_data!=reference.user_data || replay.flattened_srt!=reference.flattened_srt ||
-                        replay.uniform_fill!=reference.uniform_fill || replay_spec!=reference_spec) ++stats.failures;
-                } else {
-                    ++stats.failures;
-                }
-            }
-
-            if (stats.samples==1u || stats.samples%64u==0u) {
-                const auto n=stats.captured!=0u ? static_cast<double>(stats.captured) : 1.0;
-                std::printf("frozen36: samples=%llu eligible=%llu captured=%llu failures=%llu serial-us=%.3f capture-us=%.3f replay-us=%.3f\n",
-                    static_cast<unsigned long long>(stats.samples),
-                    static_cast<unsigned long long>(stats.eligible),
-                    static_cast<unsigned long long>(stats.captured),
-                    static_cast<unsigned long long>(stats.failures),
-                    stats.serial_us/n,stats.capture_us/n,stats.replay_us/n);
-                std::fflush(stdout);
-            }
-        }
-        }
-        ''',encoding="utf-8",newline="\n")
-
-        Path('patches/frozen_test36.txt').parent.mkdir(parents=True,exist_ok=True)
-        Path('patches/frozen_test36.txt').write_text(r'''
-        void TestFrozenInputs36() {
-          using namespace Libs::Graphics::ShaderRecompiler::IR;
-          SetResourceMaterializationVerification(false);
-          const auto plan=MemoPlan(MemoPlanExtra::None,true);
-          (void)CompileResourcePlan(plan);
-          Check(FrozenInputsEligible36(plan),"simple plan rejected");
-
-          struct Job {FrozenResourceInputs36 input; ResourceSnapshot expected; ResourceSpecialization spec;};
-          std::array<std::vector<Job>,2> jobs;
-
-          for(uint32_t stream=0;stream<2;stream++) {
-            jobs[stream].resize(128);
-            MemoFixture f;
-            for(uint32_t step=0;step<128;step++) {
-              f.user_data={static_cast<uint32_t>(TableMemory::Base),0u,0u,8u};
-              for (uint32_t word=0;word<f.memory.words.size();++word) f.memory.words[word]=0x1000u+word;
-              f.memory.words[3]=0;
-              f.memory.words[0]=(step+stream*512u)*16u;
-              f.memory.words[1]=0x100u+step+stream*512u;
-              f.memory.words[4]=(step+stream)&1u;
-              f.user_data[2]=0x200u+step+stream*512u;
-
-              const SrtRuntime runtime {.user_data=f.user_data,.read_memory=TableMemory::DirectRead,
-                .userdata=&f.memory,.read_specialization_memory=TableMemory::StrictRead};
-
-              auto& job=jobs[stream][step];
-              Check(MaterializeResourcesReference(plan,runtime,job.expected,job.spec),"reference failed");
-              Check(job.input.Capture(plan,runtime),"freeze failed");
-              Check(job.input.Valid() && job.input.WordCount()==5,"capture lost flat inputs");
-              f.user_data.fill(0xffffffffu);f.memory.words.fill(0xffffffffu);
-
-              uint32_t missing=0;
-              const auto frozen=job.input.Runtime();
-              Check(!frozen.read_memory(frozen.userdata,0x40,{&missing,1}),"missing word accepted");
-            }
-          }
-
-          std::atomic<bool> start=false;
-          const auto run=[&](uint32_t stream) {
-            t_resource_scratch_slot=stream;
-            while(!start.load(std::memory_order_acquire)) std::this_thread::yield();
-            ResourceSnapshot out;ResourceSpecialization spec;
-            for(uint32_t i=0;i<32768;i++) {
-              const auto& job=jobs[stream][i%128];
-              Check(MaterializeResources(plan,job.input.Runtime(),out,spec),"frozen replay failed");
-              const auto& e=job.expected;
-              Check(out.buffers==e.buffers && out.images==e.images && out.samplers==e.samplers &&
-                out.user_data==e.user_data && out.flattened_srt==e.flattened_srt &&
-                out.uniform_fill==e.uniform_fill && spec==job.spec,"frozen replay differs after source changed");
-            }
-          };
-
-          std::thread worker([&]{run(1);});
-          start.store(true,std::memory_order_release);
-          run(0);
-          worker.join();
-          t_resource_scratch_slot=0;
-
-          for(const auto extra:{MemoPlanExtra::DynamicRead,MemoPlanExtra::MemoryPredicate,MemoPlanExtra::ReadFirstLane}) {
-            const auto unsafe=MemoPlan(extra,true);
-            (void)CompileResourcePlan(unsafe);
-            Check(!FrozenInputsEligible36(unsafe),"unsupported plan accepted");
-          }
-
-          MemoFixture f;FrozenResourceInputs36 packet;
-          const SrtRuntime runtime {.user_data=f.user_data,.read_memory=TableMemory::DirectRead,
-            .userdata=&f.memory,.read_specialization_memory=TableMemory::StrictRead};
-          Check(packet.Capture(plan,runtime),"initial capture failed");
-          f.user_data[0]=0x40;
-          Check(!packet.Capture(plan,runtime) && !packet.Valid(),"failed recapture kept stale valid data");
-
-          std::puts("Frozen input tests: 65536 parallel replays match the pre-mutation reference; unsafe plans and reads rejected");
-        }
-        ''',encoding="utf-8",newline="\n")
-
-        def replace(path, old, new):
+        def replace(path,old,new):
             p=Path(path)
-            s=p.read_text(encoding="utf-8")
+            s=p.read_text(encoding='utf-8')
             if s.count(old)!=1:
-                raise RuntimeError("Unexpected frozen input boundary: "+path)
-            p.write_text(s.replace(old,new),encoding="utf-8",newline="\n")
+                raise RuntimeError('Unexpected diagnostic 37 boundary: '+path)
+            p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
 
-        p=Path("src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp")
-        p.write_text('#include "graphics/shader/recompiler/ir/passes/FrozenResourceInputs36.h"\n#include <chrono>\n#include <cstdio>\n'+p.read_text(encoding="utf-8"),encoding="utf-8")
+        header='src/graphics/shader/recompiler/ir/passes/ResourceCosts37.h'
+        Path(header).write_text('#pragma once\nnamespace Libs::Graphics::ShaderRecompiler::IR {\ninline thread_local bool t_resource_costs37=false;\n}\n',encoding='utf-8')
+
+        p=Path('src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp')
+        p.write_text('#include "graphics/shader/recompiler/ir/passes/ResourceCosts37.h"\n#include <chrono>\n#include <map>\n#include <tuple>\n#include <string>\n'+p.read_text(encoding='utf-8'),encoding='utf-8')
+
+        helper=r'''
+        namespace {
+        const char* ResourceReason37(const ResourcePlan& p) {
+            if (!p.compiled || !p.srt_plan_complete || !p.resource_tracking_complete) return "incomplete";
+            if (p.has_address_writes) return "address-writes";
+            if (p.uniform_fill.fill.words!=0u) return "uniform-fill";
+            if (std::ranges::any_of(p.clean_flat_slots,[](auto x){return x!=0u;})) return "clean-SRT";
+            if (std::ranges::any_of(p.info.buffers,&BufferResource::written)) return "buffer-writes";
+            if (std::ranges::any_of(p.info.images,&ImageResource::written)) return "image-writes";
+            if (std::ranges::any_of(p.descriptor_sources,[](const auto& x){return x.indirect_image.has_value();})) return "indirect-images";
+
+            for (const auto& n:p.compiled->nodes) {
+                if (n.op==ResourceNode::Op::Select) return "select";
+                if (n.op==ResourceNode::Op::ReadFirstLane) return "read-first-lane";
+                if ((n.flags&ResourceNode::CleanSlot)!=0u) return "clean-node";
+            }
+
+            for (size_t i=0;i<p.compiled->conditions.size();++i) {
+                if (p.compiled->conditions[i]!=ResourceNode::NoNode &&
+                    (i>=p.compiled->direct_conditions.size() || p.compiled->direct_conditions[i]==0u))
+                    return "strict-condition";
+            }
+
+            if (!p.compiled->memoizable)
+                return p.requires_specialization_memory ? "strict-memory" : "other-nonmemo";
+            return "capturable36";
+        }
+
+        struct ResourceRow37 {
+            uint64_t calls=0,hits=0,failed=0;
+            double us=0;
+            const char* reason=nullptr;
+        };
+
+        void RecordResourceCost37(const ResourcePlan& p,double us,bool result,bool hit) {
+            using Key=std::tuple<uint64_t,uint32_t,std::string>;
+            static std::map<Key,ResourceRow37> rows;
+            static uint64_t samples=0;
+            static double total_us=0;
+            static auto start=std::chrono::steady_clock::now();
+
+            ++samples;
+            total_us+=us;
+            const auto* reason=ResourceReason37(p);
+            const Key key {p.shader_hash,static_cast<uint32_t>(p.stage),reason};
+
+            if (rows.size()<8192u || rows.contains(key)) {
+                auto& r=rows[key];
+                if (r.reason==nullptr) r.reason=reason;
+                ++r.calls;
+                r.us+=us;
+                r.hits+=hit ? 1u : 0u;
+                r.failed+=result ? 0u : 1u;
+            }
+
+            if (samples%256u!=0u) return;
+            const auto now=std::chrono::steady_clock::now();
+            std::vector<std::pair<Key,ResourceRow37>> sorted(rows.begin(),rows.end());
+            std::ranges::sort(sorted,[](const auto& a,const auto& b){return a.second.us>b.second.us;});
+
+            std::printf("resource37: interval-s=%.2f samples=%llu avg-us=%.3f groups=%zu; ranked by sampled CPU time\n",
+                std::chrono::duration<double>(now-start).count(),
+                static_cast<unsigned long long>(samples),total_us/samples,rows.size());
+
+            for (size_t i=0;i<std::min<size_t>(12u,sorted.size());++i) {
+                const auto& [k,r]=sorted[i];
+                std::printf("resource37-row: shader=%016llx stage=%u reason=%s calls=%llu hits=%llu failed=%llu avg-us=%.3f sample-share=%.2f%%\n",
+                    static_cast<unsigned long long>(std::get<0>(k)),std::get<1>(k),r.reason,
+                    static_cast<unsigned long long>(r.calls),
+                    static_cast<unsigned long long>(r.hits),
+                    static_cast<unsigned long long>(r.failed),
+                    r.us/r.calls,total_us>0 ? 100.0*r.us/total_us : 0.0);
+            }
+
+            std::fflush(stdout);
+            rows.clear();
+            samples=0;
+            total_us=0;
+            start=std::chrono::steady_clock::now();
+        }
+        }
+        '''
 
         boundary='bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,'
-        replace(str(p),boundary,Path("patches/probe36.txt").read_text(encoding="utf-8")+'\n'+boundary)
+        replace(str(p),boundary,helper+'\n'+boundary)
 
         replace(str(p),
             '\tconst bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);',
-            '''    thread_local uint64_t calls36=0;
-            const bool sample36=t_frozen_probe36 && (++calls36%4096u==0u);
-            const auto begin36=sample36 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
-        \tconst bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);
-            if (sample36 && result) {
-                const auto us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin36).count();
-                ProbeFrozenInputs36(program,runtime,us);
+            r'''    thread_local uint64_t calls37=0;
+            thread_local uint32_t slot37=1543u;
+            bool sample37=false;
+            if (t_resource_costs37) {
+                ++calls37;
+                if ((calls37&4095u)==0u) slot37=(slot37+1543u)&4095u;
+                sample37=(calls37&4095u)==slot37;
+            }
+            const auto begin37=sample37 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
+            const bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);
+            if (sample37) {
+                const auto us=std::chrono::duration<double,std::micro>(std::chrono::steady_clock::now()-begin37).count();
+                RecordResourceCost37(program,us,result,memo!=nullptr && memo->reused);
             }''')
 
-        p=Path("src/graphics/guest_gpu/graphicsRun.cpp")
-        p.write_text('#include "graphics/shader/recompiler/ir/passes/FrozenResourceInputs36.h"\n#include <cstdio>\n#include <cstdlib>\n'+p.read_text(encoding="utf-8"),encoding="utf-8")
+        p=Path('src/graphics/guest_gpu/graphicsRun.cpp')
+        p.write_text('#include "graphics/shader/recompiler/ir/passes/ResourceCosts37.h"\n'+p.read_text(encoding='utf-8'),encoding='utf-8')
 
-        replace(str(p),'\tg_gpu_thread = true;', '''\tg_gpu_thread = true;
-            const auto* frozen36=std::getenv("KYTY_FROZEN_DIAGNOSTIC_36");
-            ShaderRecompiler::IR::t_frozen_probe36 = frozen36 != nullptr && frozen36[0]=='1' && frozen36[1]=='\\0';
-            if (ShaderRecompiler::IR::t_frozen_probe36) {
-                std::printf("frozen36: diagnostic active; game results unchanged; sample stride=4096\\n");
+        replace(str(p),'\tg_gpu_thread = true;',r'''    g_gpu_thread = true;
+            const char* costs37=std::getenv("KYTY_RESOURCE_COSTS_37");
+            ShaderRecompiler::IR::t_resource_costs37=costs37!=nullptr && costs37[0]=='1' && costs37[1]=='\0';
+            if (ShaderRecompiler::IR::t_resource_costs37) {
+                std::printf("resource37: diagnostic active; original execution; one sample per 4096 calls\n");
+                std::printf("resource37: stage legend: Unknown=0 Vertex=1 Pixel=2 Fetch=3 Compute=4 Mesh=5 Local=6 TessControl=7 TessEval=8\n");
                 std::fflush(stdout);
             }''')
 
-        p=Path("tests/ResourceMaterializationTests.cpp")
-        p.write_text('#include "graphics/shader/recompiler/ir/passes/FrozenResourceInputs36.h"\n#include <atomic>\n#include <thread>\n'+p.read_text(encoding="utf-8"),encoding="utf-8")
-        replace(str(p),'int main() {',Path("patches/frozen_test36.txt").read_text(encoding="utf-8")+'\nint main() {\n  TestFrozenInputs36();')
-
-        print("Diagnostic 36 installed; game results remain on the original path",flush=True)
+        print('Diagnostic 37 installed: timing original calls only',flush=True)
         '@ | & $env:KYTY_PYTHON -
-        if ($LASTEXITCODE -ne 0) { throw "Diagnostic 36 adaptation failed" }
+        if ($LASTEXITCODE -ne 0) { throw "Diagnostic 37 adaptation failed" }
         git diff --check
         if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
@@ -435,15 +282,17 @@ jobs:
                 raise RuntimeError("Unexpected build step")
 
             if step["name"] == "Configure CMake":
-                flags = os.environ["KYTY_FLAGS_36"]
+                flags = os.environ["KYTY_FLAGS_37"]
                 args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
-                        "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang-cl",
+                        "-DCMAKE_BUILD_TYPE=Release",
+                        "-DCMAKE_C_COMPILER=clang-cl",
                         "-DCMAKE_CXX_COMPILER=clang-cl",
                         "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
-                        "-DCMAKE_C_FLAGS_INIT=" + flags, "-DCMAKE_CXX_FLAGS_INIT=" + flags,
+                        "-DCMAKE_C_FLAGS_INIT=" + flags,
+                        "-DCMAKE_CXX_FLAGS_INIT=" + flags,
                         "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
 
-                print("Configuring profile:", os.environ["KYTY_PROFILE_36"], flags, flush=True)
+                print("Configuring profile:", os.environ["KYTY_PROFILE_37"], flags, flush=True)
                 subprocess.run(args, check=True)
 
                 cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
@@ -458,7 +307,7 @@ jobs:
                 print("Verified C++ flags:", cpp_flags, flush=True)
                 continue
 
-            script = Path(f"_build36_{index}.ps1")
+            script = Path(f"_build37_{index}.ps1")
             script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
             print("Running:", step["name"], flush=True)
 
@@ -480,12 +329,13 @@ jobs:
         if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
 
         foreach ($mode in @(0, 1)) {
-            $name = if ($mode -eq 1) { "Diagnostico-36.cmd" } else { "Comparacion-36.cmd" }
+            $name = if ($mode -eq 1) { "Diagnostico-37.cmd" } else { "Comparacion-37.cmd" }
             @(
                 '@echo off',
                 'setlocal',
                 'cd /d "%~dp0"',
-                "set KYTY_FROZEN_DIAGNOSTIC_36=$mode",
+                "set KYTY_RESOURCE_COSTS_37=$mode",
+                'set KYTY_FROZEN_DIAGNOSTIC_36=0',
                 'set KYTY_DESCRIPTOR_MEMO_35=0',
                 'set KYTY_DESCRIPTOR_STATS_35=0',
                 'set KYTY_DESCRIPTOR_RECIPES_34=0',
@@ -537,20 +387,20 @@ jobs:
 
         @(
             "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-            "Diagnostico-36.cmd: samples frozen inputs; diagnostic results are never adopted.",
-            "Comparacion-36.cmd: same executable, diagnostic OFF.",
-            "This is a measurement build, not a parallel rendering or FPS improvement build.",
+            "Diagnostico-37.cmd: samples the original resource preparation by shader.",
+            "Comparacion-37.cmd: same executable, diagnostic OFF.",
+            "Reports timing only; no extra resource evaluation or memory capture.",
             "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
             "Copy your working _Patches and select THIS interpreter.",
             "Warm up, then remain in the fixed heavy view for 60 seconds.",
-            "Copy console output including frozen36 lines.",
+            "Copy console output including resource37 lines.",
             "Close emulator and launcher completely before changing mode."
-        ) | Set-Content "$install/DIAGNOSTICO-36.txt" -Encoding ascii
+        ) | Set-Content "$install/DIAGNOSTICO-37.txt" -Encoding ascii
 
     - name: Create Windows ZIP
       run: |
         $ErrorActionPreference = "Stop"
-        $zip = "KytyPS5-Diagnostico-36.zip"
+        $zip = "KytyPS5-Diagnostico-37.zip"
         Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
         if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
             throw "Packaging failed: missing or empty ZIP"
@@ -559,7 +409,7 @@ jobs:
     - name: Upload KytyPS5
       uses: actions/upload-artifact@v4
       with:
-        name: KytyPS5-Diagnostico-36
-        path: KytyPS5-Diagnostico-36.zip
+        name: KytyPS5-Diagnostico-37
+        path: KytyPS5-Diagnostico-37.zip
         if-no-files-found: error
         retention-days: 7
