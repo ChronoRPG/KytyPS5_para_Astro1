@@ -1,4 +1,4 @@
-name: Windows AMD - Diagnostico 40 - Coste de lecturas
+name: Windows AMD - Prueba 41 - Recorrido compacto
 
 on:
   workflow_dispatch:
@@ -8,12 +8,12 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - Diagnostico 40
+    name: Windows x64 - Prueba 41
     runs-on: windows-2022
 
     env:
-      KYTY_FLAGS_40: /clang:-ffp-contract=off
-      KYTY_PROFILE_40: Generica
+      KYTY_FLAGS_41: /clang:-ffp-contract=off
+      KYTY_PROFILE_41: Generica
 
     defaults:
       run:
@@ -77,7 +77,7 @@ jobs:
                   continue
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected baseline preparation step")
-              script = Path(f"_prepare40_{index}.ps1")
+              script = Path(f"_prepare41_{index}.ps1")
               script.write_text('$ErrorActionPreference = "Stop"\n' + step["run"], encoding="utf-8")
               print("Preparing:", step["name"], flush=True)
               subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
@@ -86,7 +86,7 @@ jobs:
           '@ | & $env:KYTY_PYTHON -
           if ($LASTEXITCODE -ne 0) { throw "Baseline preparation failed" }
 
-      - name: Add sampled original-reader timings
+      - name: Add optional compact flat traversal and regression tests
         run: |
           $ErrorActionPreference = "Stop"
           @'
@@ -95,211 +95,156 @@ jobs:
           def replace(path,old,new):
               p=Path(path);s=p.read_text(encoding='utf-8')
               if s.count(old)!=1:
-                  raise RuntimeError('Unexpected phase 40 boundary: '+path)
+                  raise RuntimeError('Unexpected compact-flat boundary: '+path)
               p.write_text(s.replace(old,new),encoding='utf-8',newline='\n')
 
-          Path('src/graphics/shader/recompiler/ir/passes/ResourcePhases40.h').write_text(
-              '#pragma once\nnamespace Libs::Graphics::ShaderRecompiler::IR { inline thread_local bool t_phases40=false; }\n',
-              encoding='utf-8'
-          )
-
-          p=Path('src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp')
-          p.write_text(
-              '#include "graphics/shader/recompiler/ir/passes/ResourcePhases40.h"\n#include <chrono>\n'+p.read_text(encoding='utf-8'),
-              encoding='utf-8'
-          )
-
-          helper=r'''
-          using PhaseClock40=std::chrono::steady_clock;
-          struct PhaseState40 {
-              bool active=false;
-              uint32_t phase=0;
-              std::array<double,6> us {};
-              std::array<std::array<double,3>,6> read_us {};
-              std::array<std::array<uint64_t,3>,6> reads {}, failed_reads {}, bytes {};
-              PhaseClock40::time_point last;
-          };
-          thread_local PhaseState40 phase40;
-
-          void MarkPhase40(uint32_t next) {
-              if (!phase40.active) return;
-              const auto now=PhaseClock40::now();
-              phase40.us[phase40.phase]+=std::chrono::duration<double,std::micro>(now-phase40.last).count();
-              phase40.phase=next;
-              phase40.last=now;
+          header='src/graphics/shader/recompiler/ir/passes/CompactFlat41.h'
+          Path(header).write_text(r'''#pragma once
+          #include <cstdlib>
+          #include <cstring>
+          namespace Libs::Graphics::ShaderRecompiler::IR {
+          inline bool CompactFlat41Enabled() {
+              static const bool enabled=[] {
+                  const auto* v=std::getenv("KYTY_COMPACT_FLAT_41");
+                  return v!=nullptr && std::strcmp(v,"1")==0;
+              }();
+              return enabled;
           }
+          }
+          ''',encoding='utf-8')
 
-          struct ReadProbe40 {
-              SrtRuntime source;
+          p='src/graphics/shader/recompiler/ir/ShaderIR.h'
+          replace(p,'\tstd::vector<uint8_t>                 in_run; // Per srt_reads entry; empty without runs.',
+          '''\tstd::vector<uint8_t>                 in_run; // Per srt_reads entry; empty without runs.
+              // Original-order slots left after batched runs; immutable once compiled.
+              std::vector<uint32_t>                scalar_slots41;''')
 
-              static bool Read(void* data,uint64_t address,std::span<uint32_t> values) {
-                  return static_cast<ReadProbe40*>(data)->Call(0,address,values);
-              }
-
-              static bool Strict(void* data,uint64_t address,std::span<uint32_t> values) {
-                  return static_cast<ReadProbe40*>(data)->Call(1,address,values);
-              }
-
-              static bool Block(void* data,uint64_t address,std::span<uint32_t> values) {
-                  return static_cast<ReadProbe40*>(data)->Call(2,address,values);
-              }
-
-              bool Call(uint32_t kind,uint64_t address,std::span<uint32_t> values) {
-                  const auto reader=kind==0 ? source.read_memory : kind==1 ? source.read_specialization_memory : source.read_memory_block;
-                  auto* data=kind==1 ? SpecializationUserdata(source) : source.userdata;
-                  const auto phase=phase40.phase;
-                  const auto start=PhaseClock40::now();
-                  const bool ok=reader(data,address,values);
-                  const auto stop=PhaseClock40::now();
-                  phase40.read_us[phase][kind]+=std::chrono::duration<double,std::micro>(stop-start).count();
-                  ++phase40.reads[phase][kind];
-                  phase40.failed_reads[phase][kind]+=ok ? 0u : 1u;
-                  phase40.bytes[phase][kind]+=values.size_bytes();
-                  return ok;
-              }
-
-              SrtRuntime Runtime() {
-                  auto r=source;
-                  if (source.read_memory!=nullptr) r.read_memory=Read;
-                  if (source.read_memory_block!=nullptr) r.read_memory_block=Block;
-                  r.userdata=this;
-                  if (source.read_specialization_memory!=nullptr) {
-                      r.read_specialization_memory=Strict;
-                      r.specialization_userdata=this;
+          p='src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp'
+          f=Path(p)
+          f.write_text('#include "graphics/shader/recompiler/ir/passes/CompactFlat41.h"\n#include <atomic>\n#include <cstdio>\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
+          replace(p,'\tBuildFlatRuns(program, *compiled);',r'''
+              BuildFlatRuns(program, *compiled);
+              if (CompactFlat41Enabled() && !compiled->flat_runs.empty()) {
+                  for (uint32_t slot=0;slot<program.srt_reads.size();++slot) {
+                      if (compiled->in_run[slot]==0u) compiled->scalar_slots41.push_back(slot);
                   }
-                  return r;
-              }
-          };
+                  static std::atomic<uint32_t> reports41 {0};
+                  if (reports41.fetch_add(1,std::memory_order_relaxed)<12u ||
+                      program.shader_hash==0x3b809f9d156a95ddull || program.shader_hash==0xf112e0ba527945adull) {
+                      std::printf("flat41-plan: shader=%016llx slots=%llu batched=%llu residual=%llu\n",
+                          static_cast<unsigned long long>(program.shader_hash),
+                          static_cast<unsigned long long>(program.srt_reads.size()),
+                          static_cast<unsigned long long>(program.srt_reads.size()-compiled->scalar_slots41.size()),
+                          static_cast<unsigned long long>(compiled->scalar_slots41.size()));
+                      std::fflush(stdout);
+                  }
+              }''')
 
-          bool BeginPhase40(const ResourcePlan& p) {
-              if (!t_phases40) return false;
-              const int target=p.shader_hash==0x3b809f9d156a95ddull ? 0 : p.shader_hash==0xf112e0ba527945adull ? 1 : -1;
-              if (target<0) return false;
-              thread_local std::array<uint64_t,2> calls {};
-              thread_local std::array<uint32_t,2> slots {519u,519u};
-              const auto n=++calls[target];
-              if ((n&1023u)==0u) slots[target]=(slots[target]+487u)&1023u;
-              if ((n&1023u)!=(slots[target]&1023u)) return false;
-              phase40.us.fill(0);
-              phase40.read_us={};
-              phase40.reads={};
-              phase40.failed_reads={};
-              phase40.bytes={};
-              phase40.phase=0;
-              phase40.last=PhaseClock40::now();
-              phase40.active=true;
-              return true;
-          }
-
-          void EndPhase40(const ResourcePlan& p,bool ok,bool hit) {
-              MarkPhase40(0);
-              phase40.active=false;
-              struct Row {
-                  uint64_t samples=0,failed=0;
-                  std::array<double,6> us {};
-                  std::array<std::array<double,3>,6> read_us {};
-                  std::array<std::array<uint64_t,3>,6> reads {}, failed_reads {}, bytes {};
+          old=r'''\tfor (uint32_t slot = 0; slot < m_program.srt_reads.size(); slot++) {
+          \t\tif (runs && m_compiled.in_run[slot] != 0u) {
+          \t\t\tcontinue;
+          \t\t}
+          \t\tconst auto offset = m_program.srt_reads[slot].flat_offset;
+          \t\tconst bool clean  = m_clean_flat_slots && offset < m_compiled.clean_slots.size() &&
+          \t\t                   m_compiled.clean_slots[offset] != 0u;
+          \t\tif (clean &&
+          \t\t    (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
+          \t\t\treturn false;
+          \t\t}
+          \t\tauto& evaluator = clean ? *m_clean_evaluator : *this;
+          \t\tif (offset >= flat.size() || !evaluator.Evaluate(m_compiled.slots[slot], flat[offset])) {
+          \t\t\treturn false;
+          \t\t}
+          \t}'''
+          old=old.replace('\\t','\t')
+          new=r'''
+              const auto refresh_slot41=[&](uint32_t slot) {
+                  const auto offset=m_program.srt_reads[slot].flat_offset;
+                  const bool clean=m_clean_flat_slots && offset<m_compiled.clean_slots.size() &&
+                                   m_compiled.clean_slots[offset]!=0u;
+                  if (clean && (m_clean_evaluator==nullptr || m_runtime.read_specialization_memory==nullptr)) return false;
+                  auto& evaluator=clean ? *m_clean_evaluator : *this;
+                  return offset<flat.size() && evaluator.Evaluate(m_compiled.slots[slot],flat[offset]);
               };
-              static std::array<Row,4> rows;
-              const uint32_t target=p.shader_hash==0x3b809f9d156a95ddull ? 0u : 1u;
-              auto& r=rows[target*2u+(hit ? 1u : 0u)];
-              ++r.samples;
-              r.failed+=ok ? 0u : 1u;
-              for (size_t i=0;i<6u;++i) r.us[i]+=phase40.us[i];
-              for (size_t i=0;i<6u;++i) for (size_t k=0;k<3u;++k) {
-                  r.read_us[i][k]+=phase40.read_us[i][k];
-                  r.reads[i][k]+=phase40.reads[i][k];
-                  r.failed_reads[i][k]+=phase40.failed_reads[i][k];
-                  r.bytes[i][k]+=phase40.bytes[i][k];
+              if (runs && CompactFlat41Enabled()) {
+                  for (const auto slot:m_compiled.scalar_slots41) {
+                      if (!refresh_slot41(slot)) return false;
+                  }
+              } else {
+                  for (uint32_t slot=0;slot<m_program.srt_reads.size();++slot) {
+                      if (runs && m_compiled.in_run[slot]!=0u) continue;
+                      if (!refresh_slot41(slot)) return false;
+                  }
+              }'''
+          replace(p,old,new)
+
+          p='src/graphics/guest_gpu/graphicsRun.cpp'
+          f=Path(p)
+          f.write_text('#include "graphics/shader/recompiler/ir/passes/CompactFlat41.h"\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
+          replace(p,'\tg_gpu_thread = true;',r'''
+              g_gpu_thread = true;
+              std::printf("flat41: compact residual-slot traversal %s\n",
+                  ShaderRecompiler::IR::CompactFlat41Enabled() ? "ON" : "OFF");
+              std::fflush(stdout);''')
+
+          p='tests/ResourceMaterializationTests.cpp'
+          f=Path(p)
+          f.write_text('#include "graphics/shader/recompiler/ir/passes/CompactFlat41.h"\n'+f.read_text(encoding='utf-8'),encoding='utf-8')
+          tests=r'''
+          void TestCompactFlat41() {
+              using namespace Libs::Graphics::ShaderRecompiler::IR;
+              SetResourceMaterializationVerification(true);
+              // A clean scalar slot remains outside the ordinary four-dword run.
+              auto plan=MemoPlan(MemoPlanExtra::None,false);
+              // Encode adjacent dwords as instruction offsets with one shared dynamic offset.
+              for (uint32_t slot=0;slot<plan.srt_reads.size();++slot) {
+                  auto* raw=plan.srt_reads[slot].value.TryInstruction();
+                  auto flags=raw->Flags<MemoryFlags>();
+                  auto memory=plan.memory_info[flags.index];
+                  memory.offset=slot*4u;
+                  flags.index=static_cast<uint32_t>(plan.memory_info.size());
+                  plan.memory_info.push_back(memory);
+                  raw->SetFlags(flags);
+                  raw->SetArg(1,Value(0u));
               }
-              if (r.samples!=1u && r.samples%64u!=0u) return;
-              const double n=static_cast<double>(r.samples);
-              double total=0;
-              for (const auto v:r.us) total+=v;
-              std::printf("phase40: shader=%016llx memo-hit=%u samples=%llu failed=%llu total-us=%.3f setup-us=%.3f activity-us=%.3f flat-us=%.3f memo-us=%.3f descriptors-us=%.3f specialization-us=%.3f\n",
-                  static_cast<unsigned long long>(p.shader_hash),hit ? 1u : 0u,
-                  static_cast<unsigned long long>(r.samples),static_cast<unsigned long long>(r.failed),
-                  total/n,r.us[0]/n,r.us[1]/n,r.us[2]/n,r.us[3]/n,r.us[4]/n,r.us[5]/n);
-              constexpr std::array phases {"setup","activity","flat","memo","descriptors","specialization"};
-              constexpr std::array kinds {"ordinary","strict","ordinary-block"};
-              for (size_t i=0;i<6u;++i) for (size_t k=0;k<3u;++k) {
-                  if (r.reads[i][k]==0u) continue;
-                  std::printf("read40: shader=%016llx memo-hit=%u samples=%llu phase=%s kind=%s calls-per-sample=%.3f callback-us=%.3f requested-bytes-per-sample=%.1f failed-calls=%llu\n",
-                      static_cast<unsigned long long>(p.shader_hash),hit ? 1u : 0u,
-                      static_cast<unsigned long long>(r.samples),phases[i],kinds[k],
-                      static_cast<double>(r.reads[i][k])/n,r.read_us[i][k]/n,
-                      static_cast<double>(r.bytes[i][k])/n,static_cast<unsigned long long>(r.failed_reads[i][k]));
+              plan.clean_flat_slots.assign(plan.srt_reads.size(),0u);
+              plan.clean_flat_slots[4]=1u;
+              MemoFixture f;
+              const auto& compiled=CompileResourcePlan(plan);
+              Check(!compiled.flat_runs.empty(),"compact-flat fixture has no batched run");
+              if (CompactFlat41Enabled()) {
+                  Check(compiled.scalar_slots41==std::vector<uint32_t>{4u},
+                        "compact traversal lost or reordered a residual clean slot");
               }
-              std::fflush(stdout);
+              for (uint32_t i=0;i<128u;++i) {
+                  f.memory.words[0]^=0x100u;
+                  f.memory.words[4]=i;
+                  Check(f.Refresh(plan) && f.snapshot.flattened_srt[4]==i,
+                        "compact traversal lost fresh input data");
+              }
+              f.memory.reject_strict=true;
+              Check(!f.Refresh(plan),"compact traversal ignored a rejected clean slot");
+              f.memory.reject_strict=false;
+              // A rejected broad read must fall back to the original dword reads.
+              const auto exact=+[](void* data,uint64_t address,std::span<uint32_t> values) {
+                  return values.size()==1u && TableMemory::Read(data,address,values);
+              };
+              const SrtRuntime rt {.user_data=f.user_data,.read_memory=exact,.userdata=&f.memory,
+                  .read_specialization_memory=TableMemory::StrictRead};
+              Check(MaterializeResources(plan,rt,f.snapshot,f.specialization),
+                    "compact traversal broke grouped-read fallback");
+              SetFlatRunReads(false);
+              auto scalar=MemoPlan(MemoPlanExtra::None,false);
+              Check(CompileResourcePlan(scalar).flat_runs.empty() && f.Refresh(scalar),
+                    "compact traversal broke a plan without runs");
+              SetFlatRunReads(true);
+              std::puts("CompactFlat41: residual slots, fresh inputs, clean rejection and fallback passed");
           }
           '''
-
-          replace(str(p),'constexpr uint64_t AddressMask',helper+'\nconstexpr uint64_t AddressMask')
-          replace(str(p),'\tconst auto active = walker.FindActiveSources();',
-              '\tMarkPhase40(1);\n\tconst auto active = walker.FindActiveSources();\n\tMarkPhase40(2);')
-          replace(str(p),'\tsnapshot.uniform_fill = {};',
-              '\tMarkPhase40(3);\n\tsnapshot.uniform_fill = {};')
-          replace(str(p),'\t\t\t\tmemo->reused = true;\n\t\t\t\treturn true;',
-              '\t\t\t\tmemo->reused = true;\n\t\t\t\tMarkPhase40(0);\n\t\t\t\treturn true;')
-          replace(str(p),'\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {',
-              '\tMarkPhase40(4);\n\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {')
-          replace(str(p),'\tif (!BuildResourceSpecialization(program, snapshot, specialization)) {',
-              '\tMarkPhase40(5);\n\tif (!BuildResourceSpecialization(program, snapshot, specialization)) {')
-          replace(str(p),'\t\t\tmemo->valid = true;\n\t\t}\n\t}\n\treturn true;',
-              '\t\t\tmemo->valid = true;\n\t\t}\n\t}\n\tMarkPhase40(0);\n\treturn true;')
-
-          replace(str(p),'\tconst bool result = MaterializeCompiled(program, runtime, snapshot, specialization, memo);',r'''
-              const bool sampled40=BeginPhase40(program);
-              bool result;
-              if (sampled40) {
-                  ReadProbe40 probe40 {runtime};
-                  const auto measured40=probe40.Runtime();
-                  result=MaterializeCompiled(program,measured40,snapshot,specialization,memo);
-                  EndPhase40(program,result,memo!=nullptr && memo->reused);
-              } else {
-                  result=MaterializeCompiled(program,runtime,snapshot,specialization,memo);
-              }''')
-
-          p=Path('src/graphics/guest_gpu/graphicsRun.cpp')
-          p.write_text(
-              '#include "graphics/shader/recompiler/ir/passes/ResourcePhases40.h"\n'+p.read_text(encoding='utf-8'),
-              encoding='utf-8'
-          )
-          replace(str(p),'\tg_gpu_thread = true;',r'''
-              g_gpu_thread = true;
-              const auto* v40=std::getenv("KYTY_PHASES_40");
-              ShaderRecompiler::IR::t_phases40=v40!=nullptr && v40[0]=='1' && v40[1]=='\0';
-              if (ShaderRecompiler::IR::t_phases40) {
-                  std::printf("phase40: diagnostic active; sampled original calls; reader timings active\n");
-                  std::fflush(stdout);
-              }''')
-
-          p=Path('tests/ResourceMaterializationTests.cpp')
-          p.write_text(
-              '#include "graphics/shader/recompiler/ir/passes/ResourcePhases40.h"\n'+p.read_text(encoding='utf-8'),
-              encoding='utf-8'
-          )
-          replace(str(p),'  std::puts("ResourceMaterializationTests: all cases passed");',r'''
-            {
-              using namespace Libs::Graphics::ShaderRecompiler::IR;
-              auto plan=MemoPlan(MemoPlanExtra::None,true);
-              MemoFixture fixture;
-              t_phases40=true;
-              for (const uint64_t hash:{0x3b809f9d156a95ddull,0xf112e0ba527945adull}) {
-                plan.shader_hash=hash;
-                for (uint32_t i=0;i<131072u;++i) {
-                  if (i%1024u==0u) fixture.memory.words[0]^=0x100u;
-                  if ((i&1u)==0u) fixture.memo.valid=false;
-                  Check(fixture.Refresh(plan),"sampled original-reader refresh failed");
-                }
-              }
-              t_phases40=false;
-            }
-            std::puts("ResourceMaterializationTests: all cases passed");''')
-
-          print('Diagnostic 40 installed: targeted phase and original-reader timings only',flush=True)
+          replace(p,'int main() {',tests+'\nint main() {\n  TestCompactFlat41();')
+          print('Compact flat traversal 41 installed',flush=True)
           '@ | & $env:KYTY_PYTHON -
-          if ($LASTEXITCODE -ne 0) { throw "Diagnostic 40 adaptation failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Compact flat adaptation failed" }
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
@@ -354,14 +299,14 @@ jobs:
               if "uses" in step or "run" not in step:
                   raise RuntimeError("Unexpected build step")
               if step["name"] == "Configure CMake":
-                  flags = os.environ["KYTY_FLAGS_40"]
+                  flags = os.environ["KYTY_FLAGS_41"]
                   args = ["cmake", "-S", ".", "-B", "_Build/windows", "-G", "Ninja",
                           "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_C_COMPILER=clang-cl",
                           "-DCMAKE_CXX_COMPILER=clang-cl",
                           "-DCMAKE_PREFIX_PATH=" + os.environ["QT_ROOT_DIR"],
                           "-DCMAKE_C_FLAGS_INIT=" + flags, "-DCMAKE_CXX_FLAGS_INIT=" + flags,
                           "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON"]
-                  print("Configuring profile:", os.environ["KYTY_PROFILE_40"], flags, flush=True)
+                  print("Configuring profile:", os.environ["KYTY_PROFILE_41"], flags, flush=True)
                   subprocess.run(args, check=True)
                   cache = Path("_Build/windows/CMakeCache.txt").read_text(encoding="utf-8")
                   cpp_flags = next((line.split("=", 1)[1] for line in cache.splitlines()
@@ -372,7 +317,7 @@ jobs:
                       raise RuntimeError("Selected CPU flags are missing from CMAKE_CXX_FLAGS")
                   print("Verified C++ flags:", cpp_flags, flush=True)
                   continue
-              script = Path(f"_build40_{index}.ps1")
+              script = Path(f"_build41_{index}.ps1")
               source = step["run"]
               if step["name"] == "Install glslang":
                   api_call = '$release = Invoke-RestMethod -Uri "https://api.github.com/repos/KhronosGroup/glslang/releases/tags/main-tot" -Headers $headers'
@@ -391,7 +336,12 @@ jobs:
               path_file = Path(os.environ["GITHUB_PATH"])
               entries = path_file.read_text(encoding="utf-8-sig").splitlines() if path_file.exists() else []
               os.environ["PATH"] = os.pathsep.join(entries + [os.environ["PATH"]])
-              subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+              if step["name"] == "Test memory and shader paths":
+                  for mode in ("0", "1"):
+                      os.environ["KYTY_COMPACT_FLAT_41"] = mode
+                      subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+              else:
+                  subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
           if not started or not finished:
               raise RuntimeError("Build boundaries missing")
           '@ | & $env:KYTY_PYTHON -
@@ -403,12 +353,12 @@ jobs:
           $install = "_Build/windows/install"
           if (-not (Test-Path "$install/launcher.exe")) { throw "launcher.exe missing" }
           foreach ($mode in @(0, 1)) {
-              $name = if ($mode -eq 1) { "Diagnostico-40.cmd" } else { "Comparacion-40.cmd" }
+              $name = if ($mode -eq 1) { "Prueba-41.cmd" } else { "Comparacion-41.cmd" }
               @(
                   '@echo off',
                   'setlocal',
                   'cd /d "%~dp0"',
-                  "set KYTY_PHASES_40=$mode",
+                  "set KYTY_COMPACT_FLAT_41=$mode",
                   'set KYTY_REDUNDANT_SOURCES_38=0',
                   'set KYTY_RESOURCE_COSTS_37=0',
                   'set KYTY_FROZEN_DIAGNOSTIC_36=0',
@@ -460,20 +410,20 @@ jobs:
           Copy-Item $pdb $install -Force
           @(
               "AMD base: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9",
-              "Diagnostico-40.cmd: samples original phase and reader timings.",
-              "Comparacion-40.cmd: same executable, diagnostic OFF.",
-              "Diagnostic only; timings include instrumentation overhead.",
+              "Prueba-41.cmd: optional compact traversal; original reads retained.",
+              "Comparacion-41.cmd: same executable, compact traversal OFF.",
+              "Compare the same heavy view for 60 seconds in each mode.",
               "AMD CPU patch OFF; shader validation OFF; red-zone protection ON.",
               "Copy your working _Patches and select THIS interpreter.",
               "Warm up, then remain in the fixed heavy view for 60 seconds.",
-              "Copy console including phase40 and read40 lines.",
+              "Copy Prueba-41 console including flat41 and flat41-plan lines.",
               "Close emulator and launcher completely before changing mode."
-          ) | Set-Content "$install/DIAGNOSTICO-40.txt" -Encoding ascii
+          ) | Set-Content "$install/PRUEBA-41.txt" -Encoding ascii
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Diagnostico-40.zip"
+          $zip = "KytyPS5-Prueba-41.zip"
           Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
               throw "Packaging failed: missing or empty ZIP"
@@ -482,7 +432,7 @@ jobs:
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Diagnostico-40
-          path: KytyPS5-Diagnostico-40.zip
+          name: KytyPS5-Prueba-41
+          path: KytyPS5-Prueba-41.zip
           if-no-files-found: error
           retention-days: 7
