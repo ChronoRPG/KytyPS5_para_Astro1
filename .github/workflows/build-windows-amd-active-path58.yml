@@ -1,0 +1,339 @@
+name: Windows AMD - Prueba 58 - Ruta de condiciones
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 - Ruta 58
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      KYTY_FLAGS_51: /clang:-ffp-contract=off
+      KYTY_PROFILE_51: Generica
+
+    steps:
+      - name: Checkout fixed AMD base
+        uses: actions/checkout@v4
+        with:
+          ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout pinned working diagnostic 20
+        uses: actions/checkout@v4
+        with:
+          ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+          path: _patch_source
+          sparse-checkout: |
+            patches
+            .github/workflows
+          fetch-depth: 1
+          submodules: false
+
+      - name: Read working diagnostic 51 from this commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: _workflow51
+          sparse-checkout: .github/workflows/build-windows-amd-occlusion-observation.yml
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Setup fixed Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pin Python executable and install YAML parser
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+          if (-not $pythonExe) { throw "Python executable missing" }
+          "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $pythonExe -m pip install PyYAML==6.0.2
+          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+          & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+
+      - name: Create runner for existing plain-text workflow
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          import subprocess
+          import sys
+          import yaml
+          source=Path("_workflow51/.github/workflows/build-windows-amd-occlusion-observation.yml")
+          if not source.is_file():
+              raise RuntimeError("Keep the working build-windows-amd-occlusion-observation.yml in this repository")
+          workflow=yaml.safe_load(source.read_text(encoding="utf-8"))
+          steps=workflow["jobs"]["build"]["steps"]
+          name=sys.argv[1]
+          selected=[s for s in steps if s.get("name")==name]
+          if len(selected)!=1 or "run" not in selected[0]:
+              raise RuntimeError("Missing or ambiguous diagnostic 51 step: "+name)
+          script=selected[0]["run"]
+          if name=="Install optional occlusion observation" and ("zlib" in script or "base64" in script):
+              raise RuntimeError("Diagnostic 51 must be the working plain-text version")
+          if name=="Package launchers and symbols":
+              script=script.replace("Diagnostico-51.cmd","Prueba-58.cmd").replace("Comparacion-51.cmd","Comparacion-58.cmd").replace("DIAGNOSTICO-51.txt","PRUEBA-58.txt")
+          path=Path("_run_saved51.ps1")
+          path.write_text('$ErrorActionPreference = "Stop"\n'+script,encoding="utf-8")
+          print("Reusing validated 51 step:",name,flush=True)
+          subprocess.run(["pwsh","-NoProfile","-File",str(path.resolve())],check=True)
+          '@ | Set-Content "_run_saved51.py" -Encoding utf8
+          & $env:KYTY_PYTHON -m py_compile _run_saved51.py
+          if ($LASTEXITCODE -ne 0) { throw "Saved workflow runner invalid" }
+
+      - name: Reproduce working AMD source and retained optimizations
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Reproduce working AMD source and retained optimizations"
+          if ($LASTEXITCODE -ne 0) { throw "Saved workflow source step failed" }
+
+      - name: Install optional occlusion observation
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Install optional occlusion observation"
+          if ($LASTEXITCODE -ne 0) { throw "Saved observation installation failed" }
+
+      - name: Install checked last condition path
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          import subprocess
+          import sys
+          files={}
+          files['patches/adapt_active_path58.py']=r"""from pathlib import Path
+          changes={}
+          def replace(p,old,new):
+           s=changes.get(p,Path(p).read_text())
+           if s.count(old)!=1:raise RuntimeError('Unexpected path58 boundary: '+p+' / '+old[:80])
+           changes[p]=s.replace(old,new)
+          p='src/graphics/shader/recompiler/ir/ShaderIR.h'
+          replace(p,'#include <array>','#include <array>\n#include "graphics/shader/recompiler/ir/passes/ActivePath58.h"')
+          replace(p,'\t\tstd::vector<ActiveTraceStep>                  active_trace;','\t\tstd::vector<ActiveTraceStep>                  active_trace;\n        ActivePath58::Cache active_path58;')
+          p='src/graphics/shader/recompiler/ir/passes/SrtWalker.cpp'
+          replace(p,'\tauto& trace    = m_program.ThreadScratch().active_trace;\n\tif (evaluates && !tree.empty()) {','''\tauto& trace    = m_program.ThreadScratch().active_trace;
+              const bool path58 = ActivePath58::Enabled();
+              auto& last_path58 = m_program.ThreadScratch().active_path58;
+              if (path58 && evaluates && !tree.empty()) {
+                  const auto cached = last_path58.Lookup(tree, outcome);
+                  ActivePath58::Count(last_path58, cached.has_value());
+                  if (cached) {
+                      const auto first = m_program.ThreadScratch().active_tree_sources.begin() + *cached;
+                      const auto count = static_cast<ptrdiff_t>(m_program.descriptor_sources.size());
+                      active.assign(first, first + count);
+                      return active;
+                  }
+              }
+          \tif (!path58 && evaluates && !tree.empty()) {''')
+          replace(p,'\t\t} else if (!fits) {\n\t\t\t// Not expected:', '\t\t} else if (!fits) {\n            if (path58) last_path58.Invalidate();\n\t\t\t// Not expected:')
+          replace(p,'\t\t\tsources.clear();\n\t\t}\n\t}\n\treturn active;','\t\t\tsources.clear();\n\t\t}\n        if (path58 && fits) last_path58.Learn(tree, trace);\n\t}\n\treturn active;')
+          source=Path(__file__).resolve().parent.parent/'experiments/path58/ActivePath58.h'
+          if not source.is_file():raise RuntimeError('ActivePath58.h missing')
+          for p,s in changes.items():Path(p).write_text(s,newline='\n')
+          Path('src/graphics/shader/recompiler/ir/passes/ActivePath58.h').write_text(source.read_text(),newline='\n')
+          print('path58: sequential last path, conditions rechecked in original order; mismatch continues at original branch')
+          """
+          files['experiments/path58/ActivePath58.h']=r"""#pragma once
+          #include <chrono>
+          #include <cinttypes>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <optional>
+          #include <vector>
+          namespace ActivePath58 {
+          inline bool Enabled(){static const bool on=[]{const char* v=std::getenv("KYTY_ACTIVE_PATH58");const bool x=v&&std::strcmp(v,"1")==0;if(x)std::puts("path58: checked last condition path ON");return x;}();return on;}
+          struct Step{uint32_t block,node;uint8_t outcome;};
+          class Cache{
+           static constexpr uint32_t None=UINT32_MAX;
+           std::vector<Step> path;
+           uint32_t sources=None;
+          public:
+           bool fast=false;
+           uint64_t checks=0;
+           void Invalidate(){path.clear();sources=None;}
+           template<class Tree,class Eval>std::optional<uint32_t> Lookup(const Tree& tree,Eval&& evaluate){
+            fast=false;checks=0;if(tree.empty()){Invalidate();return std::nullopt;}
+            uint32_t node=0;
+            if(sources!=None){
+             bool same=true;
+             for(size_t i=0;i<path.size();++i){const auto result=evaluate(path[i].block);++checks;
+              if(result!=path[i].outcome){node=tree[path[i].node].next[result];path[i].outcome=result;path.resize(i+1);same=false;break;}
+             }
+             if(same){fast=true;return sources;}
+            }else path.clear();
+            while(node!=None&&tree[node].block!=None){const auto block=tree[node].block;const auto result=evaluate(block);++checks;path.push_back({block,node,result});node=tree[node].next[result];}
+            if(node!=None&&tree[node].sources!=None){sources=tree[node].sources;return sources;}
+            Invalidate();return std::nullopt;
+           }
+           template<class Tree,class Trace>void Learn(const Tree& tree,const Trace& trace){
+            Invalidate();uint32_t node=0;
+            for(const auto& step:trace){if(node==None||node>=tree.size()||tree[node].block!=step.block){Invalidate();return;}
+             path.push_back({step.block,node,step.outcome});node=tree[node].next[step.outcome];
+            }
+            if(node!=None&&node<tree.size()&&tree[node].block==None&&tree[node].sources!=None)sources=tree[node].sources;else Invalidate();
+           }
+          };
+          inline void Count(const Cache& cache,bool hit){
+           struct Counters{uint64_t calls=0,fast=0,tree=0,miss=0,checks=0;std::chrono::steady_clock::time_point last=std::chrono::steady_clock::now();};
+           static thread_local Counters c;
+           ++c.calls;c.fast+=hit&&cache.fast;c.tree+=hit&&!cache.fast;c.miss+=!hit;c.checks+=cache.checks;
+           if((c.calls&4095)!=0)return;
+           const auto now=std::chrono::steady_clock::now();const double seconds=std::chrono::duration<double>(now-c.last).count();if(seconds<5)return;
+           std::printf("path58-stats: seconds=%.6f calls=%" PRIu64 " fast-hits=%" PRIu64 " tree-hits=%" PRIu64 " misses=%" PRIu64 " condition-checks=%" PRIu64 "\n",seconds,c.calls,c.fast,c.tree,c.miss,c.checks);std::fflush(stdout);c=Counters{};
+          }
+          }
+          """
+          files['experiments/path58/ActivePath58Tests.cpp']=r"""#include "ActivePath58.h"
+          #include <array>
+          #include <cassert>
+          #include <functional>
+          #include <utility>
+          struct Node{uint32_t block=UINT32_MAX;std::array<uint32_t,3> next{UINT32_MAX,UINT32_MAX,UINT32_MAX};uint32_t sources=UINT32_MAX;};
+          struct Trace{uint32_t block;uint8_t outcome;};
+          int main(){
+           std::vector<Node> tree;
+           std::function<uint32_t(unsigned)> build=[&](unsigned depth){const auto id=uint32_t(tree.size());tree.emplace_back();if(!depth){tree[id].sources=id*7;return id;}tree[id].block=id;for(unsigned i=0;i<3;++i){const auto child=build(depth-1);tree[id].next[i]=child;}return id;};build(4);
+           ActivePath58::Cache cache;std::vector<uint8_t> values(tree.size());uint32_t rng=12345;
+           auto reference=[&](std::vector<uint32_t>& log){uint32_t node=0;while(node!=UINT32_MAX&&tree[node].block!=UINT32_MAX){log.push_back(tree[node].block);node=tree[node].next[values[tree[node].block]];}return node==UINT32_MAX?std::optional<uint32_t>{}:std::optional<uint32_t>{tree[node].sources};};
+           uint64_t hits=0;
+           for(unsigned iteration=0;iteration<20000;++iteration){
+            if(iteration%3==0)for(auto& v:values){rng=rng*1664525+1013904223;v=uint8_t(rng%3);}
+            std::vector<uint32_t> expected_reads,actual_reads;const auto expected=reference(expected_reads);
+            const auto actual=cache.Lookup(tree,[&](uint32_t block){actual_reads.push_back(block);return values[block];});
+            assert(actual==expected&&actual_reads==expected_reads);hits+=cache.fast;
+           }
+           assert(hits>10000);
+           std::vector<uint32_t> reads;reference(reads);std::vector<Trace> trace;for(auto block:reads)trace.push_back({block,values[block]});cache.Learn(tree,trace);
+           auto result=cache.Lookup(tree,[&](uint32_t block){return values[block];});assert(result&&cache.fast);
+           cache.Invalidate();tree[0].next[values[0]]=UINT32_MAX;reads.clear();const auto expected=reference(reads);std::vector<uint32_t> actual;
+           result=cache.Lookup(tree,[&](uint32_t block){actual.push_back(block);return values[block];});assert(result==expected&&actual==reads&&!result);
+           tree.clear();assert(!cache.Lookup(tree,[](uint32_t){return uint8_t{0};}));
+           std::puts("ActivePath58: changing/unknown conditions, identical read order, missing branches and reset passed");
+          }
+          """
+          root=Path("_path58")
+          for name,text in files.items():
+              p=root/name
+              p.parent.mkdir(parents=True,exist_ok=True)
+              p.write_text(text,encoding="utf-8",newline="\n")
+          subprocess.run([sys.executable,str(root/"patches/adapt_active_path58.py")],check=True)
+          '@ | & $env:KYTY_PYTHON -
+          if ($LASTEXITCODE -ne 0) { throw "Path 58 adaptation failed" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: 18
+          platform: x64
+          cygwin: 0
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.8.3
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qt5compat
+          cache: true
+
+      - name: Test isolated query components on Windows
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Test isolated query components on Windows"
+          if ($LASTEXITCODE -ne 0) { throw "Isolated query component tests failed" }
+
+      - name: Test checked condition paths
+        run: |
+          $ErrorActionPreference = "Stop"
+          clang-cl /nologo /std:c++20 /EHsc /O2 "_path58/experiments/path58/ActivePath58Tests.cpp" /Fe:_Build/occlusion51/ActivePath58.exe /Fo:_Build/occlusion51/ActivePath58.obj
+          if ($LASTEXITCODE -ne 0) { throw "Condition path test build failed" }
+          & "_Build/occlusion51/ActivePath58.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Condition path tests failed" }
+
+      - name: Build and test using pinned working workflow
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Build and test using pinned working workflow"
+          if ($LASTEXITCODE -ne 0) { throw "Build or tests failed" }
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Verify materialization with path OFF and ON
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($mode in @(0, 1)) {
+              $env:KYTY_ACTIVE_PATH58 = "$mode"
+              ctest --test-dir _Build/windows -C Release --output-on-failure --no-tests=error -R '^resource_materialization$'
+              if ($LASTEXITCODE -ne 0) { throw "Materialization failed with path mode $mode" }
+          }
+          Remove-Item Env:KYTY_ACTIVE_PATH58
+
+      - name: Package launchers and symbols
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Package launchers and symbols"
+          if ($LASTEXITCODE -ne 0) { throw "Launcher packaging failed" }
+
+      - name: Configure comparison and test 58
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          root=Path("_Build/windows/install")
+          for name,on in [("Prueba-58.cmd",True),("Comparacion-58.cmd",False)]:
+              p=root/name
+              s=p.read_text()
+              if "set KYTY_OCCLUSION_PROBE=" not in s:
+                  raise RuntimeError("Unexpected launcher: "+name)
+              s=s.replace("set KYTY_OCCLUSION_PROBE=1","set KYTY_OCCLUSION_PROBE=0")
+              s=s.replace("set KYTY_OCCLUSION_PROBE=0", "set KYTY_OCCLUSION_PROBE=0\nset KYTY_BUFFER_TIMING55=0\nset KYTY_DRAW_TIMING56=0\nset KYTY_REFRESH_TIMING57=0\nset KYTY_ACTIVE_PATH58="+str(int(on)))
+              p.write_text(s,newline="\r\n")
+          (root/"PRUEBA-58.txt").write_text(
+              "Prueba-58.cmd: checked last path ON. Comparacion-58.cmd: OFF.\n"
+              "Warm up one minute; measure heavy view 60 seconds in each mode.\n"
+              "Then check light view, movement, stalls and graphic errors.\n"
+              "All current conditions are evaluated. No guest memory snapshot is reused without validation.\n"
+              "Send FPS and full test console with path58-stats.\n",
+              encoding="utf-8")
+          '@ | & $env:KYTY_PYTHON -
+          if ($LASTEXITCODE -ne 0) { throw "Launcher 58 setup failed" }
+
+      - name: Create Windows ZIP
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "KytyPS5-Prueba-58.zip"
+          Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+              throw "Packaging failed: missing or empty ZIP"
+          }
+
+      - name: Upload KytyPS5
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Prueba-58
+          path: KytyPS5-Prueba-58.zip
+          if-no-files-found: error
+          retention-days: 7
