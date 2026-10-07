@@ -1,0 +1,399 @@
+name: Windows AMD - Prueba 59 - Limpiezas nativas
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 - Prueba 59
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      KYTY_FLAGS_51: /clang:-ffp-contract=off
+      KYTY_PROFILE_51: Generica
+
+    steps:
+      - name: Checkout fixed AMD base
+        uses: actions/checkout@v4
+        with:
+          ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout pinned working diagnostic 20
+        uses: actions/checkout@v4
+        with:
+          ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+          path: _patch_source
+          sparse-checkout: |
+            patches
+            .github/workflows
+          fetch-depth: 1
+          submodules: false
+
+      - name: Read working diagnostic 51 from this commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: _workflow51
+          sparse-checkout: .github/workflows/build-windows-amd-occlusion-observation.yml
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Setup fixed Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pin Python executable and install YAML parser
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+          if (-not $pythonExe) { throw "Python executable missing" }
+          "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $pythonExe -m pip install PyYAML==6.0.2
+          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+          & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+
+      - name: Create runner for existing plain-text workflow
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          import subprocess
+          import sys
+          import yaml
+
+          source = Path("_workflow51/.github/workflows/build-windows-amd-occlusion-observation.yml")
+          if not source.is_file():
+              raise RuntimeError("Keep build-windows-amd-occlusion-observation.yml in this repository")
+
+          workflow = yaml.safe_load(source.read_text(encoding="utf-8"))
+          steps = workflow["jobs"]["build"]["steps"]
+          name = sys.argv[1]
+          selected = [s for s in steps if s.get("name") == name]
+
+          if len(selected) != 1 or "run" not in selected[0]:
+              raise RuntimeError("Missing or ambiguous saved step: " + name)
+
+          script = selected[0]["run"]
+
+          if name == "Package launchers and symbols":
+              script = script.replace("Diagnostico-51.cmd", "Prueba-59.cmd")
+              script = script.replace("Comparacion-51.cmd", "Comparacion-59.cmd")
+              script = script.replace("DIAGNOSTICO-51.txt", "PRUEBA-59.txt")
+              script = script.replace("set KYTY_OCCLUSION_PROBE=$mode", "set KYTY_OCCLUSION_PROBE=0")
+              script = script.replace(
+                  '"set KYTY_OCCLUSION_PROBE=0",',
+                  '"set KYTY_OCCLUSION_PROBE=0",\n        "set KYTY_WIDE_FILL_CLEAR=$mode",'
+              )
+
+          path = Path("_run_saved51.ps1")
+          path.write_text('$ErrorActionPreference = "Stop"\n' + script, encoding="utf-8")
+          print("Reusing saved step:", name, flush=True)
+          subprocess.run(["pwsh", "-NoProfile", "-File", str(path.resolve())], check=True)
+          '@ | Set-Content "_run_saved51.py" -Encoding utf8
+
+          & $env:KYTY_PYTHON -m py_compile _run_saved51.py
+          if ($LASTEXITCODE -ne 0) { throw "Saved workflow runner invalid" }
+
+      - name: Reproduce working AMD source and retained optimizations
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Reproduce working AMD source and retained optimizations"
+          if ($LASTEXITCODE -ne 0) { throw "AMD source preparation failed" }
+
+      - name: Install native wide image fills 59
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          changes = {}
+
+          def replace(path, old, new):
+              p = Path(path)
+              text = changes.get(path, p.read_text(encoding="utf-8"))
+              if text.count(old) != 1:
+                  raise RuntimeError("Unexpected wide59 boundary: " + path + " / " + old[:70])
+              changes[path] = text.replace(old, new)
+
+          helper = r"""[[nodiscard]] inline bool DecodeWideFill59(vk::Format format, uint32_t word,
+                                                    vk::ClearColorValue& clear) {
+              const auto half = [](uint32_t bits) {
+                  const uint32_t exponent = (bits >> 10u) & 0x1fu;
+                  const uint32_t mantissa = bits & 0x3ffu;
+                  const float value = std::ldexp(
+                      static_cast<float>(exponent != 0 ? mantissa | 0x400u : mantissa),
+                      static_cast<int>(std::max(exponent, 1u)) - 25);
+                  return (bits & 0x8000u) != 0 ? -value : value;
+              };
+              switch (format) {
+              case vk::Format::eR16G16B16A16Sfloat:
+                  if ((word & 0x7c00u) == 0x7c00u || (word & 0x7c000000u) == 0x7c000000u)
+                      return false;
+                  clear.float32 = std::array {half(word), half(word >> 16u), half(word), half(word >> 16u)};
+                  return true;
+              case vk::Format::eR16G16B16A16Uint:
+                  clear.uint32 = std::array {word & 0xffffu, word >> 16u, word & 0xffffu, word >> 16u};
+                  return true;
+              case vk::Format::eR32G32Sfloat:
+              case vk::Format::eR32G32B32A32Sfloat:
+                  if ((word & 0x7f800000u) == 0x7f800000u) return false;
+                  clear.float32 = std::array {
+                      std::bit_cast<float>(word), std::bit_cast<float>(word),
+                      std::bit_cast<float>(word), std::bit_cast<float>(word)
+                  };
+                  return true;
+              case vk::Format::eR32G32Uint:
+              case vk::Format::eR32G32B32A32Uint:
+                  clear.uint32 = std::array {word, word, word, word};
+                  return true;
+              default:
+                  return false;
+              }
+          }
+          """
+
+          extra = r"""// Adapted from Jetsku 0d74f849; opt-in.
+          bool WideFill59Enabled() {
+              static const bool enabled = [] {
+                  const auto* value = std::getenv("KYTY_WIDE_FILL_CLEAR");
+                  return value != nullptr && std::strcmp(value, "1") == 0;
+              }();
+              return enabled;
+          }
+          """
+
+          color = r"""        if (!DecodePackedColorClear(image.info.pixel_format, packed_clear, clear.color)) {
+                      vk::ClearColorValue wide {};
+                      if (!DecodeWideFill59(image.info.pixel_format, packed_clear, wide)) return false;
+                      ++m_wide59_candidates;
+                      if (!WideFill59Enabled()) return false;
+                      clear.color = wide;
+                      ++m_wide59_used;
+                      m_wide59_bytes += size;
+                      if (m_wide59_used <= 3) {
+                          std::printf("wide59-used: format=%u bytes=%" PRIu64 " word=0x%08x\n",
+                                      static_cast<unsigned>(image.info.pixel_format), size, packed_clear);
+                      }
+                  }"""
+
+          summary = r"""    std::printf("wide59-stats: candidates=%" PRIu64 " used=%" PRIu64 " bytes=%" PRIu64 "\n",
+                          m_wide59_candidates, m_wide59_used, m_wide59_bytes);
+              std::fflush(stdout);
+          """
+
+          test = r"""#include "graphics/host_gpu/renderer/image/imageInfo.h"
+          #include <cstdio>
+          #include <cstdlib>
+          using namespace Libs::Graphics;
+
+          void Check(bool ok) {
+              if (!ok) {
+                  std::fputs("wide59 decoder test failed\n", stderr);
+                  std::abort();
+              }
+          }
+
+          int main() {
+              vk::ClearColorValue c {};
+              for (uint32_t h = 0; h < 65536; ++h) {
+                  const uint32_t word = h | (h << 16u);
+                  const bool finite = (h & 0x7c00u) != 0x7c00u;
+                  Check(DecodeWideFill59(vk::Format::eR16G16B16A16Sfloat, word, c) == finite);
+                  if (finite) {
+                      const unsigned e = (h >> 10u) & 31u, m = h & 1023u;
+                      double v = e ? std::ldexp(1.0 + double(m) / 1024.0, int(e) - 15)
+                                   : std::ldexp(double(m), -24);
+                      if (h & 32768u) v = -v;
+                      for (float f : c.float32)
+                          Check(std::bit_cast<uint32_t>(f) == std::bit_cast<uint32_t>(float(v)));
+                  }
+              }
+
+              Check(DecodeWideFill59(vk::Format::eR16G16B16A16Uint, 0xabcd1234u, c));
+              Check(c.uint32[0] == 0x1234u && c.uint32[1] == 0xabcdu &&
+                    c.uint32[2] == 0x1234u && c.uint32[3] == 0xabcdu);
+
+              for (auto format : {vk::Format::eR32G32Uint, vk::Format::eR32G32B32A32Uint}) {
+                  Check(DecodeWideFill59(format, 0xdeadbeefu, c));
+                  for (auto value : c.uint32) Check(value == 0xdeadbeefu);
+              }
+
+              for (auto format : {vk::Format::eR32G32Sfloat, vk::Format::eR32G32B32A32Sfloat}) {
+                  for (uint32_t word : {0u, 0x80000000u, 0x3f800000u, 0xbf800000u,
+                                        0x00000001u, 0x7f7fffffu}) {
+                      Check(DecodeWideFill59(format, word, c));
+                      for (float f : c.float32) Check(std::bit_cast<uint32_t>(f) == word);
+                  }
+                  for (uint32_t word : {0x7f800000u, 0xff800000u, 0x7fc00001u})
+                      Check(!DecodeWideFill59(format, word, c));
+              }
+
+              Check(!DecodeWideFill59(vk::Format::eR8G8B8A8Unorm, 0, c));
+              Check(DecodePackedColorClear(vk::Format::eR8G8B8A8Unorm, 0x44332211u, c));
+              std::puts("wide59: decoder and original path tests passed");
+          }
+          """
+
+          p = "src/graphics/host_gpu/renderer/image/imageInfo.h"
+          replace(
+              p,
+              "[[nodiscard]] inline bool DecodePackedStencilClear",
+              helper + "\n[[nodiscard]] inline bool DecodePackedStencilClear"
+          )
+
+          p = "src/graphics/host_gpu/renderer/cache/textureCache.cpp"
+          replace(
+              p,
+              "constexpr uint64_t NumFramesBeforeRemoval = 32;",
+              extra + "\nconstexpr uint64_t NumFramesBeforeRemoval = 32;"
+          )
+          replace(
+              p,
+              "\tm_dcc_gpu_clear = Config::DccGpuClearEnabled()",
+              '    std::printf("wide59: native wide fills %s\\n", WideFill59Enabled() ? "ON" : "OFF");\n'
+              '\tm_dcc_gpu_clear = Config::DccGpuClearEnabled()'
+          )
+          replace(
+              p,
+              "TextureCache::~TextureCache() {",
+              "TextureCache::~TextureCache() {\n" + summary
+          )
+          replace(
+              p,
+              "void TextureCache::RunGarbageCollector() {\n\t(void)CollectGarbage(false);\n}",
+              "void TextureCache::RunGarbageCollector() {\n"
+              "\t(void)CollectGarbage(false);\n"
+              "    if (++m_wide59_frames % 300 == 0) {\n"
+              "        std::scoped_lock lock {m_lock};\n" + summary +
+              "    }\n}"
+          )
+          replace(
+              p,
+              "\t\tif (!DecodePackedColorClear(image.info.pixel_format, packed_clear, clear.color)) {\n"
+              "\t\t\treturn false;\n\t\t}",
+              color
+          )
+
+          p = "src/graphics/host_gpu/renderer/cache/textureCache.h"
+          replace(p, "class TextureCache", "class TextureCache")
+          text = changes[p]
+          start = text.index("class TextureCache")
+          private = text.index("private:", start)
+          changes[p] = text[:private] + text[private:].replace(
+              "private:",
+              "private:\n"
+              "    uint64_t m_wide59_candidates=0, m_wide59_used=0, "
+              "m_wide59_bytes=0, m_wide59_frames=0;",
+              1
+          )
+
+          for path, text in changes.items():
+              Path(path).write_text(text, encoding="utf-8", newline="\n")
+
+          Path("tests/FillClear59Tests.cpp").write_text(test, encoding="utf-8", newline="\n")
+          p = Path("CMakeLists.txt")
+          p.write_text(
+              p.read_text(encoding="utf-8") +
+              "\nadd_executable(wide_clear59_tests EXCLUDE_FROM_ALL tests/FillClear59Tests.cpp)\n"
+              "target_link_libraries(wide_clear59_tests common fmt::fmt)\n"
+              "target_include_directories(wide_clear59_tests PRIVATE ${inc_headers})\n"
+              "add_test(NAME wide_clear59 COMMAND $<TARGET_FILE:wide_clear59_tests>)\n",
+              encoding="utf-8",
+              newline="\n"
+          )
+          print("wide59 installed; AMD base retained")
+          '@ | & $env:KYTY_PYTHON -
+
+          if ($LASTEXITCODE -ne 0) { throw "Wide fill adaptation failed" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: 18
+          platform: x64
+          cygwin: 0
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.8.3
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qt5compat
+          cache: true
+
+      - name: Build and test using pinned working workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Build and test using pinned working workflow"
+          if ($LASTEXITCODE -ne 0) { throw "Build or baseline tests failed" }
+
+      - name: Test actual wide clear decoder
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake --build _Build/windows --target wide_clear59_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw "Wide clear test build failed" }
+          ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^wide_clear59$"
+          if ($LASTEXITCODE -ne 0) { throw "Wide clear decoder tests failed" }
+
+      - name: Package launchers and symbols
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Package launchers and symbols"
+          if ($LASTEXITCODE -ne 0) { throw "Launcher packaging failed" }
+
+      - name: Write instructions
+        run: |
+          $ErrorActionPreference = "Stop"
+          @(
+              "Comparacion-59.cmd: original fill path. Prueba-59.cmd: native wide fills ON.",
+              "Both run the same executable. Occlusion observation OFF in both.",
+              "Keep _Patches, _PipelineCache and kyty_settings.ini. Choose THIS interpreter.",
+              "AMD CPU patch OFF; shader validation OFF; red-zone ON.",
+              "Warm up one minute. Heavy view 60 seconds, then light view 60 seconds.",
+              "Send the full console for each run, including wide59-stats.",
+              "candidates: supported wide fills rejected by the old decoder; used: converted fills.",
+              "Counters are cumulative and include loading."
+          ) | Set-Content "_Build/windows/install/PRUEBA-59.txt" -Encoding ascii
+
+      - name: Create Windows ZIP
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "KytyPS5-Prueba-59.zip"
+          Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+              throw "Packaging failed: missing or empty ZIP"
+          }
+
+      - name: Upload KytyPS5
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Prueba-59
+          path: KytyPS5-Prueba-59.zip
+          if-no-files-found: error
+          retention-days: 7
