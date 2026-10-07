@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 60 Plus - Tres cambios
+name: Windows AMD - Prueba 60 TODO - commits IPO PGO
 
 'on':
   workflow_dispatch:
@@ -8,8 +8,18 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - Prueba 60 Plus
+    name: Windows - ${{ matrix.label }}
     runs-on: windows-2022
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Comparacion-Base
+            mode: '0'
+          - label: Prueba-Todo
+            mode: '1'
 
     defaults:
       run:
@@ -18,6 +28,8 @@ jobs:
     env:
       KYTY_FLAGS_51: /clang:-ffp-contract=off
       KYTY_PROFILE_51: Generica
+      ALL_MODE: ${{ matrix.mode }}
+      BUILD_LABEL: ${{ matrix.label }}
 
     steps:
       - name: Checkout fixed AMD base
@@ -38,35 +50,12 @@ jobs:
           fetch-depth: 1
           submodules: false
 
-      - name: Read pinned original workflow 60
-        uses: actions/checkout@v4
-        with:
-          ref: 8344367d56e00196db7faf989e32912d7414e2e1
-          path: _workflow60
-          sparse-checkout: .github/workflows/build-windows-amd-storage-repeat60.yml
-          sparse-checkout-cone-mode: false
-          fetch-depth: 1
-          submodules: false
-
       - name: Read pinned working diagnostic 51
         uses: actions/checkout@v4
         with:
           ref: 8344367d56e00196db7faf989e32912d7414e2e1
           path: _workflow51
           sparse-checkout: .github/workflows/build-windows-amd-occlusion-observation.yml
-          sparse-checkout-cone-mode: false
-          fetch-depth: 1
-          submodules: false
-
-      - name: Read pinned Jetsku int16.1 clear decoder and tests
-        uses: actions/checkout@v4
-        with:
-          repository: Jetsku/KytyPS5
-          ref: f9e19582f0deac0d1226a7ce3faae30a9ab408ab
-          path: _donor60
-          sparse-checkout: |
-            src/graphics/host_gpu/renderer/image/imageInfo.h
-            tests/ClearRegisterDecodeTests.cpp
           sparse-checkout-cone-mode: false
           fetch-depth: 1
           submodules: false
@@ -81,13 +70,24 @@ jobs:
           $ErrorActionPreference = "Stop"
           $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
           if (-not $pythonExe) { throw "Python executable missing" }
+
           "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
           & $pythonExe -m pip install PyYAML==6.0.2
           if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+
           & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
           if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
 
-      - name: Create runner for pinned workflow 60
+      - name: Checkout pinned experiment 60
+        uses: actions/checkout@v4
+        with:
+          ref: 8344367d56e00196db7faf989e32912d7414e2e1
+          path: _workflow60
+          sparse-checkout: .github/workflows/build-windows-amd-storage-repeat60.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Create runner for existing plain-text workflow
         run: |
           $ErrorActionPreference = "Stop"
           @'
@@ -96,225 +96,47 @@ jobs:
           import sys
           import yaml
 
-          path = Path("_workflow60/.github/workflows/build-windows-amd-storage-repeat60.yml")
-          workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+          source = Path("_workflow60/.github/workflows/build-windows-amd-storage-repeat60.yml")
+          workflow = yaml.safe_load(source.read_text(encoding="utf-8"))
           name = sys.argv[1]
-          steps = [s for s in workflow["jobs"]["build"]["steps"] if s.get("name") == name]
-          if len(steps) != 1 or "run" not in steps[0]:
+          selected = [
+              step for step in workflow["jobs"]["build"]["steps"]
+              if step.get("name") == name
+          ]
+
+          if len(selected) != 1:
               raise RuntimeError("Missing pinned step: " + name)
 
-          script = Path("_run_saved60.ps1")
+          script = Path("_execute60.ps1")
           script.write_text(
-              '$ErrorActionPreference = "Stop"\n' + steps[0]["run"],
+              '$ErrorActionPreference = "Stop"\n' + selected[0]["run"],
               encoding="utf-8"
           )
-          print("Running pinned 60 step:", name, flush=True)
-          subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
-          '@ | Set-Content "_run_saved60.py" -Encoding utf8
+          subprocess.run(
+              ["pwsh", "-NoProfile", "-File", str(script.resolve())],
+              check=True
+          )
+          '@ | Set-Content _execute60.py -Encoding utf8
 
-          & $env:KYTY_PYTHON _run_saved60.py "Create runner for existing plain-text workflow"
-          if ($LASTEXITCODE -ne 0) { throw "Pinned runner creation failed" }
+          & $env:KYTY_PYTHON _execute60.py "Create runner for existing plain-text workflow"
+          if ($LASTEXITCODE -ne 0) { throw "Runner setup failed" }
 
       - name: Reproduce working AMD source and retained optimizations
         run: |
           $ErrorActionPreference = "Stop"
-          & $env:KYTY_PYTHON _run_saved60.py "Reproduce working AMD source and retained optimizations"
+          & $env:KYTY_PYTHON _run_saved51.py "Reproduce working AMD source and retained optimizations"
           if ($LASTEXITCODE -ne 0) { throw "AMD source preparation failed" }
 
       - name: Install repeated storage write experiment 60
         run: |
           $ErrorActionPreference = "Stop"
-          & $env:KYTY_PYTHON _run_saved60.py "Install repeated storage write experiment 60"
-          if ($LASTEXITCODE -ne 0) { throw "Storage repeat adaptation failed" }
-
-      - name: Install memory search and register clear commits
-        run: |
-          $ErrorActionPreference = "Stop"
-          @'
-          from pathlib import Path
-
-          changes = {}
-
-          def replace(path, old, new):
-              p = Path(path)
-              text = changes.get(path, p.read_text(encoding="utf-8"))
-              if text.count(old) != 1:
-                  raise RuntimeError("Unexpected suite60 boundary: " + path + " / " + old[:70])
-              changes[path] = text.replace(old, new)
-
-          def function(source, name):
-              start = source.index("[[nodiscard]] inline bool " + name + "(")
-              opening = source.index("{", start)
-              depth = 1
-              pos = opening + 1
-              while depth:
-                  if source[pos] == "{":
-                      depth += 1
-                  if source[pos] == "}":
-                      depth -= 1
-                  pos += 1
-              return source[start:pos]
-
-          source = Path(
-              "_donor60/src/graphics/host_gpu/renderer/image/imageInfo.h"
-          ).read_text(encoding="utf-8")
-
-          helper = "// Register-clear port from Jetsku 00ed2a5a6c58, int16.1.\n"
-          helper += function(source, "ClearRegisterWideEnabled") + "\n\n"
-          helper += function(source, "DecodePackedColorClear64") + "\n\n"
-
-          p = "src/graphics/host_gpu/renderer/image/imageInfo.h"
-          replace(
-              p,
-              "#include <cstdint>",
-              "#include <cstdint>\n#include <cstdlib>\n#include <limits>"
-          )
-          replace(
-              p,
-              "\tuint32_t            clear_word           = 0;",
-              "\tuint32_t            clear_word           = 0;\n"
-              "\tuint32_t clear_word1 = 0;"
-          )
-          replace(
-              p,
-              "[[nodiscard]] inline bool DecodePackedStencilClear",
-              helper + "[[nodiscard]] inline bool DecodePackedStencilClear"
-          )
-
-          p = "src/graphics/host_gpu/renderer/colorRenderTarget.cpp"
-          replace(
-              p,
-              "\t\tdesc.info.metadata.clear_word           = rt.clear_word0.word0;",
-              "\t\tdesc.info.metadata.clear_word           = rt.clear_word0.word0;\n"
-              "        desc.info.metadata.clear_word1 = ClearRegisterWideEnabled() ? rt.clear_word1.word1 : 0;"
-          )
-
-          p = "src/graphics/host_gpu/renderer/cache/textureCache.cpp"
-          replace(
-              p,
-              '#include "graphics/host_gpu/renderer/cache/textureCache.h"',
-              '#include "graphics/host_gpu/renderer/cache/textureCache.h"\n'
-              '#include "graphics/host_gpu/renderer/image/clear60plusStats.h"'
-          )
-          replace(
-              p,
-              "\t\treturn desc.type == TextureCache::BindingType::RenderTarget &&\n"
-              "\t\t       metadata.clear_register_valid &&\n"
-              "\t\t       DecodePackedColorClear(format, metadata.clear_word, clear);",
-              "        if (desc.type != TextureCache::BindingType::RenderTarget ||\n"
-              "            !metadata.clear_register_valid) return false;\n"
-              "        const bool old_ok = DecodePackedColorClear(format, metadata.clear_word, clear);\n"
-              "        if (!ClearRegisterWideEnabled()) return old_ok;\n"
-              "        const bool decoded = DecodePackedColorClear64(\n"
-              "            format, metadata.clear_word, metadata.clear_word1, clear);\n"
-              "        if (decoded && !old_ok)\n"
-              "            KytyClear60Plus::extra_decodes.fetch_add(1, std::memory_order_relaxed);\n"
-              "        return decoded;"
-          )
-          replace(
-              p,
-              "    KytyStorageRepeat60::Banner();",
-              "    KytyStorageRepeat60::Banner();\n"
-              '    std::printf("clear60plus: wide register clears %s\\n", ClearRegisterWideEnabled() ? "ON" : "OFF");'
-          )
-          replace(
-              p,
-              "    KytyStorageRepeat60::Frame();",
-              "    KytyStorageRepeat60::Frame();\n"
-              "    KytyClear60Plus::Report();"
-          )
-
-          p = "src/kernel/memoryAddressSpace.inc"
-          old = (
-              "\t\tfor (const auto& [base, range_size]: m_free) {\n"
-              "\t\t\tconst auto candidate = AlignUp"
-          )
-          fast = r'''        // Indexed scan port from Jetsku f1a4dffcafd2; opt-in.
-                  static const bool fast_search60 = [] {
-                      const char* value = std::getenv("KYTY_FAST_FREE_SEARCH_60");
-                      const bool on = value && std::strcmp(value, "1") == 0;
-                      std::printf("memory60plus: indexed free-range search %s\n", on ? "ON" : "OFF");
-                      return on;
-                  }();
-                  if (fast_search60) {
-                      auto it = m_free.upper_bound(search_start);
-                      if (it != m_free.begin()) --it;
-                      for (; it != m_free.end() && it->first < search_end; ++it) {
-                          const auto& [base, range_size] = *it;
-                          const auto candidate = AlignUp(std::max(base, search_start), alignment);
-                          if (candidate < search_end && size <= search_end - candidate &&
-                              GuestFreeRangeContains(base, range_size, candidate, size))
-                              return candidate;
-                      }
-                      return 0;
-                  }
-          '''
-          replace(p, old, fast + old)
-
-          for path, text in changes.items():
-              Path(path).write_text(text, encoding="utf-8", newline="\n")
-
-          test = Path("_donor60/tests/ClearRegisterDecodeTests.cpp").read_text(encoding="utf-8")
-          needle = "\tTestUnchangedFormats();"
-          if test.count(needle) != 1:
-              raise RuntimeError("Unexpected donor clear test")
-          test = test.replace(
-              needle,
-              needle + "\n\tImageMetadataInfo a {}, b {};\n"
-              "\tb.clear_word1 = 1;\n"
-              '\tCheck(!(a == b), "metadata comparison includes the second register word");'
-          )
-          Path("tests/ClearRegister60PlusTests.cpp").write_text(
-              test, encoding="utf-8", newline="\n"
-          )
-
-          p = Path("CMakeLists.txt")
-          p.write_text(
-              p.read_text(encoding="utf-8") +
-              "\nadd_executable(clear_register60plus_tests EXCLUDE_FROM_ALL tests/ClearRegister60PlusTests.cpp)\n"
-              "target_link_libraries(clear_register60plus_tests common fmt::fmt Vulkan::Headers)\n"
-              "target_include_directories(clear_register60plus_tests PRIVATE ${inc_headers})\n"
-              "add_test(NAME clear_register60plus COMMAND $<TARGET_FILE:clear_register60plus_tests>)\n",
-              encoding="utf-8", newline="\n"
-          )
-
-          stats = r"""#pragma once
-          #include <atomic>
-          #include <cstdint>
-          #include <cstdio>
-          namespace KytyClear60Plus {
-          inline std::atomic_uint64_t extra_decodes {0};
-          inline thread_local uint64_t ticks = 0;
-          inline void Report() {
-              if (++ticks % 300 == 0) {
-                  std::printf("clear60plus-stats: extra-register-decodes=%llu\n",
-                      static_cast<unsigned long long>(extra_decodes.load(std::memory_order_relaxed)));
-                  std::fflush(stdout);
-              }
-          }
-          }
-          """
-          Path("src/graphics/host_gpu/renderer/image/clear60plusStats.h").write_text(
-              stats, encoding="utf-8", newline="\n"
-          )
-          print("suite60: indexed memory search and register clears installed; PGO unchanged")
-          '@ | & $env:KYTY_PYTHON -
-
-          if ($LASTEXITCODE -ne 0) { throw "Suite 60 adaptation failed" }
-          git diff --check
-          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+          & $env:KYTY_PYTHON _execute60.py "Install repeated storage write experiment 60"
+          if ($LASTEXITCODE -ne 0) { throw "Storage adaptation failed" }
 
       - name: Setup MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-
-      - name: Setup Clang
-        uses: egor-tensin/setup-clang@v1
-        with:
-          version: 18
-          platform: x64
-          cygwin: 0
 
       - name: Setup Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
@@ -329,102 +151,297 @@ jobs:
           modules: qt5compat
           cache: true
 
-      - name: Build and test using pinned working workflow
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Checkout Jetsku donor and PGO profile
+        uses: actions/checkout@v4
+        with:
+          repository: Jetsku/KytyPS5
+          ref: f9e19582f0deac0d1226a7ce3faae30a9ab408ab
+          path: _jetsku
+          sparse-checkout: |
+            src/graphics/host_gpu/renderer/image/imageInfo.h
+            tests/ClearRegisterDecodeTests.cpp
+            tools/pgo/u59-int9-sg-1.profdata
+          sparse-checkout-cone-mode: false
+
+      - name: Install matching LLVM 22.1.3
         run: |
           $ErrorActionPreference = "Stop"
-          & $env:KYTY_PYTHON _run_saved60.py "Build and test using pinned working workflow"
-          if ($LASTEXITCODE -ne 0) { throw "Build or baseline tests failed" }
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-22.1.3-win64.exe"
 
-      - name: Test storage repeat policy OFF and ON
-        run: |
-          $ErrorActionPreference = "Stop"
-          & $env:KYTY_PYTHON _run_saved60.py "Test storage repeat policy OFF and ON"
-          if ($LASTEXITCODE -ne 0) { throw "Storage repeat tests failed" }
+          Invoke-WebRequest "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.3/LLVM-22.1.3-win64.exe" -OutFile $installer
 
-      - name: Test register clears and memory paths
-        run: |
-          $ErrorActionPreference = "Stop"
-          cmake --build _Build/windows --target clear_register60plus_tests --parallel 2
-          if ($LASTEXITCODE -ne 0) { throw "Register clear test build failed" }
+          $process = Start-Process $installer -ArgumentList '/S','/D=C:\LLVM-22.1.3' -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "LLVM installation failed" }
 
-          $env:KYTY_CLEAR_REGISTER_WIDE = "1"
-          ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^clear_register60plus$"
-          if ($LASTEXITCODE -ne 0) { throw "Register clear tests failed" }
+          & C:\LLVM-22.1.3\bin\clang-cl.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "LLVM verification failed" }
 
-          foreach ($mode in @("0", "1")) {
-              $env:KYTY_FAST_FREE_SEARCH_60 = $mode
-              $env:KYTY_CLEAR_REGISTER_WIDE = $mode
-              $env:KYTY_GUEST_STORAGE_REPEAT = $mode
-              ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^(memory_tracker|virtual_memory_allocation)$"
-              if ($LASTEXITCODE -ne 0) { throw "Memory tests failed in mode $mode" }
-          }
+          "C:\LLVM-22.1.3\bin" | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
 
-          Remove-Item Env:KYTY_FAST_FREE_SEARCH_60 -ErrorAction SilentlyContinue
-          Remove-Item Env:KYTY_CLEAR_REGISTER_WIDE -ErrorAction SilentlyContinue
-          Remove-Item Env:KYTY_GUEST_STORAGE_REPEAT -ErrorAction SilentlyContinue
+          cmd /c "mklink /J C:\kyty-src `"$env:GITHUB_WORKSPACE`""
+          if ($LASTEXITCODE -ne 0) { throw "Source junction failed" }
 
-      - name: Package launchers and symbols
-        run: |
-          $ErrorActionPreference = "Stop"
-          & $env:KYTY_PYTHON _run_saved60.py "Package launchers and symbols"
-          if ($LASTEXITCODE -ne 0) { throw "Launcher packaging failed" }
+          git config --global --add safe.directory C:/kyty-src
 
-      - name: Create comparison and combined test launchers
+      - name: Install combined changes and compiler optimization
         run: |
           $ErrorActionPreference = "Stop"
           @'
           from pathlib import Path
+          import os
+          import subprocess
 
-          install = Path("_Build/windows/install")
-          marker = '"%~dp0launcher.exe" %*'
-
-          for mode, old, new in [
-              (0, "Comparacion-60.cmd", "Comparacion-60-Plus.cmd"),
-              (1, "Prueba-60.cmd", "Prueba-60-Plus.cmd")
-          ]:
-              path = install/old
-              text = path.read_text(encoding="ascii")
-              if text.count(marker) != 1:
-                  raise RuntimeError("Launcher boundary missing")
-              text = text.replace(
-                  marker,
-                  f"set KYTY_FAST_FREE_SEARCH_60={mode}\n"
-                  f"set KYTY_CLEAR_REGISTER_WIDE={mode}\n" + marker
+          def replace(path, old, new):
+              p = Path(path)
+              source = p.read_text(encoding="utf-8")
+              if source.count(old) != 1:
+                  raise RuntimeError(
+                      "Unexpected boundary: " + path + " / " + old[:60]
+                  )
+              p.write_text(
+                  source.replace(old, new),
+                  encoding="utf-8",
+                  newline="\n"
               )
-              (install/new).write_text(text, encoding="ascii", newline="\r\n")
-              path.unlink()
 
-          (install/"PRUEBA-60.txt").unlink(missing_ok=True)
-          (install/"PRUEBA-60-PLUS.txt").write_text(
-              "Comparison: original barriers, original memory scan, original register decoding.\n"
-              "Test: all three changes ON. Same executable, compiler and build flags.\n"
-              "PGO and IPO are not added by this workflow.\n"
-              "Keep _Patches, _PipelineCache and kyty_settings.ini. Select THIS interpreter.\n"
-              "AMD CPU patch OFF; shader validation OFF; red-zone ON.\n"
-              "Warm up, then heavy and light views for 60 seconds each. Send both consoles and FPS.\n"
-              "clear60plus counts extra decode decisions, not GPU clear commands.\n"
-              "If graphical errors appear, close the test and use the comparison.\n",
-              encoding="ascii"
+          # Same compiler and source path in both builds.
+          workflow = "_workflow51/.github/workflows/build-windows-amd-occlusion-observation.yml"
+
+          replace(
+              workflow,
+              '"cmake", "-S", ".", "-B", "_Build/windows"',
+              '"cmake", "-S", "C:/kyty-src", "-B", "_Build/windows"'
           )
+          replace(
+              workflow,
+              '"-DCMAKE_C_COMPILER=clang-cl"',
+              '"-DCMAKE_C_COMPILER=C:/LLVM-22.1.3/bin/clang-cl.exe"'
+          )
+          replace(
+              workflow,
+              '"-DCMAKE_CXX_COMPILER=clang-cl"',
+              '"-DCMAKE_CXX_COMPILER=C:/LLVM-22.1.3/bin/clang-cl.exe",\n'
+              '                        "-DCMAKE_LINKER=C:/LLVM-22.1.3/bin/lld-link.exe",\n'
+              '                        "-DCMAKE_AR=C:/LLVM-22.1.3/bin/llvm-lib.exe"'
+          )
+
+          if os.environ["ALL_MODE"] == "1":
+              # Adapt f1a4dffcafd28a45b8cdf3253947c70e33613aa5.
+              replace(
+                  "src/kernel/memoryAddressSpace.inc",
+                  "\t\tfor (const auto& [base, range_size]: m_free) {\n"
+                  "\t\t\tconst auto candidate = AlignUp(std::max(base, search_start), alignment);",
+                  "\t\tauto it = m_free.upper_bound(search_start);\n"
+                  "\t\tif (it != m_free.begin()) --it;\n"
+                  "\t\tfor (; it != m_free.end() && it->first < search_end; ++it) {\n"
+                  "\t\t\tconst auto& [base, range_size] = *it;\n"
+                  "\t\t\tconst auto candidate = AlignUp(std::max(base, search_start), alignment);"
+              )
+
+              # Adapt 00ed2a5a6c58 using pinned donor functions.
+              donor = Path(
+                  "_jetsku/src/graphics/host_gpu/renderer/image/imageInfo.h"
+              ).read_text(encoding="utf-8")
+
+              def function(name):
+                  start = donor.index(
+                      "[[nodiscard]] inline bool " + name + "("
+                  )
+                  opening = donor.index("{", start)
+                  depth = 1
+                  end = opening + 1
+                  while depth:
+                      depth += (donor[end] == "{") - (donor[end] == "}")
+                      end += 1
+                  return donor[start:end] + "\n"
+
+              header = "src/graphics/host_gpu/renderer/image/imageInfo.h"
+
+              replace(
+                  header,
+                  "#include <cstdint>",
+                  "#include <cstdint>\n#include <cstdlib>\n#include <limits>"
+              )
+              replace(
+                  header,
+                  "\tuint32_t            clear_word           = 0;",
+                  "\tuint32_t            clear_word           = 0;\n"
+                  "\tuint32_t clear_word1 = 0;"
+              )
+              replace(
+                  header,
+                  "[[nodiscard]] inline bool DecodePackedStencilClear(",
+                  function("ClearRegisterWideEnabled") + "\n"
+                  + function("DecodePackedColorClear64") + "\n"
+                  + "[[nodiscard]] inline bool DecodePackedStencilClear("
+              )
+              replace(
+                  "src/graphics/host_gpu/renderer/colorRenderTarget.cpp",
+                  "desc.info.metadata.clear_word           = rt.clear_word0.word0;",
+                  "desc.info.metadata.clear_word           = rt.clear_word0.word0;\n"
+                  "\t\tdesc.info.metadata.clear_word1 = rt.clear_word1.word1;"
+              )
+              replace(
+                  "src/graphics/host_gpu/renderer/cache/textureCache.cpp",
+                  "DecodePackedColorClear(format, metadata.clear_word, clear);",
+                  "DecodePackedColorClear64(format, metadata.clear_word, metadata.clear_word1, clear);"
+              )
+
+              test = Path(
+                  "_jetsku/tests/ClearRegisterDecodeTests.cpp"
+              ).read_text(encoding="utf-8")
+              Path("tests/ClearRegisterAllTests.cpp").write_text(
+                  test, encoding="utf-8"
+              )
+
+              cmake = r"""
+          add_executable(clear_register_all_tests EXCLUDE_FROM_ALL tests/ClearRegisterAllTests.cpp)
+          target_link_libraries(clear_register_all_tests common fmt::fmt Vulkan::Headers)
+          target_include_directories(clear_register_all_tests PRIVATE ${inc_headers})
+          add_test(NAME clear_register_all COMMAND $<TARGET_FILE:clear_register_all_tests>)
+
+          # Match the donor's emulator-target IPO scope.
+          set_property(TARGET kyty_emulator PROPERTY INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+
+          set(imported_profile "C:/kyty-src/tools/pgo/u59-int9-sg-1.profdata")
+          if(NOT EXISTS "${imported_profile}")
+              message(FATAL_ERROR "Imported PGO profile missing")
+          endif()
+
+          foreach(profile_target common kyty_emulator)
+              target_compile_options(${profile_target} PRIVATE
+                  "-fprofile-instr-use=${imported_profile}"
+                  -Wno-profile-instr-unprofiled
+                  -Wprofile-instr-missing)
+          endforeach()
+
+          message(STATUS "Prueba 60 ALL: IPO ON; imported Jetsku PGO ON")
+          """
+              p = Path("CMakeLists.txt")
+              p.write_text(
+                  p.read_text(encoding="utf-8") + cmake,
+                  encoding="utf-8",
+                  newline="\n"
+              )
+
+              profile = Path("tools/pgo/u59-int9-sg-1.profdata")
+              profile.parent.mkdir(parents=True, exist_ok=True)
+              profile.write_bytes(
+                  Path(
+                      "_jetsku/tools/pgo/u59-int9-sg-1.profdata"
+                  ).read_bytes()
+              )
+              subprocess.run(
+                  [
+                      "C:/LLVM-22.1.3/bin/llvm-profdata.exe",
+                      "show",
+                      str(profile)
+                  ],
+                  check=True
+              )
+
+          print("Build mode:", os.environ["ALL_MODE"], flush=True)
+          subprocess.run(["git", "diff", "--check"], check=True)
           '@ | & $env:KYTY_PYTHON -
 
-          if ($LASTEXITCODE -ne 0) { throw "Combined launchers failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Combined adaptation failed" }
 
-      - name: Create Windows ZIP
+      - name: Build and test
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Prueba-60-Plus.zip"
-          Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+
+          & $env:KYTY_PYTHON _run_saved51.py "Build and test using pinned working workflow" 2>&1 | Tee-Object build-all.log
+          if ($LASTEXITCODE -ne 0) { throw "Build or baseline tests failed" }
+
+          $ninja = Get-Content _Build/windows/build.ninja -Raw
+          if ($env:ALL_MODE -eq "1") {
+              if (-not $ninja.Contains("-fprofile-instr-use=") -or -not $ninja.Contains("-flto")) {
+                  throw "PGO or IPO flags absent"
+              }
+              if (-not $ninja.Contains('C$:\kyty-src\src\emulator.cpp')) {
+                  throw "Unexpected PGO source path"
+              }
+          }
+
+          $warnings = Select-String build-all.log -Pattern "profile data may be|profile.*out of date|profile.*incomplete|no profile data"
+          if ($warnings) {
+              "::warning::Imported PGO profile has coverage warnings. Inspect build-all.log; this is not a locally trained profile."
+              $warnings | Select-Object -First 20
+          }
+
+      - name: Test combined helpers
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          cmake --build _Build/windows --target storage_repeat60_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw "Storage test build failed" }
+
+          foreach ($mode in @("0", "1")) {
+              $env:KYTY_GUEST_STORAGE_REPEAT = $mode
+              ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^storage_repeat60$"
+              if ($LASTEXITCODE -ne 0) { throw "Storage tests failed" }
+          }
+
+          if ($env:ALL_MODE -eq "1") {
+              cmake --build _Build/windows --target clear_register_all_tests --parallel 2
+              if ($LASTEXITCODE -ne 0) { throw "Clear test build failed" }
+
+              $env:KYTY_CLEAR_REGISTER_WIDE = "1"
+              ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^clear_register_all$"
+              if ($LASTEXITCODE -ne 0) { throw "Clear tests failed" }
+          }
+
+      - name: Package launchers
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          & $env:KYTY_PYTHON _run_saved51.py "Package launchers and symbols"
+          if ($LASTEXITCODE -ne 0) { throw "Launcher packaging failed" }
+
+          $install = "_Build/windows/install"
+          $source = if ($env:ALL_MODE -eq "1") { "Prueba-60.cmd" } else { "Comparacion-60.cmd" }
+          $name = if ($env:ALL_MODE -eq "1") { "Prueba-60-Todo.cmd" } else { "Comparacion-60-Base.cmd" }
+
+          $body = Get-Content "$install/$source" -Raw
+          $body = $body.Replace(
+              '"%~dp0launcher.exe" %*',
+              "set KYTY_CLEAR_REGISTER_WIDE=$env:ALL_MODE`r`n`"%~dp0launcher.exe`" %*"
+          )
+          $body | Set-Content "$install/$name" -Encoding ascii
+
+          Remove-Item "$install/Prueba-60.cmd", "$install/Comparacion-60.cmd"
+
+          @(
+              "Build: $name; combined mode=$env:ALL_MODE.",
+              "ALL=storage-repeat60, indexed free-range search, wide register clears, IPO and imported PGO.",
+              "BASE=retained AMD source; these three changes OFF; IPO and PGO OFF.",
+              "LLVM 22.1.3 in both builds. Imported profile may have partial coverage.",
+              "Copy _Patches, _PipelineCache and kyty_settings.ini into each extracted build.",
+              "AMD CPU patch OFF; shader validation OFF; red-zone ON.",
+              "Select this folder's interpreter. Warm up 1 minute; heavy 60s, light 60s."
+          ) | Set-Content "$install/PRUEBA-60-TODO.txt" -Encoding ascii
+
+          $zip = "KytyPS5-60-$env:BUILD_LABEL.zip"
+          Compress-Archive "$install/*" $zip -Force
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
               throw "Packaging failed"
           }
 
-      - name: Upload KytyPS5
+      - name: Upload build
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Prueba-60-Plus
-          path: KytyPS5-Prueba-60-Plus.zip
+          name: KytyPS5-60-${{ matrix.label }}
+          path: KytyPS5-60-${{ matrix.label }}.zip
           if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload compiler log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Compiler-log-60-${{ matrix.label }}
+          path: build-all.log
+          if-no-files-found: ignore
           retention-days: 7
