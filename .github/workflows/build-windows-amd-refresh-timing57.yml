@@ -1,0 +1,303 @@
+name: Windows AMD - Diagnostico 57 - Actualizacion de recursos
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 - Recursos 57
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      KYTY_FLAGS_51: /clang:-ffp-contract=off
+      KYTY_PROFILE_51: Generica
+
+    steps:
+      - name: Checkout fixed AMD base
+        uses: actions/checkout@v4
+        with:
+          ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout pinned working diagnostic 20
+        uses: actions/checkout@v4
+        with:
+          ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+          path: _patch_source
+          sparse-checkout: |
+            patches
+            .github/workflows
+          fetch-depth: 1
+          submodules: false
+
+      - name: Read working diagnostic 51 from this commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: _workflow51
+          sparse-checkout: .github/workflows/build-windows-amd-occlusion-observation.yml
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Setup fixed Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pin Python executable and install YAML parser
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+          if (-not $pythonExe) { throw "Python executable missing" }
+          "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $pythonExe -m pip install PyYAML==6.0.2
+          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+          & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+
+      - name: Create runner for existing plain-text workflow
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          import subprocess
+          import sys
+          import yaml
+          source=Path("_workflow51/.github/workflows/build-windows-amd-occlusion-observation.yml")
+          if not source.is_file():
+              raise RuntimeError("Keep the working build-windows-amd-occlusion-observation.yml in this repository")
+          workflow=yaml.safe_load(source.read_text(encoding="utf-8"))
+          steps=workflow["jobs"]["build"]["steps"]
+          name=sys.argv[1]
+          selected=[s for s in steps if s.get("name")==name]
+          if len(selected)!=1 or "run" not in selected[0]:
+              raise RuntimeError("Missing or ambiguous diagnostic 51 step: "+name)
+          script=selected[0]["run"]
+          if name=="Install optional occlusion observation" and ("zlib" in script or "base64" in script):
+              raise RuntimeError("Diagnostic 51 must be the working plain-text version")
+          if name=="Package launchers and symbols":
+              script=script.replace("Diagnostico-51.cmd","Diagnostico-57.cmd").replace("Comparacion-51.cmd","Comparacion-57.cmd").replace("DIAGNOSTICO-51.txt","DIAGNOSTICO-57.txt")
+          path=Path("_run_saved51.ps1")
+          path.write_text('$ErrorActionPreference = "Stop"\n'+script,encoding="utf-8")
+          print("Reusing validated 51 step:",name,flush=True)
+          subprocess.run(["pwsh","-NoProfile","-File",str(path.resolve())],check=True)
+          '@ | Set-Content "_run_saved51.py" -Encoding utf8
+          & $env:KYTY_PYTHON -m py_compile _run_saved51.py
+          if ($LASTEXITCODE -ne 0) { throw "Saved workflow runner invalid" }
+
+      - name: Reproduce working AMD source and retained optimizations
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Reproduce working AMD source and retained optimizations"
+          if ($LASTEXITCODE -ne 0) { throw "Saved workflow source step failed" }
+
+      - name: Install optional occlusion observation
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Install optional occlusion observation"
+          if ($LASTEXITCODE -ne 0) { throw "Saved observation installation failed" }
+
+      - name: Install resource refresh timing
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          import subprocess
+          import sys
+          files={}
+          files['patches/adapt_refresh_timing57.py']=r"""from pathlib import Path
+          p=Path('src/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp')
+          s=p.read_text()
+          def replace(old,new):
+           global s
+           if s.count(old)!=1:raise RuntimeError('Unexpected refresh57 boundary: '+old[:100])
+           s=s.replace(old,new)
+          replace('#include <algorithm>','#include <algorithm>\n#include "RefreshTiming57.h"')
+          replace('MaterializationMemo* memo) {\n\tbool capture_reads = false;','MaterializationMemo* memo) {\n    RefreshTiming57::Scope timing57(program.shader_hash, static_cast<unsigned>(program.stage));\n\tbool capture_reads = false;')
+          replace('\t\tresult = Materialize(program, CompiledRoots {compiled}', '        RefreshTiming57::Mark(1);\n\t\tresult = Materialize(program, CompiledRoots {compiled}')
+          replace('\tconst auto active = walker.FindActiveSources();','\tconst auto active = walker.FindActiveSources();\n    RefreshTiming57::Mark(2);')
+          replace('\tsnapshot.uniform_fill = {};','    RefreshTiming57::Mark(3);\n\tsnapshot.uniform_fill = {};')
+          replace('\tif constexpr (std::is_same_v<Roots, CompiledRoots>) {\n\t\tif (memo != nullptr)', '    RefreshTiming57::Mark(4);\n\tif constexpr (std::is_same_v<Roots, CompiledRoots>) {\n\t\tif (memo != nullptr)')
+          replace('\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {','    RefreshTiming57::Mark(5);\n\tconst auto evaluate = [&](uint32_t source, DescriptorValue& value) {')
+          start=s.index('bool MaterializeCompiled(')
+          end=s.index('\nvoid VerifyMaterialization',start)
+          body=s[start:end]
+          old='\treturn result;'
+          assert body.count(old)==1
+          s=s[:start]+body.replace(old,'    timing57.Result(result, memo != nullptr && memo->reused);\n'+old)+s[end:]
+          header=Path(__file__).resolve().parent.parent/'experiments/refresh57/RefreshTiming57.h'
+          if not header.is_file():raise RuntimeError('RefreshTiming57.h missing')
+          p.write_text(s,newline='\n')
+          (p.parent/'RefreshTiming57.h').write_text(header.read_text(),newline='\n')
+          print('refresh57: elapsed materialization phases; all guest reads and memo validation preserved')
+          """
+          files['experiments/refresh57/RefreshTiming57.h']=r"""#pragma once
+          #include <array>
+          #include <chrono>
+          #include <cinttypes>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          namespace RefreshTiming57 {
+          using Clock=std::chrono::steady_clock;
+          inline bool Enabled(){static const bool v=[]{const char* s=std::getenv("KYTY_REFRESH_TIMING57");const bool on=s&&std::strcmp(s,"1")==0;if(on)std::puts("refresh57: rotating 1/128 CPU samples ON");return on;}();return v;}
+          struct Group{uint64_t hash=0,samples=0,ns=0,reused=0;unsigned stage=0;};
+          struct State{uint64_t calls=0,samples=0,reused=0,failed=0,sequence=0,dropped=0;std::array<uint64_t,6> ns{};std::array<Group,128> groups{};unsigned count=0;Clock::time_point last=Clock::now();};
+          inline thread_local State state;
+          class Scope;
+          inline thread_local Scope* current=nullptr;
+          inline void Report(Clock::time_point now){
+           const double sec=std::chrono::duration<double>(now-state.last).count();if(sec<5)return;
+           std::printf("refresh57-window: seconds=%.6f calls=%" PRIu64 " samples=%" PRIu64 " reused-samples=%" PRIu64 " failed-samples=%" PRIu64 " dropped-group-samples=%" PRIu64 "\n",sec,state.calls,state.samples,state.reused,state.failed,state.dropped);
+           const char* names[]={"setup","active","flat","fill","memo","descriptors-and-specialization"};
+           for(unsigned i=0;i<6;++i)std::printf("refresh57-part: name=%s sampled-ms=%.6f estimated-ms=%.6f\n",names[i],double(state.ns[i])/1e6,state.samples?double(state.ns[i])/double(state.samples)*double(state.calls)/1e6:0.0);
+           for(unsigned i=0;i<state.count;++i){const auto& g=state.groups[i];std::printf("refresh57-shader: hash=%016" PRIx64 " stage=%u samples=%" PRIu64 " reused=%" PRIu64 " sampled-ms=%.6f mean-us=%.6f\n",g.hash,g.stage,g.samples,g.reused,double(g.ns)/1e6,double(g.ns)/double(g.samples)/1e3);}
+           const auto sequence=state.sequence;state=State{};state.sequence=sequence;
+           std::fflush(stdout);state.last=Clock::now();
+          }
+          class Scope{
+           Scope* previous=nullptr;bool on=false,selected=false,reused=false,ok=false;uint64_t hash=0;unsigned stage=0,part=0;Clock::time_point start{},last{};
+          public:
+           Scope(uint64_t h,unsigned s):hash(h),stage(s){if(!Enabled()){return;}on=true;++state.calls;const auto n=state.sequence++;selected=(n&127)==((n>>7)&127);previous=current;current=this;if(selected)start=last=Clock::now();}
+           void Mark(unsigned next){if(selected){const auto now=Clock::now();state.ns[part]+=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now-last).count());last=now;}part=next;}
+           void Result(bool success,bool reuse){ok=success;reused=reuse;}
+           ~Scope(){if(!on)return;current=previous;if(!selected)return;Mark(part);const auto now=last;const auto ns=uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now-start).count());++state.samples;state.reused+=reused;state.failed+=!ok;
+            unsigned i=0;while(i<state.count&&(state.groups[i].hash!=hash||state.groups[i].stage!=stage))++i;
+            if(i==state.count&&i<128){state.groups[i].hash=hash;state.groups[i].stage=stage;++state.count;}
+            if(i<128){auto& g=state.groups[i];++g.samples;g.ns+=ns;g.reused+=reused;}else ++state.dropped;
+            if(!current)Report(now);
+           }
+           Scope(const Scope&)=delete;Scope& operator=(const Scope&)=delete;
+          };
+          inline void Mark(unsigned next){if(current)current->Mark(next);}
+          }
+          """
+          files['experiments/refresh57/RefreshTiming57Tests.cpp']=r"""#include "RefreshTiming57.h"
+          #include <cassert>
+          int main(int argc,char**){
+           using namespace RefreshTiming57;
+           if(argc==1){Scope s(42,1);Mark(1);assert(!current&&state.calls==0);return 0;}
+           for(unsigned i=0;i<16384;++i){Scope s(42,1);for(unsigned p=1;p<6;++p)Mark(p);s.Result(true,true);}
+           assert(!current&&state.calls==16384&&state.samples==128&&state.reused==128&&state.failed==0);
+           assert(state.count==1&&state.groups[0].samples==128);
+           state.last=Clock::now()-std::chrono::seconds(6);Report(Clock::now());
+           assert(state.calls==0&&state.sequence==16384);
+           {Scope outer(43,2);auto* p=current;{Scope inner(44,4);inner.Result(false,false);}assert(current==p);outer.Result(true,false);}assert(!current);
+          }
+          """
+          root=Path("_refresh57")
+          for name,text in files.items():
+              p=root/name
+              p.parent.mkdir(parents=True,exist_ok=True)
+              p.write_text(text,encoding="utf-8",newline="\n")
+          subprocess.run([sys.executable,str(root/"patches/adapt_refresh_timing57.py")],check=True)
+          '@ | & $env:KYTY_PYTHON -
+          if ($LASTEXITCODE -ne 0) { throw "Refresh 57 adaptation failed" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: 18
+          platform: x64
+          cygwin: 0
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.8.3
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qt5compat
+          cache: true
+
+      - name: Test isolated query components on Windows
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Test isolated query components on Windows"
+          if ($LASTEXITCODE -ne 0) { throw "Isolated query component tests failed" }
+
+      - name: Test resource timing counters
+        run: |
+          $ErrorActionPreference = "Stop"
+          clang-cl /nologo /std:c++20 /EHsc /O2 "_refresh57/experiments/refresh57/RefreshTiming57Tests.cpp" /Fe:_Build/occlusion51/RefreshTiming57.exe /Fo:_Build/occlusion51/RefreshTiming57.obj
+          if ($LASTEXITCODE -ne 0) { throw "Resource timing test build failed" }
+          $env:KYTY_REFRESH_TIMING57 = "0"
+          & "_Build/occlusion51/RefreshTiming57.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Disabled timing test failed" }
+          $env:KYTY_REFRESH_TIMING57 = "1"
+          & "_Build/occlusion51/RefreshTiming57.exe" on
+          if ($LASTEXITCODE -ne 0) { throw "Resource timing counter test failed" }
+          Remove-Item Env:KYTY_REFRESH_TIMING57
+
+      - name: Build and test using pinned working workflow
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Build and test using pinned working workflow"
+          if ($LASTEXITCODE -ne 0) { throw "Build or tests failed" }
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Package launchers and symbols
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Package launchers and symbols"
+          if ($LASTEXITCODE -ne 0) { throw "Launcher packaging failed" }
+
+      - name: Configure diagnostic 57 launchers
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          root=Path("_Build/windows/install")
+          for name,on in [("Diagnostico-57.cmd",True),("Comparacion-57.cmd",False)]:
+              p=root/name
+              s=p.read_text()
+              if "set KYTY_OCCLUSION_PROBE=" not in s:
+                  raise RuntimeError("Unexpected launcher: "+name)
+              s=s.replace("set KYTY_OCCLUSION_PROBE=1","set KYTY_OCCLUSION_PROBE=0")
+              s=s.replace("set KYTY_OCCLUSION_PROBE=0", "set KYTY_OCCLUSION_PROBE=0\nset KYTY_BUFFER_TIMING55=0\nset KYTY_DRAW_TIMING56=0\nset KYTY_REFRESH_TIMING57="+str(int(on)))
+              p.write_text(s,newline="\r\n")
+          (root/"DIAGNOSTICO-57.txt").write_text(
+              "CPU resource refresh timing ON only in Diagnostico-57.cmd. Occlusion observation OFF.\n"
+              "Warm up one minute; heavy 60 seconds, light 60 seconds.\n"
+              "Send complete console. Parts partition sampled materialization time. Shader rows overlap parts.\n"
+              "No frame counter in 57. Send heavy/light FPS with consoles.\n"
+              "Estimates use rotating 1/128 samples; counters are per thread.\n",
+              encoding="utf-8")
+          '@ | & $env:KYTY_PYTHON -
+          if ($LASTEXITCODE -ne 0) { throw "Launcher 57 setup failed" }
+
+      - name: Create Windows ZIP
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "KytyPS5-Diagnostico-57.zip"
+          Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+              throw "Packaging failed: missing or empty ZIP"
+          }
+
+      - name: Upload KytyPS5
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Diagnostico-57
+          path: KytyPS5-Diagnostico-57.zip
+          if-no-files-found: error
+          retention-days: 7
