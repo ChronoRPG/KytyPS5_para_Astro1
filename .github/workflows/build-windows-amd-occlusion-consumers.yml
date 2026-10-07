@@ -1,0 +1,330 @@
+name: Windows AMD - Diagnostico 52 - Lectores de oclusion
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Windows x64 - Consumidores 52
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      KYTY_FLAGS_51: /clang:-ffp-contract=off
+      KYTY_PROFILE_51: Generica
+    steps:
+    - name: Checkout fixed AMD base
+      uses: actions/checkout@v4
+      with:
+        ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+        submodules: recursive
+        fetch-depth: 1
+    - name: Checkout pinned working diagnostic 20
+      uses: actions/checkout@v4
+      with:
+        ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+        path: _patch_source
+        sparse-checkout: |-
+          patches
+          .github/workflows
+        fetch-depth: 1
+        submodules: false
+    - name: Read working diagnostic 51 from this commit
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        path: _workflow51
+        sparse-checkout: .github/workflows/build-windows-amd-occlusion-observation.yml
+        sparse-checkout-cone-mode: false
+        fetch-depth: 1
+        submodules: false
+    - name: Setup fixed Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Pin Python executable and install YAML parser
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+        if (-not $pythonExe) { throw "Python executable missing" }
+        "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        & $pythonExe -m pip install PyYAML==6.0.2
+        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+        & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+    - name: Create runner for existing plain-text workflow
+      run: |
+        $ErrorActionPreference = "Stop"
+        @'
+        from pathlib import Path
+        import subprocess
+        import sys
+        import yaml
+        source=Path("_workflow51/.github/workflows/build-windows-amd-occlusion-observation.yml")
+        if not source.is_file():
+            raise RuntimeError("Keep the working build-windows-amd-occlusion-observation.yml in this repository")
+        workflow=yaml.safe_load(source.read_text(encoding="utf-8"))
+        steps=workflow["jobs"]["build"]["steps"]
+        name=sys.argv[1]
+        selected=[s for s in steps if s.get("name")==name]
+        if len(selected)!=1 or "run" not in selected[0]:
+            raise RuntimeError("Missing or ambiguous diagnostic 51 step: "+name)
+        script=selected[0]["run"]
+        if name=="Install optional occlusion observation" and ("zlib" in script or "base64" in script):
+            raise RuntimeError("Diagnostic 51 must be the working plain-text version")
+        if name=="Package launchers and symbols":
+            script=script.replace("Diagnostico-51.cmd","Diagnostico-52.cmd").replace("Comparacion-51.cmd","Comparacion-52.cmd").replace("DIAGNOSTICO-51.txt","DIAGNOSTICO-52.txt")
+        path=Path("_run_saved51.ps1")
+        path.write_text('$ErrorActionPreference = "Stop"\n'+script,encoding="utf-8")
+        print("Reusing validated 51 step:",name,flush=True)
+        subprocess.run(["pwsh","-NoProfile","-File",str(path.resolve())],check=True)
+
+        '@ | Set-Content "_run_saved51.py" -Encoding utf8
+        & $env:KYTY_PYTHON -m py_compile _run_saved51.py
+        if ($LASTEXITCODE -ne 0) { throw "Saved workflow runner invalid" }
+    - name: Reproduce working AMD source and retained optimizations
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved51.py "Reproduce working AMD source and retained optimizations"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 51 step failed: Reproduce working AMD source and retained optimizations" }
+    - name: Install optional occlusion observation
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved51.py "Install optional occlusion observation"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 51 step failed: Install optional occlusion observation" }
+    - name: Install bounded consumer address observation
+      run: |
+        $ErrorActionPreference = "Stop"
+        @'
+        from pathlib import Path
+        import subprocess
+        import sys
+        files = {}
+        files['patches/adapt_occlusion_consumers52.py'] = r"""from pathlib import Path
+        import shutil
+        changes={}
+        def replace(path,old,new):
+         p=Path(path);s=changes.get(path,p.read_text())
+         if s.count(old)!=1:raise RuntimeError('Unexpected consumer52 boundary: '+path+' / '+old[:60])
+         changes[path]=s.replace(old,new)
+        p='src/graphics/host_gpu/renderer/occlusionProbe.h'
+        replace(p,'#include "occlusion/Segments.h"','#include "occlusion/Segments.h"\n#include "occlusion/AddressTrace.h"\n#include <array>')
+        replace(p,'  (void)address;\n  ++m_dumps;','  m_addresses.Dump(address);\n  ++m_dumps;')
+        replace(p,' void Predicate(uint32_t op)', ''' void Consumer(uint32_t kind,uint64_t address,uint64_t size){
+          if(kind>=m_reads.size())return;
+          ++m_reads[kind];
+          const auto hit=m_addresses.Read(address,size);
+          if(hit){
+           ++m_hits[kind];
+           if(m_examples[kind]++<2)
+            std::printf("consumer52-hit: kind=%u address=0x%016" PRIx64 " size=%" PRIu64
+                        " dump-base=0x%016" PRIx64 " dump-age=%" PRIu64 " overlap-only\\n",
+                        kind,address,size,hit->base,hit->dump_age);
+          }
+         }
+         void Predicate(uint32_t op)''')
+        replace(p,'  std::fflush(stdout);m_last_report=m_now();', '''  for(uint32_t kind=0;kind<m_reads.size();++kind)
+           std::printf("consumer52-stats: kind=%u reads=%" PRIu64 " overlaps=%" PRIu64
+                       " remembered-bases=%zu evicted=%" PRIu64 "\\n",
+                       kind,m_reads[kind],m_hits[kind],m_addresses.Bases(),m_addresses.Evicted());
+          std::fflush(stdout);m_last_report=m_now();''')
+        replace(p,' uint64_t m_dumps=0,', ''' KytyOcclusionExperiment::AddressTrace m_addresses;
+         std::array<uint64_t,5> m_reads{},m_hits{},m_examples{};
+         uint64_t m_dumps=0,''')
+        p='src/graphics/host_gpu/renderer/commandScheduler.h'
+        replace(p,'    void ObserveOcclusionPredicate(uint32_t op);','    void ObserveOcclusionPredicate(uint32_t op);\n    void ObserveOcclusionConsumer(uint32_t kind, uint64_t address, uint64_t size);')
+        p='src/graphics/host_gpu/renderer/commandScheduler.cpp'
+        replace(p,'void CommandScheduler::ObserveOcclusionPredicate(uint32_t op) {', '''void CommandScheduler::ObserveOcclusionConsumer(uint32_t kind, uint64_t address, uint64_t size) {
+            if (m_occlusion_probe) { m_occlusion_probe->Consumer(kind, address, size); }
+        }
+
+        void CommandScheduler::ObserveOcclusionPredicate(uint32_t op) {''')
+        p='src/graphics/guest_gpu/command_processor/commandProcessor.h'
+        replace(p,'\tvoid TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);',
+        '''\tvoid TriggerEvent(uint32_t event_type, uint32_t event_index, uint64_t event_address = 0);
+            void ObserveOcclusionConsumer(uint32_t kind, uint64_t address, uint64_t size);''')
+        p='src/graphics/guest_gpu/graphicsRun.cpp'
+        replace(p,'void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,',
+        '''void CommandProcessor::ObserveOcclusionConsumer(uint32_t kind, uint64_t address, uint64_t size) {
+            GetScheduler().ObserveOcclusionConsumer(kind, address, size);
+        }
+
+        void CommandProcessor::SetPredication(uint32_t condition, uint32_t op, uint32_t wait_op,''')
+        p='src/graphics/guest_gpu/graphicsRun.cpp'
+        replace(p,'\t(void)poll;\n\t// The CPU may have written', '''    GetScheduler().ObserveOcclusionConsumer(2, reinterpret_cast<uint64_t>(addr), sizeof(T));
+        \t(void)poll;
+        \t// The CPU may have written''')
+        replace(p,'    GetScheduler().ObserveOcclusionPredicate(op);', '''    GetScheduler().ObserveOcclusionPredicate(op);
+            if (op == 1 || op == 3) {
+                GetScheduler().ObserveOcclusionConsumer(3, reinterpret_cast<uint64_t>(address), op == 1 ? 256 : 8);
+            }''')
+        p='src/graphics/guest_gpu/command_processor/pm4Handlers.cpp'
+        replace(p,'\tif (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {', '''    cp.ObserveOcclusionConsumer(0, addr, sizeof(uint32_t));
+        \tif (*reinterpret_cast<const volatile uint32_t*>(addr) == 0) {''')
+        replace(p,'\tconst bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);', '''    cp.ObserveOcclusionConsumer(1, reinterpret_cast<uint64_t>(compare_addr), sizeof(uint64_t));
+        \tconst bool take_then = TestWaitRegMemValue(*compare_addr, reference, mask, function);''')
+        p='src/graphics/guest_gpu/graphicsRun.cpp'
+        replace(p,'\tbuffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,', '''    if (!src_gds) {
+                GetScheduler().ObserveOcclusionConsumer(4, src_address_or_offset_or_immediate, num_bytes);
+            }
+        \tbuffer_cache.CopyBuffer(dst_address_or_offset, src_address_or_offset_or_immediate, num_bytes,''')
+        source=Path(__file__).resolve().parent.parent/'experiments/occlusion/AddressTrace.h'
+        if not source.is_file():raise RuntimeError('AddressTrace.h missing')
+        for path,text in changes.items():Path(path).write_text(text,newline='\n')
+        shutil.copyfile(source,'src/graphics/host_gpu/renderer/occlusion/AddressTrace.h')
+        print('consumer52: address overlaps ON; 0=COND_EXEC 1=BRANCH 2=WAIT 3=PREDICATE 4=DMA_SOURCE; guest reads/results unchanged')
+        """
+        files['experiments/occlusion/AddressTrace.h'] = r"""#pragma once
+        // Address overlap evidence only. No guest memory reads, lifetime or ownership claims.
+        // Single scheduler owner thread. Remember at most capacity distinct dump bases.
+        #include <cstdint>
+        #include <cstddef>
+        #include <deque>
+        #include <limits>
+        #include <map>
+        #include <optional>
+        namespace KytyOcclusionExperiment {
+        class AddressTrace {
+        public:
+         struct Hit {uint64_t base, dump_age;};
+         explicit AddressTrace(std::size_t capacity=4096):m_capacity(capacity){}
+         void Dump(uint64_t base) {
+          ++m_sequence;
+          if(!base || base>std::numeric_limits<uint64_t>::max()-247 || !m_capacity)return;
+          auto found=m_bases.find(base);
+          if(found!=m_bases.end()){found->second=m_sequence;return;}
+          if(m_bases.size()==m_capacity){m_bases.erase(m_order.front());m_order.pop_front();++m_evicted;}
+          m_bases.emplace(base,m_sequence);m_order.push_back(base);
+         }
+         std::optional<Hit> Read(uint64_t address,uint64_t size)const {
+          if(!size || size-1>std::numeric_limits<uint64_t>::max()-address)return std::nullopt;
+          const auto last=address+size-1;
+          const auto lower=address>=247?address-247:0;
+          std::optional<Hit> hit;
+          for(auto it=m_bases.lower_bound(lower);it!=m_bases.end() && it->first<=last;++it){
+           for(uint64_t db=0;db<16;++db){
+            const auto word=it->first+db*16;
+            if(word<=last && word+7>=address){
+             const Hit candidate{it->first,m_sequence-it->second};
+             if(!hit || candidate.dump_age<hit->dump_age)hit=candidate;
+             break;
+            }
+           }
+          }
+          return hit;
+         }
+         std::size_t Bases()const{return m_bases.size();}
+         uint64_t Evicted()const{return m_evicted;}
+        private:
+         std::size_t m_capacity;
+         uint64_t m_sequence=0,m_evicted=0;
+         std::map<uint64_t,uint64_t> m_bases;
+         std::deque<uint64_t> m_order;
+        };
+        }
+        """
+        files['experiments/occlusion/AddressTraceTests.cpp'] = r"""#include "AddressTrace.h"
+        #include <cassert>
+        #include <cstdio>
+        #include <limits>
+        using KytyOcclusionExperiment::AddressTrace;
+        int main(){
+         AddressTrace t(2);assert(!t.Read(0x1000,8));t.Dump(0x1000);
+         for(unsigned db=0;db<16;++db){auto hit=t.Read(0x1000+db*16,8);assert(hit && hit->base==0x1000 && hit->dump_age==0);assert(!t.Read(0x1008+db*16,8));}
+         assert(t.Read(0x0fff,2));assert(!t.Read(0x0fff,1));assert(t.Read(0x10f7,1));assert(!t.Read(0x10f8,8));
+         t.Dump(0x1008);assert(t.Read(0x1008,8));assert(t.Read(0x1000,8)->dump_age==1);
+         t.Dump(0x1000);assert(t.Read(0x1000,8)->dump_age==0 && t.Bases()==2);
+         t.Dump(0x3000);assert(t.Evicted()==1 && t.Bases()==2);assert(!t.Read(0x1000,8));assert(t.Read(0x1008,8));
+         assert(!t.Read(0x3000,0));assert(!t.Read(std::numeric_limits<uint64_t>::max(),2));
+         t.Dump(std::numeric_limits<uint64_t>::max()-100);assert(t.Bases()==2);
+         AddressTrace zero(0);zero.Dump(0x1000);assert(zero.Bases()==0);
+         AddressTrace high;const auto base=std::numeric_limits<uint64_t>::max()-247;high.Dump(base);assert(high.Read(std::numeric_limits<uint64_t>::max(),1));
+         std::puts("AddressTrace: sparse words, begin/end columns, overlaps, bounds and eviction passed");
+        }
+        """
+        root=Path("_occlusion51")
+        for name,source in files.items():
+            path=root/name
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text(source,encoding="utf-8",newline="\n")
+        subprocess.run([sys.executable,str(root/"patches/adapt_occlusion_consumers52.py")],check=True)
+        '@ | & $env:KYTY_PYTHON -
+        if ($LASTEXITCODE -ne 0) { throw "Consumer 52 adaptation failed" }
+        git diff --check
+        if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+    - name: Setup Clang
+      uses: egor-tensin/setup-clang@v1
+      with:
+        version: 18
+        platform: x64
+        cygwin: 0
+    - name: Setup Ninja
+      uses: seanmiddleditch/gha-setup-ninja@v5
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: 6.8.3
+        host: windows
+        target: desktop
+        arch: win64_msvc2022_64
+        modules: qt5compat
+        cache: true
+    - name: Test isolated query components on Windows
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved51.py "Test isolated query components on Windows"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 51 step failed: Test isolated query components on Windows" }
+    - name: Test address overlap tracking
+      run: |
+        $ErrorActionPreference = "Stop"
+        clang-cl /nologo /std:c++20 /EHsc /O2 "_occlusion51/experiments/occlusion/AddressTraceTests.cpp" /Fe:_Build/occlusion51/AddressTrace.exe /Fo:_Build/occlusion51/AddressTrace.obj
+        if ($LASTEXITCODE -ne 0) { throw "Address trace build failed" }
+        & "_Build/occlusion51/AddressTrace.exe"
+        if ($LASTEXITCODE -ne 0) { throw "Address trace tests failed" }
+    - name: Build and test using pinned working workflow
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved51.py "Build and test using pinned working workflow"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 51 step failed: Build and test using pinned working workflow" }
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Package launchers and symbols
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved51.py "Package launchers and symbols"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 51 step failed: Package launchers and symbols" }
+    - name: Write diagnostic instructions
+      run: |
+        $ErrorActionPreference = "Stop"
+        @(
+            "Diagnostico-52.cmd: observation ON. Comparacion-52.cmd: observation OFF.",
+            "Guest counters, memory reads and rendering decisions are unchanged.",
+            "Kinds: 0=COND_EXEC, 1=BRANCH, 2=WAIT, 3=PREDICATE, 4=DMA_SOURCE.",
+            "Overlaps mean address evidence only, not verified lifetime or causation.",
+            "At most 4096 distinct dump bases remembered; eviction can miss old readers.",
+            "CPU and shader reads, copied destinations and indirect consumers are not tracked.",
+            "Keep _Patches, _PipelineCache and kyty_settings.ini.",
+            "AMD CPU patch OFF; shader validation OFF; red-zone ON.",
+            "Select THIS interpreter. Warm up, heavy view 60 seconds, light view 60 seconds.",
+            "Send full consoles including consumer52-stats and consumer52-hit. FPS may be lower."
+        ) | Set-Content "_Build/windows/install/DIAGNOSTICO-52.txt" -Encoding ascii
+    - name: Create Windows ZIP
+      run: |
+        $ErrorActionPreference = "Stop"
+        $zip = "KytyPS5-Diagnostico-52.zip"
+        Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+        if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+            throw "Packaging failed: missing or empty ZIP"
+        }
+    - name: Upload KytyPS5
+      uses: actions/upload-artifact@v4
+      with:
+        name: KytyPS5-Diagnostico-52
+        path: KytyPS5-Diagnostico-52.zip
+        if-no-files-found: error
+        retention-days: 7
