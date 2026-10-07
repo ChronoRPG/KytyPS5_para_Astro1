@@ -1,0 +1,328 @@
+name: Windows AMD - Diagnostico 53 - Esperas de oclusion
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Windows x64 - Esperas 53
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      KYTY_FLAGS_51: /clang:-ffp-contract=off
+      KYTY_PROFILE_51: Generica
+    steps:
+    - name: Checkout fixed AMD base
+      uses: actions/checkout@v4
+      with:
+        ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+        submodules: recursive
+        fetch-depth: 1
+    - name: Checkout pinned working diagnostic 20
+      uses: actions/checkout@v4
+      with:
+        ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+        path: _patch_source
+        sparse-checkout: |-
+          patches
+          .github/workflows
+        fetch-depth: 1
+        submodules: false
+    - name: Read working diagnostic 51 from this commit
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        path: _workflow51
+        sparse-checkout: .github/workflows/build-windows-amd-occlusion-observation.yml
+        sparse-checkout-cone-mode: false
+        fetch-depth: 1
+        submodules: false
+    - name: Read working diagnostic 52 from this commit
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        path: _workflow52
+        sparse-checkout: .github/workflows/build-windows-amd-occlusion-consumers.yml
+        sparse-checkout-cone-mode: false
+        fetch-depth: 1
+        submodules: false
+    - name: Setup fixed Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Pin Python executable and install YAML parser
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+        if (-not $pythonExe) { throw "Python executable missing" }
+        "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        & $pythonExe -m pip install PyYAML==6.0.2
+        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+        & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+    - name: Create runner for working diagnostic 52
+      run: |
+        $ErrorActionPreference = "Stop"
+        @'
+        from pathlib import Path
+        import subprocess
+        import sys
+        import yaml
+        source=Path("_workflow52/.github/workflows/build-windows-amd-occlusion-consumers.yml")
+        if not source.is_file():
+            raise RuntimeError("Keep the working diagnostic 52 workflow in this repository")
+        steps=yaml.safe_load(source.read_text(encoding="utf-8"))["jobs"]["build"]["steps"]
+        name=sys.argv[1]
+        selected=[s for s in steps if s.get("name")==name]
+        if len(selected)!=1 or "run" not in selected[0]:
+            raise RuntimeError("Missing or ambiguous diagnostic 52 step: "+name)
+        path=Path("_run_saved52.ps1")
+        path.write_text('$ErrorActionPreference = "Stop"\n'+selected[0]["run"],encoding="utf-8")
+        print("Reusing working 52 step:",name,flush=True)
+        subprocess.run(["pwsh","-NoProfile","-File",str(path.resolve())],check=True)
+
+        '@ | Set-Content "_run_saved52.py" -Encoding utf8
+        & $env:KYTY_PYTHON -m py_compile _run_saved52.py
+        if ($LASTEXITCODE -ne 0) { throw "Saved workflow runner invalid" }
+    - name: Create runner for existing plain-text workflow
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved52.py "Create runner for existing plain-text workflow"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 52 step failed: Create runner for existing plain-text workflow" }
+    - name: Reproduce working AMD source and retained optimizations
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved52.py "Reproduce working AMD source and retained optimizations"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 52 step failed: Reproduce working AMD source and retained optimizations" }
+    - name: Install optional occlusion observation
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved52.py "Install optional occlusion observation"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 52 step failed: Install optional occlusion observation" }
+    - name: Install bounded consumer address observation
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved52.py "Install bounded consumer address observation"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 52 step failed: Install bounded consumer address observation" }
+    - name: Install wait condition observation
+      run: |
+        $ErrorActionPreference = "Stop"
+        @'
+        from pathlib import Path
+        import subprocess
+        import sys
+        files = {}
+        files['patches/adapt_occlusion_waits53.py'] = r"""from pathlib import Path
+        import shutil
+        changes={}
+        def replace(path,old,new):
+         p=Path(path);s=changes.get(path,p.read_text())
+         if s.count(old)!=1:raise RuntimeError('Unexpected wait53 boundary: '+path+' / '+old[:60])
+         changes[path]=s.replace(old,new)
+        p='src/graphics/host_gpu/renderer/occlusionProbe.h'
+        replace(p,'#include "occlusion/AddressTrace.h"','#include "occlusion/AddressTrace.h"\n#include "occlusion/WaitTrace.h"')
+        replace(p,' void Consumer(uint32_t kind,uint64_t address,uint64_t size){', ''' void Wait(uint64_t address,uint32_t width,uint64_t value,uint64_t reference,uint64_t mask,
+                   uint32_t func,uint32_t wait_op,bool satisfied){
+          ++m_reads[2];const auto hit=m_addresses.Read(address,width);
+          if(hit)++m_hits[2];
+          if(m_wait_trace.Observe(width,func,wait_op,reference,mask,satisfied,hit))
+           std::printf("wait53-example: address=0x%016" PRIx64 " width=%u value=0x%016" PRIx64
+                       " ref=0x%016" PRIx64 " mask=0x%016" PRIx64 " func=%u wait-op=%u"
+                       " satisfied=%u dump-base=0x%016" PRIx64 " dump-age=%" PRIu64 " overlap-only\\n",
+                       address,width,value,reference,mask,func,wait_op,satisfied?1u:0u,hit->base,hit->dump_age);
+         }
+         void Consumer(uint32_t kind,uint64_t address,uint64_t size){''')
+        replace(p,'  std::fflush(stdout);m_last_report=m_now();', '''  std::printf("wait53-stats: checks=%" PRIu64 " failed=%" PRIu64 " overlaps=%" PRIu64
+                      " overlap-failed=%" PRIu64 " ungrouped=%" PRIu64 "\\n",
+                      m_wait_trace.Checks(),m_wait_trace.Failed(),m_wait_trace.Matches(),
+                      m_wait_trace.MatchedFailed(),m_wait_trace.Ungrouped());
+          for(const auto& p:m_wait_trace.Patterns())
+           std::printf("wait53-pattern: width=%u func=%u wait-op=%u ref=0x%016" PRIx64
+                       " mask=0x%016" PRIx64 " overlaps=%" PRIu64 " failed=%" PRIu64
+                       " min-dump-age=%" PRIu64 " max-dump-age=%" PRIu64 "\\n",
+                       p.width,p.func,p.wait_op,p.reference,p.mask,p.matches,p.failed,p.min_age,p.max_age);
+          std::fflush(stdout);m_last_report=m_now();''')
+        replace(p,' KytyOcclusionExperiment::AddressTrace m_addresses;',
+                ' KytyOcclusionExperiment::AddressTrace m_addresses;\n KytyOcclusionExperiment::WaitTrace m_wait_trace;')
+        p='src/graphics/host_gpu/renderer/commandScheduler.h'
+        replace(p,'    void ObserveOcclusionConsumer(uint32_t kind, uint64_t address, uint64_t size);',
+        '''    void ObserveOcclusionConsumer(uint32_t kind, uint64_t address, uint64_t size);
+            void ObserveOcclusionWait(uint64_t address, uint32_t width, uint64_t value, uint64_t reference,
+                                      uint64_t mask, uint32_t func, uint32_t wait_op, bool satisfied);''')
+        p='src/graphics/host_gpu/renderer/commandScheduler.cpp'
+        replace(p,'void CommandScheduler::ObserveOcclusionConsumer(uint32_t kind, uint64_t address, uint64_t size) {',
+        '''void CommandScheduler::ObserveOcclusionWait(uint64_t address, uint32_t width, uint64_t value,
+            uint64_t reference, uint64_t mask, uint32_t func, uint32_t wait_op, bool satisfied) {
+            if (m_occlusion_probe) { m_occlusion_probe->Wait(address, width, value, reference, mask, func, wait_op, satisfied); }
+        }
+
+        void CommandScheduler::ObserveOcclusionConsumer(uint32_t kind, uint64_t address, uint64_t size) {''')
+        p='src/graphics/guest_gpu/graphicsRun.cpp'
+        replace(p,'    GetScheduler().ObserveOcclusionConsumer(2, reinterpret_cast<uint64_t>(addr), sizeof(T));\n','')
+        replace(p,'\tif (!TestWaitRegMemValue(*addr, ref, mask, func)) {',
+        '''    // Preserve one load after AdvanceBdaEpoch; evaluate the original condition once.
+            const T observed = *addr;
+            const bool satisfied = TestWaitRegMemValue(observed, ref, mask, func);
+            GetScheduler().ObserveOcclusionWait(reinterpret_cast<uint64_t>(addr), sizeof(T), observed,
+                                                ref, mask, func, wait_op, satisfied);
+            if (!satisfied) {''')
+        source=Path(__file__).resolve().parent.parent/'experiments/occlusion/WaitTrace.h'
+        if not source.is_file():raise RuntimeError('WaitTrace.h missing')
+        for path,text in changes.items():Path(path).write_text(text,newline='\n')
+        shutil.copyfile(source,'src/graphics/host_gpu/renderer/occlusion/WaitTrace.h')
+        print('wait53: original single read and comparison preserved; failed attempts and masks observed')
+        """
+        files['experiments/occlusion/WaitTrace.h'] = r"""#pragma once
+        // Counts observed PM4 attempts, not wall time, unique commands or validated ownership.
+        #include "AddressTrace.h"
+        #include <cstdint>
+        #include <vector>
+        namespace KytyOcclusionExperiment {
+        class WaitTrace {
+        public:
+         struct Pattern {
+          uint32_t width,func,wait_op;
+          uint64_t reference,mask,matches=0,failed=0,min_age=~uint64_t{0},max_age=0;
+         };
+         bool Observe(uint32_t width,uint32_t func,uint32_t wait_op,uint64_t reference,uint64_t mask,
+                      bool satisfied,const std::optional<AddressTrace::Hit>& hit){
+          ++m_checks;if(!satisfied)++m_failed;
+          if(!hit)return false;
+          ++m_matches;if(!satisfied)++m_matched_failed;
+          Pattern* entry=nullptr;
+          for(auto& p:m_patterns)
+           if(p.width==width && p.func==func && p.wait_op==wait_op && p.reference==reference && p.mask==mask){entry=&p;break;}
+          if(!entry){
+           if(m_patterns.size()==16){++m_ungrouped;return false;}
+           m_patterns.push_back({width,func,wait_op,reference,mask});entry=&m_patterns.back();
+          }
+          ++entry->matches;if(!satisfied)++entry->failed;
+          if(hit->dump_age<entry->min_age)entry->min_age=hit->dump_age;
+          if(hit->dump_age>entry->max_age)entry->max_age=hit->dump_age;
+          return entry->matches==1 || (!satisfied && entry->failed==1);
+         }
+         uint64_t Checks()const{return m_checks;}
+         uint64_t Failed()const{return m_failed;}
+         uint64_t Matches()const{return m_matches;}
+         uint64_t MatchedFailed()const{return m_matched_failed;}
+         uint64_t Ungrouped()const{return m_ungrouped;}
+         const std::vector<Pattern>& Patterns()const{return m_patterns;}
+        private:
+         uint64_t m_checks=0,m_failed=0,m_matches=0,m_matched_failed=0,m_ungrouped=0;
+         std::vector<Pattern> m_patterns;
+        };
+        }
+        """
+        files['experiments/occlusion/WaitTraceTests.cpp'] = r"""#include "WaitTrace.h"
+        #include <cassert>
+        #include <cstdio>
+        using namespace KytyOcclusionExperiment;
+        int main(){
+         WaitTrace t;assert(!t.Observe(8,3,0,1,1,true,{}));assert(!t.Observe(8,3,0,1,1,false,{}));
+         const AddressTrace::Hit a{0x1000,2},b{0x1000,12};
+         assert(t.Observe(8,3,0,1,1,true,a));assert(!t.Observe(8,3,0,1,1,true,b));
+         assert(t.Observe(8,3,0,1,1,false,a));assert(!t.Observe(8,3,0,1,1,false,b));
+         assert(t.Checks()==6 && t.Failed()==3 && t.Matches()==4 && t.MatchedFailed()==2);
+         const auto& p=t.Patterns()[0];assert(p.matches==4 && p.failed==2 && p.min_age==2 && p.max_age==12);
+         assert(t.Observe(4,3,0,1,1,true,a));assert(t.Observe(8,3,1,1,1,true,a));
+         for(unsigned i=0;i<32;++i)t.Observe(8,i+10,0,i,i,false,a);
+         assert(t.Patterns().size()==16 && t.Ungrouped()==19);
+         assert(t.Matches()==38 && t.MatchedFailed()==34);
+         std::puts("WaitTrace: satisfied/failed attempts, address matches, patterns, ages and bounded grouping passed");
+        }
+        """
+        root=Path("_occlusion51")
+        for name,source in files.items():
+            path=root/name
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text(source,encoding="utf-8",newline="\n")
+        subprocess.run([sys.executable,str(root/"patches/adapt_occlusion_waits53.py")],check=True)
+        '@ | & $env:KYTY_PYTHON -
+        if ($LASTEXITCODE -ne 0) { throw "Wait 53 adaptation failed" }
+        git diff --check
+        if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+    - name: Setup Clang
+      uses: egor-tensin/setup-clang@v1
+      with:
+        version: 18
+        platform: x64
+        cygwin: 0
+    - name: Setup Ninja
+      uses: seanmiddleditch/gha-setup-ninja@v5
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: 6.8.3
+        host: windows
+        target: desktop
+        arch: win64_msvc2022_64
+        modules: qt5compat
+        cache: true
+    - name: Test isolated query components on Windows
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved52.py "Test isolated query components on Windows"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 52 step failed: Test isolated query components on Windows" }
+    - name: Test address overlap tracking
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved52.py "Test address overlap tracking"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 52 step failed: Test address overlap tracking" }
+    - name: Test wait condition counters
+      run: |
+        $ErrorActionPreference = "Stop"
+        clang-cl /nologo /std:c++20 /EHsc /O2 "_occlusion51/experiments/occlusion/WaitTraceTests.cpp" /Fe:_Build/occlusion51/WaitTrace.exe /Fo:_Build/occlusion51/WaitTrace.obj
+        if ($LASTEXITCODE -ne 0) { throw "Wait trace build failed" }
+        & "_Build/occlusion51/WaitTrace.exe"
+        if ($LASTEXITCODE -ne 0) { throw "Wait trace tests failed" }
+    - name: Build and test using pinned working workflow
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved52.py "Build and test using pinned working workflow"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 52 step failed: Build and test using pinned working workflow" }
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Package launchers and symbols
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved52.py "Package launchers and symbols"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 52 step failed: Package launchers and symbols" }
+    - name: Name diagnostic 53 launchers and instructions
+      run: |
+        $ErrorActionPreference = "Stop"
+        $install = "_Build/windows/install"
+        Rename-Item "$install/Diagnostico-52.cmd" "Diagnostico-53.cmd" -ErrorAction Stop
+        Rename-Item "$install/Comparacion-52.cmd" "Comparacion-53.cmd" -ErrorAction Stop
+        Remove-Item "$install/DIAGNOSTICO-52.txt" -ErrorAction SilentlyContinue
+        @(
+            "Diagnostico-53.cmd: observation ON. Comparacion-53.cmd: observation OFF.",
+            "Original wait load, comparison and suspension condition preserved.",
+            "wait53-stats: failed means a condition failed and the PM4 slice suspends.",
+            "Counters count attempts, not unique waits or elapsed waiting time.",
+            "Overlaps are address evidence, not verified memory ownership.",
+            "Keep _Patches, _PipelineCache and kyty_settings.ini.",
+            "AMD CPU patch OFF; shader validation OFF; red-zone ON.",
+            "Warm up, heavy view 60 seconds, light view 60 seconds.",
+            "Send full consoles with wait53-stats, wait53-pattern and wait53-example."
+        ) | Set-Content "$install/DIAGNOSTICO-53.txt" -Encoding ascii
+    - name: Create Windows ZIP
+      run: |
+        $ErrorActionPreference = "Stop"
+        $zip = "KytyPS5-Diagnostico-53.zip"
+        Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+        if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+            throw "Packaging failed: missing or empty ZIP"
+        }
+    - name: Upload KytyPS5
+      uses: actions/upload-artifact@v4
+      with:
+        name: KytyPS5-Diagnostico-53
+        path: KytyPS5-Diagnostico-53.zip
+        if-no-files-found: error
+        retention-days: 7
