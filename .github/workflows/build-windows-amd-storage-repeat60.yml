@@ -1,4 +1,4 @@
-name: Windows AMD - Prueba 60 - Escrituras repetidas
+name: Windows AMD - Prueba 60 Plus - Tres cambios
 
 'on':
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Windows x64 - Prueba 60
+    name: Windows x64 - Prueba 60 Plus
     runs-on: windows-2022
 
     defaults:
@@ -38,12 +38,35 @@ jobs:
           fetch-depth: 1
           submodules: false
 
-      - name: Read working diagnostic 51 from this commit
+      - name: Read pinned original workflow 60
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.sha }}
+          ref: 8344367d56e00196db7faf989e32912d7414e2e1
+          path: _workflow60
+          sparse-checkout: .github/workflows/build-windows-amd-storage-repeat60.yml
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Read pinned working diagnostic 51
+        uses: actions/checkout@v4
+        with:
+          ref: 8344367d56e00196db7faf989e32912d7414e2e1
           path: _workflow51
           sparse-checkout: .github/workflows/build-windows-amd-occlusion-observation.yml
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Read pinned Jetsku int16.1 clear decoder and tests
+        uses: actions/checkout@v4
+        with:
+          repository: Jetsku/KytyPS5
+          ref: f9e19582f0deac0d1226a7ce3faae30a9ab408ab
+          path: _donor60
+          sparse-checkout: |
+            src/graphics/host_gpu/renderer/image/imageInfo.h
+            tests/ClearRegisterDecodeTests.cpp
           sparse-checkout-cone-mode: false
           fetch-depth: 1
           submodules: false
@@ -64,7 +87,7 @@ jobs:
           & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
           if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
 
-      - name: Create runner for existing plain-text workflow
+      - name: Create runner for pinned workflow 60
         run: |
           $ErrorActionPreference = "Stop"
           @'
@@ -73,48 +96,38 @@ jobs:
           import sys
           import yaml
 
-          source = Path("_workflow51/.github/workflows/build-windows-amd-occlusion-observation.yml")
-          if not source.is_file():
-              raise RuntimeError("Keep build-windows-amd-occlusion-observation.yml in this repository")
-
-          workflow = yaml.safe_load(source.read_text(encoding="utf-8"))
-          steps = workflow["jobs"]["build"]["steps"]
+          path = Path("_workflow60/.github/workflows/build-windows-amd-storage-repeat60.yml")
+          workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
           name = sys.argv[1]
-          selected = [s for s in steps if s.get("name") == name]
+          steps = [s for s in workflow["jobs"]["build"]["steps"] if s.get("name") == name]
+          if len(steps) != 1 or "run" not in steps[0]:
+              raise RuntimeError("Missing pinned step: " + name)
 
-          if len(selected) != 1 or "run" not in selected[0]:
-              raise RuntimeError("Missing or ambiguous saved step: " + name)
+          script = Path("_run_saved60.ps1")
+          script.write_text(
+              '$ErrorActionPreference = "Stop"\n' + steps[0]["run"],
+              encoding="utf-8"
+          )
+          print("Running pinned 60 step:", name, flush=True)
+          subprocess.run(["pwsh", "-NoProfile", "-File", str(script.resolve())], check=True)
+          '@ | Set-Content "_run_saved60.py" -Encoding utf8
 
-          script = selected[0]["run"]
-
-          if name == "Package launchers and symbols":
-              script = script.replace("Diagnostico-51.cmd", "Prueba-60.cmd")
-              script = script.replace("Comparacion-51.cmd", "Comparacion-60.cmd")
-              script = script.replace("DIAGNOSTICO-51.txt", "PRUEBA-60.txt")
-              script = script.replace("set KYTY_OCCLUSION_PROBE=$mode", "set KYTY_OCCLUSION_PROBE=0")
-              script = script.replace(
-                  '"set KYTY_OCCLUSION_PROBE=0",',
-                  '"set KYTY_OCCLUSION_PROBE=0",\n'
-                  '        "set KYTY_GUEST_STORAGE_REPEAT=$mode",\n'
-                  '        "set KYTY_WIDE_FILL_CLEAR=0",'
-              )
-
-          path = Path("_run_saved51.ps1")
-          path.write_text('$ErrorActionPreference = "Stop"\n' + script, encoding="utf-8")
-          print("Reusing saved step:", name, flush=True)
-          subprocess.run(["pwsh", "-NoProfile", "-File", str(path.resolve())], check=True)
-          '@ | Set-Content "_run_saved51.py" -Encoding utf8
-
-          & $env:KYTY_PYTHON -m py_compile _run_saved51.py
-          if ($LASTEXITCODE -ne 0) { throw "Saved workflow runner invalid" }
+          & $env:KYTY_PYTHON _run_saved60.py "Create runner for existing plain-text workflow"
+          if ($LASTEXITCODE -ne 0) { throw "Pinned runner creation failed" }
 
       - name: Reproduce working AMD source and retained optimizations
         run: |
           $ErrorActionPreference = "Stop"
-          & $env:KYTY_PYTHON _run_saved51.py "Reproduce working AMD source and retained optimizations"
+          & $env:KYTY_PYTHON _run_saved60.py "Reproduce working AMD source and retained optimizations"
           if ($LASTEXITCODE -ne 0) { throw "AMD source preparation failed" }
 
       - name: Install repeated storage write experiment 60
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved60.py "Install repeated storage write experiment 60"
+          if ($LASTEXITCODE -ne 0) { throw "Storage repeat adaptation failed" }
+
+      - name: Install memory search and register clear commits
         run: |
           $ErrorActionPreference = "Stop"
           @'
@@ -126,212 +139,54 @@ jobs:
               p = Path(path)
               text = changes.get(path, p.read_text(encoding="utf-8"))
               if text.count(old) != 1:
-                  raise RuntimeError("Unexpected barrier60 boundary: " + path + " / " + old[:70])
+                  raise RuntimeError("Unexpected suite60 boundary: " + path + " / " + old[:70])
               changes[path] = text.replace(old, new)
 
-          helper = r"""#pragma once
-          // Experimental, opt-in subset of Jetsku c7cb149557e7.
-          // Guest barriers retain responsibility for dependencies between guest commands.
-          #include <vulkan/vulkan.hpp>
-          #include <cstdint>
-          #include <cstdio>
-          #include <cstdlib>
-          #include <cstring>
+          def function(source, name):
+              start = source.index("[[nodiscard]] inline bool " + name + "(")
+              opening = source.index("{", start)
+              depth = 1
+              pos = opening + 1
+              while depth:
+                  if source[pos] == "{":
+                      depth += 1
+                  if source[pos] == "}":
+                      depth -= 1
+                  pos += 1
+              return source[start:pos]
 
-          namespace KytyStorageRepeat60 {
-          inline thread_local bool active = false;
-          inline thread_local uint64_t candidates = 0, skipped = 0, frames = 0;
+          source = Path(
+              "_donor60/src/graphics/host_gpu/renderer/image/imageInfo.h"
+          ).read_text(encoding="utf-8")
 
-          inline bool Enabled() {
-              static const bool on = [] {
-                  const char* value = std::getenv("KYTY_GUEST_STORAGE_REPEAT");
-                  return value && std::strcmp(value, "1") == 0;
-              }();
-              return on;
-          }
+          helper = "// Register-clear port from Jetsku 00ed2a5a6c58, int16.1.\n"
+          helper += function(source, "ClearRegisterWideEnabled") + "\n\n"
+          helper += function(source, "DecodePackedColorClear64") + "\n\n"
 
-          struct Scope {
-              bool previous = active;
-              Scope() { active = true; }
-              ~Scope() { active = previous; }
-              Scope(const Scope&) = delete;
-              Scope& operator=(const Scope&) = delete;
-          };
-
-          inline bool Eligible(bool previous_guest, bool current_guest,
-                               vk::ImageLayout previous_layout, vk::ImageLayout layout,
-                               vk::AccessFlags2 previous_access, vk::AccessFlags2 access,
-                               vk::PipelineStageFlags2 previous_stage, vk::PipelineStageFlags2 stage,
-                               bool color) {
-              const vk::AccessFlags2 allowed =
-                  vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
-              return color && previous_guest && current_guest &&
-                     previous_layout == vk::ImageLayout::eGeneral && layout == previous_layout &&
-                     previous_access == access && previous_stage == stage &&
-                     bool(access & vk::AccessFlagBits2::eShaderWrite) && !bool(access & ~allowed);
-          }
-
-          inline bool Skip(bool previous_guest,
-                           vk::ImageLayout previous_layout, vk::ImageLayout layout,
-                           vk::AccessFlags2 previous_access, vk::AccessFlags2 access,
-                           vk::PipelineStageFlags2 previous_stage, vk::PipelineStageFlags2 stage,
-                           bool color) {
-              if (!Eligible(previous_guest, active, previous_layout, layout,
-                            previous_access, access, previous_stage, stage, color))
-                  return false;
-              ++candidates;
-              if (!Enabled()) return false;
-              ++skipped;
-              return true;
-          }
-
-          inline void Banner() {
-              std::printf("barrier60: repeated guest storage writes %s\n", Enabled() ? "ON" : "OFF");
-          }
-
-          inline void Frame() {
-              if (++frames % 300 != 0) return;
-              std::printf("barrier60-stats: candidates=%llu skipped=%llu frames=%llu\n",
-                          static_cast<unsigned long long>(candidates),
-                          static_cast<unsigned long long>(skipped),
-                          static_cast<unsigned long long>(frames));
-              std::fflush(stdout);
-          }
-          }
-          """
-
-          test = r"""#include "graphics/host_gpu/renderer/image/storageRepeat60.h"
-          #include <cstdlib>
-          using namespace KytyStorageRepeat60;
-
-          void Check(bool ok) {
-              if (!ok) {
-                  std::fputs("barrier60 test failed\n", stderr);
-                  std::abort();
-              }
-          }
-
-          int main() {
-              const auto layout = vk::ImageLayout::eGeneral;
-              const vk::AccessFlags2 rw =
-                  vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
-              const vk::PipelineStageFlags2 stage =
-                  vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
-
-              Check(!active);
-              Check(!Skip(true, layout, layout, rw, rw, stage, stage, true));
-              {
-                  Scope outer;
-                  Check(active);
-                  { Scope inner; Check(active); }
-                  Check(active);
-
-                  Check(Skip(true, layout, layout, rw, rw, stage, stage, true) == Enabled());
-                  Check(!Skip(false, layout, layout, rw, rw, stage, stage, true));
-                  Check(!Skip(true, layout, layout, rw, rw, stage, stage, false));
-                  Check(!Skip(true, layout, vk::ImageLayout::eShaderReadOnlyOptimal,
-                              rw, rw, stage, stage, true));
-                  Check(!Skip(true, layout, layout, rw, vk::AccessFlagBits2::eShaderRead,
-                              stage, stage, true));
-                  Check(!Skip(true, layout, layout, rw, rw,
-                              stage, vk::PipelineStageFlagBits2::eTransfer, true));
-                  Check(!Skip(true, layout, layout,
-                              vk::AccessFlagBits2::eTransferWrite,
-                              vk::AccessFlagBits2::eTransferWrite, stage, stage, true));
-                  Check(!Skip(true, layout, layout,
-                              rw | vk::AccessFlagBits2::eColorAttachmentWrite,
-                              rw | vk::AccessFlagBits2::eColorAttachmentWrite, stage, stage, true));
-
-                  for (unsigned bits = 0; bits < 64; ++bits) {
-                      const bool previous_guest = bits & 1;
-                      const bool current_guest = bits & 2;
-                      const bool color = bits & 4;
-                      const auto before = (bits & 8) ? layout : vk::ImageLayout::eTransferDstOptimal;
-                      const auto after = (bits & 16) ? layout : vk::ImageLayout::eShaderReadOnlyOptimal;
-                      const vk::PipelineStageFlags2 next =
-                          (bits & 32) ? stage : vk::PipelineStageFlagBits2::eTransfer;
-                      const bool expected = (bits & 31) == 31 && (bits & 32);
-                      Check(Eligible(previous_guest, current_guest, before, after,
-                                     rw, rw, stage, next, color) == expected);
-                  }
-              }
-
-              Check(!active);
-              Check(candidates == 1);
-              Check(skipped == uint64_t(Enabled()));
-              std::puts("barrier60: scope, eligibility, exclusions and ON/OFF tests passed");
-          }
-          """
-
-          p = "src/graphics/host_gpu/graphicContext.h"
+          p = "src/graphics/host_gpu/renderer/image/imageInfo.h"
           replace(
               p,
-              "\tvk::ImageLayout         layout      = vk::ImageLayout::eUndefined;",
-              "\tvk::ImageLayout         layout      = vk::ImageLayout::eUndefined;\n"
-              "\tbool guest60 = false;"
-          )
-
-          p = "src/graphics/host_gpu/renderer/image/image.cpp"
-          replace(
-              p,
-              '#include "graphics/host_gpu/renderer/image/image.h"',
-              '#include "graphics/host_gpu/renderer/image/image.h"\n'
-              '#include "graphics/host_gpu/renderer/image/storageRepeat60.h"'
+              "#include <cstdint>",
+              "#include <cstdint>\n#include <cstdlib>\n#include <limits>"
           )
           replace(
               p,
-              "\tconst bool has_subresource_states = !subresource_states.empty();",
-              "\tconst bool has_subresource_states = !subresource_states.empty();\n"
-              "    const bool guest60 = KytyStorageRepeat60::active;\n"
-              "    const bool color60 = FullAspectMask(backing.format) == vk::ImageAspectFlagBits::eColor;"
+              "\tuint32_t            clear_word           = 0;",
+              "\tuint32_t            clear_word           = 0;\n"
+              "\tuint32_t clear_word1 = 0;"
           )
           replace(
               p,
-              "\t\t\t\tconst bool     repeated_write =\n"
-              "\t\t\t\t    static_cast<bool>(subresource_state.access_mask & write_access);",
-              "                const bool skip60 = KytyStorageRepeat60::Skip(\n"
-              "                    subresource_state.guest60, subresource_state.layout, destination_layout,\n"
-              "                    subresource_state.access_mask, destination_access,\n"
-              "                    subresource_state.pl_stage, destination_stage, color60);\n"
-              "\t\t\t\tconst bool repeated_write =\n"
-              "\t\t\t\t    static_cast<bool>(subresource_state.access_mask & write_access) && !skip60;"
-          )
-          replace(
-              p,
-              "subresource_state = {destination_stage, destination_access, destination_layout};",
-              "subresource_state = {destination_stage, destination_access, destination_layout, guest60};"
-          )
-          replace(
-              p,
-              "\t\tconst bool     repeated_write = static_cast<bool>(state.access_mask & write_access);",
-              "        const bool skip60 = KytyStorageRepeat60::Skip(\n"
-              "            state.guest60, state.layout, destination_layout, state.access_mask,\n"
-              "            destination_access, state.pl_stage, destination_stage, color60);\n"
-              "\t\tconst bool repeated_write = static_cast<bool>(state.access_mask & write_access);"
-          )
-          replace(
-              p,
-              "\t\t    !repeated_write) {",
-              "\t\t    (!repeated_write || skip60)) {"
-          )
-          replace(
-              p,
-              "\tstate = {destination_stage, destination_access, destination_layout};",
-              "\tstate = {destination_stage, destination_access, destination_layout, guest60};"
+              "[[nodiscard]] inline bool DecodePackedStencilClear",
+              helper + "[[nodiscard]] inline bool DecodePackedStencilClear"
           )
 
-          p = "src/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+          p = "src/graphics/host_gpu/renderer/colorRenderTarget.cpp"
           replace(
               p,
-              '#include "graphics/host_gpu/renderer/pipeline/descriptors.h"',
-              '#include "graphics/host_gpu/renderer/pipeline/descriptors.h"\n'
-              '#include "graphics/host_gpu/renderer/image/storageRepeat60.h"'
-          )
-          replace(
-              p,
-              "\t\t\tconst bool storage = binding.desc.type == TextureCache::BindingType::Storage;",
-              "\t\t\tconst bool storage = binding.desc.type == TextureCache::BindingType::Storage;\n"
-              "            const KytyStorageRepeat60::Scope guest_transition60;"
+              "\t\tdesc.info.metadata.clear_word           = rt.clear_word0.word0;",
+              "\t\tdesc.info.metadata.clear_word           = rt.clear_word0.word0;\n"
+              "        desc.info.metadata.clear_word1 = ClearRegisterWideEnabled() ? rt.clear_word1.word1 : 0;"
           )
 
           p = "src/graphics/host_gpu/renderer/cache/textureCache.cpp"
@@ -339,50 +194,113 @@ jobs:
               p,
               '#include "graphics/host_gpu/renderer/cache/textureCache.h"',
               '#include "graphics/host_gpu/renderer/cache/textureCache.h"\n'
-              '#include "graphics/host_gpu/renderer/image/storageRepeat60.h"'
+              '#include "graphics/host_gpu/renderer/image/clear60plusStats.h"'
           )
           replace(
               p,
-              "\tm_dcc_gpu_clear = Config::DccGpuClearEnabled()",
+              "\t\treturn desc.type == TextureCache::BindingType::RenderTarget &&\n"
+              "\t\t       metadata.clear_register_valid &&\n"
+              "\t\t       DecodePackedColorClear(format, metadata.clear_word, clear);",
+              "        if (desc.type != TextureCache::BindingType::RenderTarget ||\n"
+              "            !metadata.clear_register_valid) return false;\n"
+              "        const bool old_ok = DecodePackedColorClear(format, metadata.clear_word, clear);\n"
+              "        if (!ClearRegisterWideEnabled()) return old_ok;\n"
+              "        const bool decoded = DecodePackedColorClear64(\n"
+              "            format, metadata.clear_word, metadata.clear_word1, clear);\n"
+              "        if (decoded && !old_ok)\n"
+              "            KytyClear60Plus::extra_decodes.fetch_add(1, std::memory_order_relaxed);\n"
+              "        return decoded;"
+          )
+          replace(
+              p,
+              "    KytyStorageRepeat60::Banner();",
               "    KytyStorageRepeat60::Banner();\n"
-              "\tm_dcc_gpu_clear = Config::DccGpuClearEnabled()"
+              '    std::printf("clear60plus: wide register clears %s\\n", ClearRegisterWideEnabled() ? "ON" : "OFF");'
           )
           replace(
               p,
-              "void TextureCache::RunGarbageCollector() {\n\t(void)CollectGarbage(false);\n}",
-              "void TextureCache::RunGarbageCollector() {\n\t(void)CollectGarbage(false);\n"
-              "    KytyStorageRepeat60::Frame();\n}"
+              "    KytyStorageRepeat60::Frame();",
+              "    KytyStorageRepeat60::Frame();\n"
+              "    KytyClear60Plus::Report();"
           )
 
-          guest = Path("src/graphics/guest_gpu/graphicsRun.cpp").read_text(encoding="utf-8")
-          start = guest.index("void CommandProcessor::EmitGlobalBarrier() {")
-          end = guest.index("\n}", start)
-          if "pipelineBarrier2(dependency)" not in guest[start:end]:
-              raise RuntimeError("Guest global barrier implementation missing")
+          p = "src/kernel/memoryAddressSpace.inc"
+          old = (
+              "\t\tfor (const auto& [base, range_size]: m_free) {\n"
+              "\t\t\tconst auto candidate = AlignUp"
+          )
+          fast = r'''        // Indexed scan port from Jetsku f1a4dffcafd2; opt-in.
+                  static const bool fast_search60 = [] {
+                      const char* value = std::getenv("KYTY_FAST_FREE_SEARCH_60");
+                      const bool on = value && std::strcmp(value, "1") == 0;
+                      std::printf("memory60plus: indexed free-range search %s\n", on ? "ON" : "OFF");
+                      return on;
+                  }();
+                  if (fast_search60) {
+                      auto it = m_free.upper_bound(search_start);
+                      if (it != m_free.begin()) --it;
+                      for (; it != m_free.end() && it->first < search_end; ++it) {
+                          const auto& [base, range_size] = *it;
+                          const auto candidate = AlignUp(std::max(base, search_start), alignment);
+                          if (candidate < search_end && size <= search_end - candidate &&
+                              GuestFreeRangeContains(base, range_size, candidate, size))
+                              return candidate;
+                      }
+                      return 0;
+                  }
+          '''
+          replace(p, old, fast + old)
 
           for path, text in changes.items():
               Path(path).write_text(text, encoding="utf-8", newline="\n")
 
-          Path("src/graphics/host_gpu/renderer/image/storageRepeat60.h").write_text(
-              helper, encoding="utf-8", newline="\n"
+          test = Path("_donor60/tests/ClearRegisterDecodeTests.cpp").read_text(encoding="utf-8")
+          needle = "\tTestUnchangedFormats();"
+          if test.count(needle) != 1:
+              raise RuntimeError("Unexpected donor clear test")
+          test = test.replace(
+              needle,
+              needle + "\n\tImageMetadataInfo a {}, b {};\n"
+              "\tb.clear_word1 = 1;\n"
+              '\tCheck(!(a == b), "metadata comparison includes the second register word");'
           )
-          Path("tests/StorageRepeat60Tests.cpp").write_text(
+          Path("tests/ClearRegister60PlusTests.cpp").write_text(
               test, encoding="utf-8", newline="\n"
           )
 
           p = Path("CMakeLists.txt")
           p.write_text(
               p.read_text(encoding="utf-8") +
-              "\nadd_executable(storage_repeat60_tests EXCLUDE_FROM_ALL tests/StorageRepeat60Tests.cpp)\n"
-              "target_link_libraries(storage_repeat60_tests common fmt::fmt Vulkan::Headers)\n"
-              "target_include_directories(storage_repeat60_tests PRIVATE ${inc_headers})\n"
-              "add_test(NAME storage_repeat60 COMMAND $<TARGET_FILE:storage_repeat60_tests>)\n",
+              "\nadd_executable(clear_register60plus_tests EXCLUDE_FROM_ALL tests/ClearRegister60PlusTests.cpp)\n"
+              "target_link_libraries(clear_register60plus_tests common fmt::fmt Vulkan::Headers)\n"
+              "target_include_directories(clear_register60plus_tests PRIVATE ${inc_headers})\n"
+              "add_test(NAME clear_register60plus COMMAND $<TARGET_FILE:clear_register60plus_tests>)\n",
               encoding="utf-8", newline="\n"
           )
-          print("barrier60 installed; guest global barriers retained; no wide59 changes")
+
+          stats = r"""#pragma once
+          #include <atomic>
+          #include <cstdint>
+          #include <cstdio>
+          namespace KytyClear60Plus {
+          inline std::atomic_uint64_t extra_decodes {0};
+          inline thread_local uint64_t ticks = 0;
+          inline void Report() {
+              if (++ticks % 300 == 0) {
+                  std::printf("clear60plus-stats: extra-register-decodes=%llu\n",
+                      static_cast<unsigned long long>(extra_decodes.load(std::memory_order_relaxed)));
+                  std::fflush(stdout);
+              }
+          }
+          }
+          """
+          Path("src/graphics/host_gpu/renderer/image/clear60plusStats.h").write_text(
+              stats, encoding="utf-8", newline="\n"
+          )
+          print("suite60: indexed memory search and register clears installed; PGO unchanged")
           '@ | & $env:KYTY_PYTHON -
 
-          if ($LASTEXITCODE -ne 0) { throw "Storage repeat adaptation failed" }
+          if ($LASTEXITCODE -ne 0) { throw "Suite 60 adaptation failed" }
           git diff --check
           if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
 
@@ -416,57 +334,97 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = "Stop"
-          & $env:KYTY_PYTHON _run_saved51.py "Build and test using pinned working workflow"
+          & $env:KYTY_PYTHON _run_saved60.py "Build and test using pinned working workflow"
           if ($LASTEXITCODE -ne 0) { throw "Build or baseline tests failed" }
 
       - name: Test storage repeat policy OFF and ON
         run: |
           $ErrorActionPreference = "Stop"
-          cmake --build _Build/windows --target storage_repeat60_tests --parallel 2
-          if ($LASTEXITCODE -ne 0) { throw "Storage repeat test build failed" }
+          & $env:KYTY_PYTHON _run_saved60.py "Test storage repeat policy OFF and ON"
+          if ($LASTEXITCODE -ne 0) { throw "Storage repeat tests failed" }
+
+      - name: Test register clears and memory paths
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake --build _Build/windows --target clear_register60plus_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw "Register clear test build failed" }
+
+          $env:KYTY_CLEAR_REGISTER_WIDE = "1"
+          ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^clear_register60plus$"
+          if ($LASTEXITCODE -ne 0) { throw "Register clear tests failed" }
 
           foreach ($mode in @("0", "1")) {
+              $env:KYTY_FAST_FREE_SEARCH_60 = $mode
+              $env:KYTY_CLEAR_REGISTER_WIDE = $mode
               $env:KYTY_GUEST_STORAGE_REPEAT = $mode
-              ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^storage_repeat60$"
-              if ($LASTEXITCODE -ne 0) { throw "Storage repeat tests failed in mode $mode" }
+              ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^(memory_tracker|virtual_memory_allocation)$"
+              if ($LASTEXITCODE -ne 0) { throw "Memory tests failed in mode $mode" }
           }
 
+          Remove-Item Env:KYTY_FAST_FREE_SEARCH_60 -ErrorAction SilentlyContinue
+          Remove-Item Env:KYTY_CLEAR_REGISTER_WIDE -ErrorAction SilentlyContinue
           Remove-Item Env:KYTY_GUEST_STORAGE_REPEAT -ErrorAction SilentlyContinue
 
       - name: Package launchers and symbols
         run: |
           $ErrorActionPreference = "Stop"
-          & $env:KYTY_PYTHON _run_saved51.py "Package launchers and symbols"
+          & $env:KYTY_PYTHON _run_saved60.py "Package launchers and symbols"
           if ($LASTEXITCODE -ne 0) { throw "Launcher packaging failed" }
 
-      - name: Write instructions
+      - name: Create comparison and combined test launchers
         run: |
           $ErrorActionPreference = "Stop"
-          @(
-              "Comparacion-60.cmd: original image barriers. Prueba-60.cmd: repeated guest storage writes ON.",
-              "Same executable. Occlusion observation OFF; wide59 not installed.",
-              "Keep _Patches, _PipelineCache and kyty_settings.ini. Choose THIS interpreter.",
-              "AMD CPU patch OFF; shader validation OFF; red-zone ON.",
-              "Warm up one minute. Heavy view 60 seconds, then light view 60 seconds.",
-              "Send full consoles with barrier60-stats and FPS for both runs.",
-              "Counters are cumulative. Candidates count eligible subresource transitions; skipped counts avoided barriers.",
-              "This experiment relies on the guest's explicit barriers for dependencies between commands.",
-              "If new graphical errors occur, close the test and use Comparacion-60.cmd."
-          ) | Set-Content "_Build/windows/install/PRUEBA-60.txt" -Encoding ascii
+          @'
+          from pathlib import Path
+
+          install = Path("_Build/windows/install")
+          marker = '"%~dp0launcher.exe" %*'
+
+          for mode, old, new in [
+              (0, "Comparacion-60.cmd", "Comparacion-60-Plus.cmd"),
+              (1, "Prueba-60.cmd", "Prueba-60-Plus.cmd")
+          ]:
+              path = install/old
+              text = path.read_text(encoding="ascii")
+              if text.count(marker) != 1:
+                  raise RuntimeError("Launcher boundary missing")
+              text = text.replace(
+                  marker,
+                  f"set KYTY_FAST_FREE_SEARCH_60={mode}\n"
+                  f"set KYTY_CLEAR_REGISTER_WIDE={mode}\n" + marker
+              )
+              (install/new).write_text(text, encoding="ascii", newline="\r\n")
+              path.unlink()
+
+          (install/"PRUEBA-60.txt").unlink(missing_ok=True)
+          (install/"PRUEBA-60-PLUS.txt").write_text(
+              "Comparison: original barriers, original memory scan, original register decoding.\n"
+              "Test: all three changes ON. Same executable, compiler and build flags.\n"
+              "PGO and IPO are not added by this workflow.\n"
+              "Keep _Patches, _PipelineCache and kyty_settings.ini. Select THIS interpreter.\n"
+              "AMD CPU patch OFF; shader validation OFF; red-zone ON.\n"
+              "Warm up, then heavy and light views for 60 seconds each. Send both consoles and FPS.\n"
+              "clear60plus counts extra decode decisions, not GPU clear commands.\n"
+              "If graphical errors appear, close the test and use the comparison.\n",
+              encoding="ascii"
+          )
+          '@ | & $env:KYTY_PYTHON -
+
+          if ($LASTEXITCODE -ne 0) { throw "Combined launchers failed" }
 
       - name: Create Windows ZIP
         run: |
           $ErrorActionPreference = "Stop"
-          $zip = "KytyPS5-Prueba-60.zip"
+          $zip = "KytyPS5-Prueba-60-Plus.zip"
           Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
           if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
-              throw "Packaging failed: missing or empty ZIP"
+              throw "Packaging failed"
           }
 
       - name: Upload KytyPS5
         uses: actions/upload-artifact@v4
         with:
-          name: KytyPS5-Prueba-60
-          path: KytyPS5-Prueba-60.zip
+          name: KytyPS5-Prueba-60-Plus
+          path: KytyPS5-Prueba-60-Plus.zip
           if-no-files-found: error
           retention-days: 7
