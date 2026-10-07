@@ -307,13 +307,13 @@ jobs:
           p.write_text(
               p.read_text(encoding="utf-8") +
               "\nadd_executable(wide_clear59_tests EXCLUDE_FROM_ALL tests/FillClear59Tests.cpp)\n"
-              "target_link_libraries(wide_clear59_tests common fmt::fmt)\n"
+              "target_link_libraries(wide_clear59_tests common fmt::fmt Vulkan::Headers)\n"
               "target_include_directories(wide_clear59_tests PRIVATE ${inc_headers})\n"
               "add_test(NAME wide_clear59 COMMAND $<TARGET_FILE:wide_clear59_tests>)\n",
               encoding="utf-8",
               newline="\n"
           )
-          print("wide59 installed; AMD base retained")
+          print("wide59 installed; test inherits Vulkan headers through Vulkan::Headers")
           '@ | & $env:KYTY_PYTHON -
 
           if ($LASTEXITCODE -ne 0) { throw "Wide fill adaptation failed" }
