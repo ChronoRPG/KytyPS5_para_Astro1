@@ -1,0 +1,358 @@
+name: Windows AMD - Diagnostico 54 - Rangos de shaders
+'on':
+  workflow_dispatch: null
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Windows x64 - Rangos 54
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      KYTY_FLAGS_51: /clang:-ffp-contract=off
+      KYTY_PROFILE_51: Generica
+    steps:
+    - name: Checkout fixed AMD base
+      uses: actions/checkout@v4
+      with:
+        ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+        submodules: recursive
+        fetch-depth: 1
+    - name: Checkout pinned working diagnostic 20
+      uses: actions/checkout@v4
+      with:
+        ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+        path: _patch_source
+        sparse-checkout: |-
+          patches
+          .github/workflows
+        fetch-depth: 1
+        submodules: false
+    - name: Read working diagnostic 51 from this commit
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.sha }}
+        path: _workflow51
+        sparse-checkout: .github/workflows/build-windows-amd-occlusion-observation.yml
+        sparse-checkout-cone-mode: false
+        fetch-depth: 1
+        submodules: false
+    - name: Setup fixed Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Pin Python executable and install YAML parser
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+        if (-not $pythonExe) { throw "Python executable missing" }
+        "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        & $pythonExe -m pip install PyYAML==6.0.2
+        if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+        & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+        if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+    - name: Create runner for existing plain-text workflow
+      run: |
+        $ErrorActionPreference = "Stop"
+        @'
+        from pathlib import Path
+        import subprocess
+        import sys
+        import yaml
+        source=Path("_workflow51/.github/workflows/build-windows-amd-occlusion-observation.yml")
+        if not source.is_file():
+            raise RuntimeError("Keep the working build-windows-amd-occlusion-observation.yml in this repository")
+        workflow=yaml.safe_load(source.read_text(encoding="utf-8"))
+        steps=workflow["jobs"]["build"]["steps"]
+        name=sys.argv[1]
+        selected=[s for s in steps if s.get("name")==name]
+        if len(selected)!=1 or "run" not in selected[0]:
+            raise RuntimeError("Missing or ambiguous diagnostic 51 step: "+name)
+        script=selected[0]["run"]
+        if name=="Install optional occlusion observation" and ("zlib" in script or "base64" in script):
+            raise RuntimeError("Diagnostic 51 must be the working plain-text version")
+        if name=="Package launchers and symbols":
+            script=script.replace("Diagnostico-51.cmd","Diagnostico-54.cmd").replace("Comparacion-51.cmd","Comparacion-54.cmd").replace("DIAGNOSTICO-51.txt","DIAGNOSTICO-54.txt")
+        path=Path("_run_saved51.ps1")
+        path.write_text('$ErrorActionPreference = "Stop"\n'+script,encoding="utf-8")
+        print("Reusing validated 51 step:",name,flush=True)
+        subprocess.run(["pwsh","-NoProfile","-File",str(path.resolve())],check=True)
+
+        '@ | Set-Content "_run_saved51.py" -Encoding utf8
+        & $env:KYTY_PYTHON -m py_compile _run_saved51.py
+        if ($LASTEXITCODE -ne 0) { throw "Saved workflow runner invalid" }
+    - name: Reproduce working AMD source and retained optimizations
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved51.py "Reproduce working AMD source and retained optimizations"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 51 step failed: Reproduce working AMD source and retained optimizations" }
+    - name: Install optional occlusion observation
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved51.py "Install optional occlusion observation"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 51 step failed: Install optional occlusion observation" }
+    - name: Install sampled shader range observation
+      run: |
+        $ErrorActionPreference = "Stop"
+        @'
+        from pathlib import Path
+        import subprocess
+        import sys
+        files = {}
+        files['patches/adapt_occlusion_bindings54.py'] = r"""from pathlib import Path
+        import shutil
+        changes={}
+        def replace(path,old,new):
+         p=Path(path);s=changes.get(path,p.read_text())
+         if s.count(old)!=1:raise RuntimeError('Unexpected binding54 boundary: '+path+' / '+old[:60])
+         changes[path]=s.replace(old,new)
+        p='src/graphics/host_gpu/renderer/occlusionProbe.h'
+        replace(p,'#include "occlusion/Segments.h"','#include "occlusion/Segments.h"\n#include "occlusion/ShaderBindingTrace.h"')
+        replace(p,'  (void)address;\n  ++m_dumps;','  m_binding_trace.Dump(address);\n  ++m_dumps;')
+        replace(p,' void Predicate(uint32_t op)', ''' void Binding(uint64_t hash,uint32_t stage,uint32_t slot,uint64_t address,uint64_t size,bool written){
+          const auto hit=m_binding_trace.Binding(hash,stage,slot,address,size,written);
+          if(hit && m_binding_examples++<12)
+           std::printf("binding54-example: shader=%016" PRIx64 " stage=%u slot=%u address=0x%016" PRIx64
+                       " size=%" PRIu64 " written=%u dump-base=0x%016" PRIx64 " dump-age=%" PRIu64 " range-only\\n",
+                       hash,stage,slot,address,size,written?1u:0u,hit->base,hit->age);
+         }
+         void Predicate(uint32_t op)''')
+        replace(p,'  std::fflush(stdout);m_last_report=m_now();', '''  std::printf("binding54-stats: readable-range-calls=%" PRIu64 " samples=%" PRIu64
+                      " overlaps=%" PRIu64 " dropped-group-hits=%" PRIu64 " bases=%zu evicted=%" PRIu64 "\\n",
+                      m_binding_trace.Calls(),m_binding_trace.Samples(),m_binding_trace.Hits(),
+                      m_binding_trace.Dropped(),m_binding_trace.Bases(),m_binding_trace.Evicted());
+          for(uint32_t stage=0;stage<9;++stage)if(m_binding_trace.StageCalls()[stage])
+           std::printf("binding54-stage: stage=%u calls=%" PRIu64 " samples=%" PRIu64 " overlaps=%" PRIu64 "\\n",
+                       stage,m_binding_trace.StageCalls()[stage],m_binding_trace.StageSamples()[stage],m_binding_trace.StageHits()[stage]);
+          for(const auto& g:m_binding_trace.Groups())
+           std::printf("binding54-group: shader=%016" PRIx64 " stage=%u slot=%u written=%u hits=%" PRIu64
+                       " min-size=%" PRIu64 " max-size=%" PRIu64 " min-dump-age=%" PRIu64 " max-dump-age=%" PRIu64 "\\n",
+                       g.hash,g.stage,g.slot,g.written?1u:0u,g.hits,g.min_size,g.max_size,g.min_age,g.max_age);
+          m_binding_trace.ClearGroups();
+          std::fflush(stdout);m_last_report=m_now();''')
+        replace(p,' uint64_t m_dumps=0,', ''' KytyOcclusionExperiment::ShaderBindingTrace m_binding_trace;
+         uint64_t m_binding_examples=0;
+         uint64_t m_dumps=0,''')
+        p='src/graphics/host_gpu/renderer/commandScheduler.h'
+        replace(p,'    void ObserveOcclusionPredicate(uint32_t op);', '''    void ObserveOcclusionPredicate(uint32_t op);
+            void ObserveOcclusionBinding(uint64_t hash, uint32_t stage, uint32_t slot,
+                                         uint64_t address, uint64_t size, bool written);''')
+        p='src/graphics/host_gpu/renderer/commandScheduler.cpp'
+        replace(p,'void CommandScheduler::ObserveOcclusionPredicate(uint32_t op) {', '''void CommandScheduler::ObserveOcclusionBinding(uint64_t hash, uint32_t stage, uint32_t slot,
+            uint64_t address, uint64_t size, bool written) {
+            if (m_occlusion_probe) { m_occlusion_probe->Binding(hash, stage, slot, address, size, written); }
+        }
+
+        void CommandScheduler::ObserveOcclusionPredicate(uint32_t op) {''')
+        p='src/graphics/host_gpu/renderer/pipeline/descriptors.cpp'
+        replace(p,'\t\tuint32_t buffer_offset = 0;\n\t\tprepared.buffers.push_back(NativeStorageBuffer', '''        const auto& observed_source = prepared.buffer_sources[i];
+                const auto& observed_resource = program.info.buffers[i];
+                if (observed_resource.read && observed_source.address != 0 && observed_source.size != 0) {
+                    m_context.GetCommandScheduler().ObserveOcclusionBinding(program.shader_hash,
+                        static_cast<uint32_t>(program.stage), i, observed_source.address,
+                        observed_source.size, observed_resource.written);
+                }
+        \t\tuint32_t buffer_offset = 0;
+        \t\tprepared.buffers.push_back(NativeStorageBuffer''')
+        source=Path(__file__).resolve().parent.parent/'experiments/occlusion/ShaderBindingTrace.h'
+        if not source.is_file():raise RuntimeError('ShaderBindingTrace.h missing')
+        for path,text in changes.items():Path(path).write_text(text,newline='\n')
+        shutil.copyfile(source,'src/graphics/host_gpu/renderer/occlusion/ShaderBindingTrace.h')
+        print('binding54: sampled readable descriptor ranges; no shader loads observed or guest results changed')
+        """
+        files['experiments/occlusion/ShaderBindingTrace.h'] = r"""#pragma once
+        // Sampled descriptor-range evidence only; not an observation of executed shader loads.
+        #include <array>
+        #include <cstdint>
+        #include <deque>
+        #include <limits>
+        #include <map>
+        #include <optional>
+        #include <vector>
+        namespace KytyOcclusionExperiment {
+        class ShaderBindingTrace {
+        public:
+         struct Hit {uint64_t base,age;};
+         struct Group {
+          uint64_t hash;uint32_t stage,slot;bool written;
+          uint64_t hits=0,min_size=~uint64_t{0},max_size=0,min_age=~uint64_t{0},max_age=0;
+         };
+         explicit ShaderBindingTrace(std::size_t capacity=4096):m_capacity(capacity){}
+         void Dump(uint64_t base){
+          ++m_sequence;
+          if(!base || base>std::numeric_limits<uint64_t>::max()-247 || !m_capacity)return;
+          auto found=m_bases.find(base);
+          if(found!=m_bases.end()){found->second=m_sequence;return;}
+          if(m_bases.size()==m_capacity){m_bases.erase(m_order.front());m_order.pop_front();++m_evicted;}
+          m_bases.emplace(base,m_sequence);m_order.push_back(base);
+         }
+         std::optional<Hit> FirstOverlap(uint64_t address,uint64_t size)const{
+          if(!size || size-1>std::numeric_limits<uint64_t>::max()-address)return {};
+          const auto last=address+size-1;
+          const auto lower=address>=247?address-247:0;
+          for(auto it=m_bases.lower_bound(lower);it!=m_bases.end() && it->first<=last;++it){
+           uint64_t slot=0;
+           if(address>it->first){const auto offset=address-it->first;slot=offset/16+(offset%16>=8?1:0);}
+           if(slot>=16)continue;
+           const auto word=it->first+slot*16;
+           if(word<=last && word+7>=address)return Hit{it->first,m_sequence-it->second};
+          }
+          return {};
+         }
+         std::optional<Hit> Binding(uint64_t hash,uint32_t stage,uint32_t slot,uint64_t address,uint64_t size,bool written){
+          const auto n=m_calls++;
+          if(stage<m_stage_calls.size())++m_stage_calls[stage];
+          // One selected position per 64-call block, rotating across successive blocks.
+          if((n&63)!=((n>>6)&63))return {};
+          ++m_samples;if(stage<m_stage_samples.size())++m_stage_samples[stage];
+          const auto hit=FirstOverlap(address,size);if(!hit)return {};
+          ++m_hits;if(stage<m_stage_hits.size())++m_stage_hits[stage];
+          Group* group=nullptr;
+          for(auto& g:m_groups)if(g.hash==hash && g.stage==stage && g.slot==slot && g.written==written){group=&g;break;}
+          if(!group){
+           if(m_groups.size()==32){++m_dropped;return hit;}
+           m_groups.push_back({hash,stage,slot,written});group=&m_groups.back();
+          }
+          ++group->hits;
+          if(size<group->min_size)group->min_size=size;
+          if(size>group->max_size)group->max_size=size;
+          if(hit->age<group->min_age)group->min_age=hit->age;
+          if(hit->age>group->max_age)group->max_age=hit->age;
+          return hit;
+         }
+         uint64_t Calls()const{return m_calls;}uint64_t Samples()const{return m_samples;}
+         uint64_t Hits()const{return m_hits;}uint64_t Dropped()const{return m_dropped;}
+         uint64_t Evicted()const{return m_evicted;}std::size_t Bases()const{return m_bases.size();}
+         const std::vector<Group>& Groups()const{return m_groups;}
+         const auto& StageCalls()const{return m_stage_calls;}
+         const auto& StageSamples()const{return m_stage_samples;}
+         const auto& StageHits()const{return m_stage_hits;}
+         void ClearGroups(){m_groups.clear();}
+        private:
+         std::size_t m_capacity;
+         uint64_t m_sequence=0,m_evicted=0,m_calls=0,m_samples=0,m_hits=0,m_dropped=0;
+         std::map<uint64_t,uint64_t> m_bases;
+         std::deque<uint64_t> m_order;
+         std::vector<Group> m_groups;
+         std::array<uint64_t,9> m_stage_calls{},m_stage_samples{},m_stage_hits{};
+        };
+        }
+        """
+        files['experiments/occlusion/ShaderBindingTraceTests.cpp'] = r"""#include "ShaderBindingTrace.h"
+        #include <cassert>
+        #include <cstdio>
+        #include <random>
+        using KytyOcclusionExperiment::ShaderBindingTrace;
+        int main(){
+         ShaderBindingTrace t(2);t.Dump(0x1000);
+         for(unsigned db=0;db<16;++db){assert(t.FirstOverlap(0x1000+db*16,8));assert(!t.FirstOverlap(0x1008+db*16,8));}
+         assert(t.FirstOverlap(0xfff,2));assert(!t.FirstOverlap(0xfff,1));assert(t.FirstOverlap(0x10f7,1));assert(!t.FirstOverlap(0x10f8,8));
+         t.Dump(0x1008);assert(t.FirstOverlap(0x1008,8));t.Dump(0x3000);assert(t.Evicted()==1 && t.Bases()==2);assert(!t.FirstOverlap(0x1000,8));
+         assert(!t.FirstOverlap(~uint64_t{0},2));assert(!t.FirstOverlap(0x3000,0));
+         ShaderBindingTrace high;high.Dump(~uint64_t{0}-247);assert(high.FirstOverlap(~uint64_t{0},1));
+         // Compare the fast search with all sixteen written words over random intervals.
+         ShaderBindingTrace ranges;std::vector<uint64_t> bases;std::mt19937 rng(54);
+         for(unsigned i=0;i<128;++i){const uint64_t base=0x1000+(rng()%4096)*8;bases.push_back(base);ranges.Dump(base);}
+         for(unsigned i=0;i<10000;++i){uint64_t addr=rng()%50000,size=1+rng()%4096;bool expected=false;
+          for(auto base:bases)for(unsigned db=0;db<16;++db){auto word=base+db*16;if(word<=addr+size-1 && word+7>=addr)expected=true;}
+          assert(ranges.FirstOverlap(addr,size).has_value()==expected);
+         }
+         ShaderBindingTrace samples;samples.Dump(0x1000);
+         for(unsigned block=0;block<64;++block){const auto before=samples.Samples();
+          for(unsigned i=0;i<64;++i){auto hit=samples.Binding(block+1,2,0,0x1000,8,false);assert(hit.has_value()==(i==block));}
+          assert(samples.Samples()==before+1);
+         }
+         assert(samples.Calls()==4096 && samples.Samples()==64 && samples.Hits()==64);
+         assert(samples.Groups().size()==32 && samples.Dropped()==32);
+         assert(samples.StageCalls()[2]==4096 && samples.StageSamples()[2]==64 && samples.StageHits()[2]==64);
+         samples.ClearGroups();assert(samples.Groups().empty() && samples.Hits()==64);
+         std::puts("ShaderBindingTrace: sparse ranges, randomized overlap search, rotating samples and bounded groups passed");
+        }
+        """
+        root=Path("_occlusion51")
+        for name,source in files.items():
+            path=root/name
+            path.parent.mkdir(parents=True,exist_ok=True)
+            path.write_text(source,encoding="utf-8",newline="\n")
+        subprocess.run([sys.executable,str(root/"patches/adapt_occlusion_bindings54.py")],check=True)
+        '@ | & $env:KYTY_PYTHON -
+        if ($LASTEXITCODE -ne 0) { throw "Binding 54 adaptation failed" }
+        git diff --check
+        if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+    - name: Setup MSVC environment
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
+    - name: Setup Clang
+      uses: egor-tensin/setup-clang@v1
+      with:
+        version: 18
+        platform: x64
+        cygwin: 0
+    - name: Setup Ninja
+      uses: seanmiddleditch/gha-setup-ninja@v5
+    - name: Install Qt
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: 6.8.3
+        host: windows
+        target: desktop
+        arch: win64_msvc2022_64
+        modules: qt5compat
+        cache: true
+    - name: Test isolated query components on Windows
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved51.py "Test isolated query components on Windows"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 51 step failed: Test isolated query components on Windows" }
+    - name: Test shader range observation
+      run: |
+        $ErrorActionPreference = "Stop"
+        clang-cl /nologo /std:c++20 /EHsc /O2 "_occlusion51/experiments/occlusion/ShaderBindingTraceTests.cpp" /Fe:_Build/occlusion51/ShaderBindingTrace.exe /Fo:_Build/occlusion51/ShaderBindingTrace.obj
+        if ($LASTEXITCODE -ne 0) { throw "Shader binding trace build failed" }
+        & "_Build/occlusion51/ShaderBindingTrace.exe"
+        if ($LASTEXITCODE -ne 0) { throw "Shader binding trace tests failed" }
+    - name: Build and test using pinned working workflow
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved51.py "Build and test using pinned working workflow"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 51 step failed: Build and test using pinned working workflow" }
+      env:
+        GH_TOKEN: ${{ github.token }}
+    - name: Package launchers and symbols
+      run: |
+        $ErrorActionPreference = "Stop"
+        & $env:KYTY_PYTHON _run_saved51.py "Package launchers and symbols"
+        if ($LASTEXITCODE -ne 0) { throw "Saved diagnostic 51 step failed: Package launchers and symbols" }
+    - name: Write diagnostic 54 instructions
+      run: |
+        $ErrorActionPreference = "Stop"
+        @(
+            "Diagnostico-54.cmd: observation ON. Comparacion-54.cmd: observation OFF.",
+            "Samples one of 64 readable buffer descriptor preparations, rotating positions.",
+            "A range match does not prove an executed shader load or valid query ownership.",
+            "Direct CPU reads and indirect BDA accesses are not observed.",
+            "Stage codes: 1=Vertex, 2=Pixel, 4=Compute, 5=Mesh, 6=Local, 7=Hull, 8=Domain.",
+            "Stats/stages are cumulative; groups cover the report interval.",
+            "Keep _Patches, _PipelineCache and kyty_settings.ini.",
+            "AMD CPU patch OFF; shader validation OFF; red-zone ON.",
+            "Warm up, heavy view 60 seconds, light view 60 seconds.",
+            "Send full consoles containing binding54-stats, binding54-stage and binding54-group."
+        ) | Set-Content "_Build/windows/install/DIAGNOSTICO-54.txt" -Encoding ascii
+    - name: Create Windows ZIP
+      run: |
+        $ErrorActionPreference = "Stop"
+        $zip = "KytyPS5-Diagnostico-54.zip"
+        Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+        if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+            throw "Packaging failed: missing or empty ZIP"
+        }
+    - name: Upload KytyPS5
+      uses: actions/upload-artifact@v4
+      with:
+        name: KytyPS5-Diagnostico-54
+        path: KytyPS5-Diagnostico-54.zip
+        if-no-files-found: error
+        retention-days: 7
