@@ -1,0 +1,350 @@
+name: Windows AMD - Diagnostico 56 - Fases de dibujos
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 - Fases 56
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      KYTY_FLAGS_51: /clang:-ffp-contract=off
+      KYTY_PROFILE_51: Generica
+
+    steps:
+      - name: Checkout fixed AMD base
+        uses: actions/checkout@v4
+        with:
+          ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout pinned working diagnostic 20
+        uses: actions/checkout@v4
+        with:
+          ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+          path: _patch_source
+          sparse-checkout: |
+            patches
+            .github/workflows
+          fetch-depth: 1
+          submodules: false
+
+      - name: Read working diagnostic 51 from this commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: _workflow51
+          sparse-checkout: .github/workflows/build-windows-amd-occlusion-observation.yml
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Setup fixed Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pin Python executable and install YAML parser
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+          if (-not $pythonExe) { throw "Python executable missing" }
+          "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $pythonExe -m pip install PyYAML==6.0.2
+          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+          & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+
+      - name: Create runner for existing plain-text workflow
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          import subprocess
+          import sys
+          import yaml
+          source=Path("_workflow51/.github/workflows/build-windows-amd-occlusion-observation.yml")
+          if not source.is_file():
+              raise RuntimeError("Keep the working build-windows-amd-occlusion-observation.yml in this repository")
+          workflow=yaml.safe_load(source.read_text(encoding="utf-8"))
+          steps=workflow["jobs"]["build"]["steps"]
+          name=sys.argv[1]
+          selected=[s for s in steps if s.get("name")==name]
+          if len(selected)!=1 or "run" not in selected[0]:
+              raise RuntimeError("Missing or ambiguous diagnostic 51 step: "+name)
+          script=selected[0]["run"]
+          if name=="Install optional occlusion observation" and ("zlib" in script or "base64" in script):
+              raise RuntimeError("Diagnostic 51 must be the working plain-text version")
+          if name=="Package launchers and symbols":
+              script=script.replace("Diagnostico-51.cmd","Diagnostico-56.cmd").replace("Comparacion-51.cmd","Comparacion-56.cmd").replace("DIAGNOSTICO-51.txt","DIAGNOSTICO-56.txt")
+          path=Path("_run_saved51.ps1")
+          path.write_text('$ErrorActionPreference = "Stop"\n'+script,encoding="utf-8")
+          print("Reusing validated 51 step:",name,flush=True)
+          subprocess.run(["pwsh","-NoProfile","-File",str(path.resolve())],check=True)
+          '@ | Set-Content "_run_saved51.py" -Encoding utf8
+          & $env:KYTY_PYTHON -m py_compile _run_saved51.py
+          if ($LASTEXITCODE -ne 0) { throw "Saved workflow runner invalid" }
+
+      - name: Reproduce working AMD source and retained optimizations
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Reproduce working AMD source and retained optimizations"
+          if ($LASTEXITCODE -ne 0) { throw "Saved workflow source step failed" }
+
+      - name: Install optional occlusion observation
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Install optional occlusion observation"
+          if ($LASTEXITCODE -ne 0) { throw "Saved observation installation failed" }
+
+      - name: Install sampled draw phase timing
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          import subprocess
+          import sys
+          files={}
+          files['patches/adapt_draw_timing56.py']=r"""from pathlib import Path
+          changes={}
+          def replace(path,old,new):
+           s=changes.get(path,Path(path).read_text())
+           if s.count(old)!=1:raise RuntimeError('Unexpected draw56 boundary: '+path+' / '+old[:80])
+           changes[path]=s.replace(old,new)
+          p='src/graphics/host_gpu/renderer/debug.h'
+          replace(p,'#include <array>','#include <array>\n#include "DrawTiming56.h"')
+          replace(p,'m_start(m_timer != nullptr ? Now() : 0) {}','m_start(m_timer != nullptr ? Now() : 0), m_probe56(static_cast<unsigned>(probe)) {}')
+          replace(p,'\t\tuint64_t        m_start;','\t\tuint64_t        m_start;\n        DrawTiming56::ProbeScope m_probe56;')
+          replace(p,'\tvoid Mark(Phase phase) {','\tvoid Mark(Phase phase) {\n        DrawTiming56::Mark(static_cast<unsigned>(phase));')
+          replace(p,'inline thread_local DrawPhaseTimer g_draw_phases;','inline thread_local DrawPhaseTimer g_draw_phases;\nstatic_assert(DrawPhaseTimer::Count == 19 && DrawPhaseTimer::ProbeCount == 16);')
+          p='src/graphics/host_gpu/renderer/debug.cpp'
+          replace(p,'void DrawPhaseTimer::End(uint64_t pixel_hash) {','void DrawPhaseTimer::End(uint64_t pixel_hash) {\n    DrawTiming56::Complete();')
+          p='src/graphics/host_gpu/renderer/renderDraw.cpp'
+          replace(p,'\tg_draw_phases.Begin();','    DrawTiming56::DrawScope draw56(false);\n\tg_draw_phases.Begin();')
+          replace(p,'\tg_draw_phases.Begin(true);','    DrawTiming56::DrawScope draw56(true);\n\tg_draw_phases.Begin(true);')
+          p='src/graphics/host_gpu/renderer/renderCompute.cpp'
+          replace(p,'uint32_t thread_group_z, uint32_t mode) {','uint32_t thread_group_z, uint32_t mode) {\n    DrawTiming56::WorkScope compute56(0, false);')
+          replace(p,'uint64_t args_addr, uint32_t mode) {','uint64_t args_addr, uint32_t mode) {\n    DrawTiming56::WorkScope compute56(1, false);')
+          p='src/graphics/guest_gpu/graphicsRun.cpp'
+          replace(p,'\t\tconst auto packet_dw =\n\t\t    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;','    DrawTiming56::WorkScope packet56(opcode, true);\n\t\tconst auto packet_dw =\n\t\t    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;\n    packet56.Stop();')
+          p='src/graphics/presentation/window/window.cpp'
+          replace(p,'\tDrainStats::CountFrame(new_frame);','\tDrainStats::CountFrame(new_frame);\n    DrawTiming56::Frame(new_frame);')
+          replace(p,'#include "graphics/presentation/window.h"','#include "graphics/presentation/window.h"\n#include "graphics/host_gpu/renderer/DrawTiming56.h"')
+          source=Path(__file__).resolve().parent.parent/'experiments/draw56/DrawTiming56.h'
+          if not source.is_file():raise RuntimeError('DrawTiming56.h missing')
+          for p,s in changes.items():Path(p).write_text(s,newline='\n')
+          Path('src/graphics/host_gpu/renderer/DrawTiming56.h').write_text(source.read_text(),newline='\n')
+          print('draw56: sampled elapsed CPU draw phases, PM4 handlers, compute and new presentations')
+          """
+          files['experiments/draw56/DrawTiming56.h']=r"""#pragma once
+          #include <array>
+          #include <atomic>
+          #include <chrono>
+          #include <cinttypes>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          namespace DrawTiming56 {
+          using Clock=std::chrono::steady_clock;
+          inline bool Enabled(){static const bool on=[]{const char* v=std::getenv("KYTY_DRAW_TIMING56");const bool x=v&&std::strcmp(v,"1")==0;if(x)std::puts("draw56: rotating 1/64 CPU samples ON; frames count new presentations");return x;}();return on;}
+          inline std::atomic<uint64_t> frames{0},thread_ids{0};
+          inline void Frame(bool fresh){if(fresh&&Enabled())frames.fetch_add(1,std::memory_order_relaxed);}
+          struct Metric {uint64_t calls=0,samples=0,ns=0,max=0,sequence=0;};
+          struct State {
+           std::array<Metric,258> metrics{};
+           std::array<uint64_t,19> phases{};
+           std::array<uint64_t,16> probes{};
+           std::array<uint64_t,2> draws{},completed{};
+           uint64_t samples=0,sampled_completed=0,frame_start=frames.load(),id=thread_ids.fetch_add(1);
+           Clock::time_point last=Clock::now();
+          };
+          inline thread_local State state;
+          inline uint64_t Ns(Clock::time_point a,Clock::time_point b){return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(b-a).count());}
+          inline bool Select(Metric& m){++m.calls;const auto n=m.sequence++;return (n&63)==((n>>6)&63);}
+          inline void Add(Metric& m,uint64_t ns){++m.samples;m.ns+=ns;if(ns>m.max)m.max=ns;}
+          inline void Report(Clock::time_point now){
+           const double sec=std::chrono::duration<double>(now-state.last).count();if(sec<5)return;
+           const auto f=frames.load(std::memory_order_relaxed),delta=f-state.frame_start;
+           std::printf("draw56-window: thread=%" PRIu64 " seconds=%.6f new-frames=%" PRIu64 " draw-index=%" PRIu64 " draw-auto=%" PRIu64 " normal-index=%" PRIu64 " normal-auto=%" PRIu64 " draw-samples=%" PRIu64 " normal-samples=%" PRIu64 "\n",state.id,sec,delta,state.draws[0],state.draws[1],state.completed[0],state.completed[1],state.samples,state.sampled_completed);
+           const char* names[]={"setup","vs-params","ps-params","ps-program","vs-program","targets","stage-tex","stage-smp","stage-bind","find-buf","rebind-img","buf-views","gfx-bind","rt-acquire","pipeline","records","commit","record","tail"};
+           const char* probes[]={"rt-image","tex-image","tex-describe","buf-written","buf-read","buf-invalidate","upload","find-finish","stream-copy","pending-ops","bda","spec-reads","refresh","prog-match","inputs-check","upload-copy"};
+           const auto calls=state.draws[0]+state.draws[1];
+           for(unsigned i=0;i<19;++i)std::printf("draw56-phase: name=%s sampled-ms=%.6f estimated-ms=%.6f\n",names[i],double(state.phases[i])/1e6,state.samples?double(state.phases[i])/double(state.samples)*double(calls)/1e6:0.0);
+           for(unsigned i=0;i<16;++i)if(state.probes[i])std::printf("draw56-probe: name=%s sampled-ms=%.6f estimated-ms=%.6f nested-do-not-add\n",probes[i],double(state.probes[i])/1e6,state.samples?double(state.probes[i])/double(state.samples)*double(calls)/1e6:0.0);
+           for(unsigned i=0;i<258;++i){auto& m=state.metrics[i];if(!m.calls)continue;
+            const double mean=m.samples?double(m.ns)/double(m.samples):0.0;
+            std::printf("draw56-work: thread=%" PRIu64 " kind=%s id=%u calls=%" PRIu64 " samples=%" PRIu64 " sampled-ms=%.6f mean-us=%.6f max-us=%.6f estimated-ms=%.6f\n",state.id,i<256?"pm4":"compute",i<256?i:i-256,m.calls,m.samples,double(m.ns)/1e6,mean/1e3,double(m.max)/1e3,mean*double(m.calls)/1e6);
+            const auto sequence=m.sequence;m={};m.sequence=sequence;
+           }
+           state.phases={};state.probes={};state.draws={};state.completed={};state.samples=0;state.sampled_completed=0;state.frame_start=f;
+           std::fflush(stdout);state.last=Clock::now();
+          }
+          class DrawScope;
+          inline thread_local DrawScope* current=nullptr;
+          class DrawScope {
+           DrawScope* previous=nullptr;bool on=false,sampled=false,normal=false;unsigned kind=0;Clock::time_point last{};
+          public:
+           explicit DrawScope(bool automatic):kind(automatic?1u:0u){
+            if(!Enabled()){return;}
+            on=true;previous=current;current=this;++state.draws[kind];
+            static thread_local uint64_t sequence=0;const auto n=sequence++;sampled=(n&63)==((n>>6)&63);
+            if(sampled){++state.samples;last=Clock::now();}
+           }
+           bool Sampled()const{return sampled;}
+           void Mark(unsigned phase){if(sampled&&phase<19){const auto now=Clock::now();state.phases[phase]+=Ns(last,now);last=now;}}
+           void Complete(){if(on&&!normal){normal=true;++state.completed[kind];if(sampled)++state.sampled_completed;}}
+           ~DrawScope(){if(on){Mark(18);current=previous;}}
+           DrawScope(const DrawScope&)=delete;DrawScope& operator=(const DrawScope&)=delete;
+          };
+          inline void Mark(unsigned phase){if(current)current->Mark(phase);}
+          inline void Complete(){if(current)current->Complete();}
+          class ProbeScope {
+           bool active=false;unsigned index=0;Clock::time_point start{};
+          public:
+           explicit ProbeScope(unsigned probe):index(probe){active=current&&current->Sampled()&&probe<16;if(active)start=Clock::now();}
+           ~ProbeScope(){if(active)state.probes[index]+=Ns(start,Clock::now());}
+           ProbeScope(const ProbeScope&)=delete;ProbeScope& operator=(const ProbeScope&)=delete;
+          };
+          class WorkScope {
+           unsigned index=0;bool active=false,report=false;Clock::time_point start{};
+          public:
+           WorkScope(unsigned id,bool pm4):index(pm4?id:256+id),report(pm4){if(!Enabled()||index>=258)return;active=Select(state.metrics[index]);if(active)start=Clock::now();}
+           void Stop(){if(!active)return;const auto now=Clock::now();Add(state.metrics[index],Ns(start,now));active=false;if(report&&!current)Report(now);}
+           ~WorkScope(){Stop();}
+           WorkScope(const WorkScope&)=delete;WorkScope& operator=(const WorkScope&)=delete;
+          };
+          }
+          """
+          files['experiments/draw56/DrawTiming56Tests.cpp']=r"""#include "DrawTiming56.h"
+          #include <cassert>
+          int main(int argc,char**){
+           using namespace DrawTiming56;
+           if(argc==1){Frame(true);DrawScope d(false);WorkScope w(0,true);assert(current==nullptr&&frames.load()==0);return 0;}
+           Frame(false);assert(frames.load()==0);Frame(true);assert(frames.load()==1);
+           for(unsigned i=0;i<4096;++i){DrawScope d(i%2);assert(current);Mark(0);{ProbeScope p(0);}if(i%2==0)Complete();}
+           assert(!current&&state.samples==64&&state.draws[0]==2048&&state.draws[1]==2048&&state.completed[0]==2048&&state.completed[1]==0);
+           for(unsigned i=0;i<4096;++i){WorkScope w(42,true);w.Stop();w.Stop();}
+           assert(state.metrics[42].calls==4096&&state.metrics[42].samples==64);
+           {WorkScope w(1,false);}
+           assert(state.metrics[257].calls==1&&state.metrics[257].samples==1);
+           state.last=Clock::now()-std::chrono::seconds(6);Frame(true);Report(Clock::now());
+           assert(state.metrics[42].calls==0&&state.metrics[42].sequence==4096&&state.draws[0]==0&&state.frame_start==2);
+           {DrawScope outer(false);auto* p=current;{DrawScope inner(true);}assert(current==p);}assert(!current);
+          }
+          """
+          root=Path("_draw56")
+          for name,text in files.items():
+              p=root/name
+              p.parent.mkdir(parents=True,exist_ok=True)
+              p.write_text(text,encoding="utf-8",newline="\n")
+          subprocess.run([sys.executable,str(root/"patches/adapt_draw_timing56.py")],check=True)
+          '@ | & $env:KYTY_PYTHON -
+          if ($LASTEXITCODE -ne 0) { throw "Draw 56 adaptation failed" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: 18
+          platform: x64
+          cygwin: 0
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.8.3
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qt5compat
+          cache: true
+
+      - name: Test isolated query components on Windows
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Test isolated query components on Windows"
+          if ($LASTEXITCODE -ne 0) { throw "Isolated query component tests failed" }
+
+      - name: Test draw timing counters
+        run: |
+          $ErrorActionPreference = "Stop"
+          clang-cl /nologo /std:c++20 /EHsc /O2 "_draw56/experiments/draw56/DrawTiming56Tests.cpp" /Fe:_Build/occlusion51/DrawTiming56.exe /Fo:_Build/occlusion51/DrawTiming56.obj
+          if ($LASTEXITCODE -ne 0) { throw "Draw timing test build failed" }
+          $env:KYTY_DRAW_TIMING56 = "0"
+          & "_Build/occlusion51/DrawTiming56.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Disabled timing test failed" }
+          $env:KYTY_DRAW_TIMING56 = "1"
+          & "_Build/occlusion51/DrawTiming56.exe" on
+          if ($LASTEXITCODE -ne 0) { throw "Draw timing counter test failed" }
+          Remove-Item Env:KYTY_DRAW_TIMING56
+
+      - name: Build and test using pinned working workflow
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Build and test using pinned working workflow"
+          if ($LASTEXITCODE -ne 0) { throw "Build or tests failed" }
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Package launchers and symbols
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Package launchers and symbols"
+          if ($LASTEXITCODE -ne 0) { throw "Launcher packaging failed" }
+
+      - name: Configure diagnostic 56 launchers
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          root=Path("_Build/windows/install")
+          for name,on in [("Diagnostico-56.cmd",True),("Comparacion-56.cmd",False)]:
+              p=root/name
+              s=p.read_text()
+              if "set KYTY_OCCLUSION_PROBE=" not in s:
+                  raise RuntimeError("Unexpected launcher: "+name)
+              s=s.replace("set KYTY_OCCLUSION_PROBE=1","set KYTY_OCCLUSION_PROBE=0")
+              s=s.replace("set KYTY_OCCLUSION_PROBE=0", "set KYTY_OCCLUSION_PROBE=0\nset KYTY_BUFFER_TIMING55=0\nset KYTY_DRAW_TIMING56="+str(int(on)))
+              p.write_text(s,newline="\r\n")
+          (root/"DIAGNOSTICO-56.txt").write_text(
+              "CPU draw timing ON only in Diagnostico-56.cmd. Occlusion observation OFF.\n"
+              "Warm up one minute; heavy 60 seconds, light 60 seconds.\n"
+              "Send complete console. PM4, compute and probes overlap phases: do not add nested times.\n"
+              "New frames count new presentations, not GPU-completion or guest suspend points.\n"
+              "Estimates use rotating 1/64 samples; counters are per thread.\n",
+              encoding="utf-8")
+          '@ | & $env:KYTY_PYTHON -
+          if ($LASTEXITCODE -ne 0) { throw "Launcher 56 setup failed" }
+
+      - name: Create Windows ZIP
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "KytyPS5-Diagnostico-56.zip"
+          Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+              throw "Packaging failed: missing or empty ZIP"
+          }
+
+      - name: Upload KytyPS5
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Diagnostico-56
+          path: KytyPS5-Diagnostico-56.zip
+          if-no-files-found: error
+          retention-days: 7
