@@ -1,0 +1,472 @@
+name: Windows AMD - Prueba 60 - Escrituras repetidas
+
+'on':
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Windows x64 - Prueba 60
+    runs-on: windows-2022
+
+    defaults:
+      run:
+        shell: pwsh
+
+    env:
+      KYTY_FLAGS_51: /clang:-ffp-contract=off
+      KYTY_PROFILE_51: Generica
+
+    steps:
+      - name: Checkout fixed AMD base
+        uses: actions/checkout@v4
+        with:
+          ref: 4068f4ac886dcd25acc52b6e3fa3e3800dc576a9
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Checkout pinned working diagnostic 20
+        uses: actions/checkout@v4
+        with:
+          ref: 535aa7ef4d19ef96ec97c757f0c728a4f83e83b5
+          path: _patch_source
+          sparse-checkout: |
+            patches
+            .github/workflows
+          fetch-depth: 1
+          submodules: false
+
+      - name: Read working diagnostic 51 from this commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: _workflow51
+          sparse-checkout: .github/workflows/build-windows-amd-occlusion-observation.yml
+          sparse-checkout-cone-mode: false
+          fetch-depth: 1
+          submodules: false
+
+      - name: Setup fixed Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Pin Python executable and install YAML parser
+        run: |
+          $ErrorActionPreference = "Stop"
+          $pythonExe = (Get-Command python -CommandType Application | Select-Object -First 1).Source
+          if (-not $pythonExe) { throw "Python executable missing" }
+          "KYTY_PYTHON=$pythonExe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & $pythonExe -m pip install PyYAML==6.0.2
+          if ($LASTEXITCODE -ne 0) { throw "YAML parser installation failed" }
+          & $pythonExe -c "import sys, yaml; print(sys.executable); print(yaml.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw "Python YAML verification failed" }
+
+      - name: Create runner for existing plain-text workflow
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+          import subprocess
+          import sys
+          import yaml
+
+          source = Path("_workflow51/.github/workflows/build-windows-amd-occlusion-observation.yml")
+          if not source.is_file():
+              raise RuntimeError("Keep build-windows-amd-occlusion-observation.yml in this repository")
+
+          workflow = yaml.safe_load(source.read_text(encoding="utf-8"))
+          steps = workflow["jobs"]["build"]["steps"]
+          name = sys.argv[1]
+          selected = [s for s in steps if s.get("name") == name]
+
+          if len(selected) != 1 or "run" not in selected[0]:
+              raise RuntimeError("Missing or ambiguous saved step: " + name)
+
+          script = selected[0]["run"]
+
+          if name == "Package launchers and symbols":
+              script = script.replace("Diagnostico-51.cmd", "Prueba-60.cmd")
+              script = script.replace("Comparacion-51.cmd", "Comparacion-60.cmd")
+              script = script.replace("DIAGNOSTICO-51.txt", "PRUEBA-60.txt")
+              script = script.replace("set KYTY_OCCLUSION_PROBE=$mode", "set KYTY_OCCLUSION_PROBE=0")
+              script = script.replace(
+                  '"set KYTY_OCCLUSION_PROBE=0",',
+                  '"set KYTY_OCCLUSION_PROBE=0",\n'
+                  '        "set KYTY_GUEST_STORAGE_REPEAT=$mode",\n'
+                  '        "set KYTY_WIDE_FILL_CLEAR=0",'
+              )
+
+          path = Path("_run_saved51.ps1")
+          path.write_text('$ErrorActionPreference = "Stop"\n' + script, encoding="utf-8")
+          print("Reusing saved step:", name, flush=True)
+          subprocess.run(["pwsh", "-NoProfile", "-File", str(path.resolve())], check=True)
+          '@ | Set-Content "_run_saved51.py" -Encoding utf8
+
+          & $env:KYTY_PYTHON -m py_compile _run_saved51.py
+          if ($LASTEXITCODE -ne 0) { throw "Saved workflow runner invalid" }
+
+      - name: Reproduce working AMD source and retained optimizations
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Reproduce working AMD source and retained optimizations"
+          if ($LASTEXITCODE -ne 0) { throw "AMD source preparation failed" }
+
+      - name: Install repeated storage write experiment 60
+        run: |
+          $ErrorActionPreference = "Stop"
+          @'
+          from pathlib import Path
+
+          changes = {}
+
+          def replace(path, old, new):
+              p = Path(path)
+              text = changes.get(path, p.read_text(encoding="utf-8"))
+              if text.count(old) != 1:
+                  raise RuntimeError("Unexpected barrier60 boundary: " + path + " / " + old[:70])
+              changes[path] = text.replace(old, new)
+
+          helper = r"""#pragma once
+          // Experimental, opt-in subset of Jetsku c7cb149557e7.
+          // Guest barriers retain responsibility for dependencies between guest commands.
+          #include <vulkan/vulkan.hpp>
+          #include <cstdint>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+
+          namespace KytyStorageRepeat60 {
+          inline thread_local bool active = false;
+          inline thread_local uint64_t candidates = 0, skipped = 0, frames = 0;
+
+          inline bool Enabled() {
+              static const bool on = [] {
+                  const char* value = std::getenv("KYTY_GUEST_STORAGE_REPEAT");
+                  return value && std::strcmp(value, "1") == 0;
+              }();
+              return on;
+          }
+
+          struct Scope {
+              bool previous = active;
+              Scope() { active = true; }
+              ~Scope() { active = previous; }
+              Scope(const Scope&) = delete;
+              Scope& operator=(const Scope&) = delete;
+          };
+
+          inline bool Eligible(bool previous_guest, bool current_guest,
+                               vk::ImageLayout previous_layout, vk::ImageLayout layout,
+                               vk::AccessFlags2 previous_access, vk::AccessFlags2 access,
+                               vk::PipelineStageFlags2 previous_stage, vk::PipelineStageFlags2 stage,
+                               bool color) {
+              const vk::AccessFlags2 allowed =
+                  vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+              return color && previous_guest && current_guest &&
+                     previous_layout == vk::ImageLayout::eGeneral && layout == previous_layout &&
+                     previous_access == access && previous_stage == stage &&
+                     bool(access & vk::AccessFlagBits2::eShaderWrite) && !bool(access & ~allowed);
+          }
+
+          inline bool Skip(bool previous_guest,
+                           vk::ImageLayout previous_layout, vk::ImageLayout layout,
+                           vk::AccessFlags2 previous_access, vk::AccessFlags2 access,
+                           vk::PipelineStageFlags2 previous_stage, vk::PipelineStageFlags2 stage,
+                           bool color) {
+              if (!Eligible(previous_guest, active, previous_layout, layout,
+                            previous_access, access, previous_stage, stage, color))
+                  return false;
+              ++candidates;
+              if (!Enabled()) return false;
+              ++skipped;
+              return true;
+          }
+
+          inline void Banner() {
+              std::printf("barrier60: repeated guest storage writes %s\n", Enabled() ? "ON" : "OFF");
+          }
+
+          inline void Frame() {
+              if (++frames % 300 != 0) return;
+              std::printf("barrier60-stats: candidates=%llu skipped=%llu frames=%llu\n",
+                          static_cast<unsigned long long>(candidates),
+                          static_cast<unsigned long long>(skipped),
+                          static_cast<unsigned long long>(frames));
+              std::fflush(stdout);
+          }
+          }
+          """
+
+          test = r"""#include "graphics/host_gpu/renderer/image/storageRepeat60.h"
+          #include <cstdlib>
+          using namespace KytyStorageRepeat60;
+
+          void Check(bool ok) {
+              if (!ok) {
+                  std::fputs("barrier60 test failed\n", stderr);
+                  std::abort();
+              }
+          }
+
+          int main() {
+              const auto layout = vk::ImageLayout::eGeneral;
+              const vk::AccessFlags2 rw =
+                  vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+              const vk::PipelineStageFlags2 stage =
+                  vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+
+              Check(!active);
+              Check(!Skip(true, layout, layout, rw, rw, stage, stage, true));
+              {
+                  Scope outer;
+                  Check(active);
+                  { Scope inner; Check(active); }
+                  Check(active);
+
+                  Check(Skip(true, layout, layout, rw, rw, stage, stage, true) == Enabled());
+                  Check(!Skip(false, layout, layout, rw, rw, stage, stage, true));
+                  Check(!Skip(true, layout, layout, rw, rw, stage, stage, false));
+                  Check(!Skip(true, layout, vk::ImageLayout::eShaderReadOnlyOptimal,
+                              rw, rw, stage, stage, true));
+                  Check(!Skip(true, layout, layout, rw, vk::AccessFlagBits2::eShaderRead,
+                              stage, stage, true));
+                  Check(!Skip(true, layout, layout, rw, rw,
+                              stage, vk::PipelineStageFlagBits2::eTransfer, true));
+                  Check(!Skip(true, layout, layout,
+                              vk::AccessFlagBits2::eTransferWrite,
+                              vk::AccessFlagBits2::eTransferWrite, stage, stage, true));
+                  Check(!Skip(true, layout, layout,
+                              rw | vk::AccessFlagBits2::eColorAttachmentWrite,
+                              rw | vk::AccessFlagBits2::eColorAttachmentWrite, stage, stage, true));
+
+                  for (unsigned bits = 0; bits < 64; ++bits) {
+                      const bool previous_guest = bits & 1;
+                      const bool current_guest = bits & 2;
+                      const bool color = bits & 4;
+                      const auto before = (bits & 8) ? layout : vk::ImageLayout::eTransferDstOptimal;
+                      const auto after = (bits & 16) ? layout : vk::ImageLayout::eShaderReadOnlyOptimal;
+                      const vk::PipelineStageFlags2 next =
+                          (bits & 32) ? stage : vk::PipelineStageFlagBits2::eTransfer;
+                      const bool expected = (bits & 31) == 31 && (bits & 32);
+                      Check(Eligible(previous_guest, current_guest, before, after,
+                                     rw, rw, stage, next, color) == expected);
+                  }
+              }
+
+              Check(!active);
+              Check(candidates == 1);
+              Check(skipped == uint64_t(Enabled()));
+              std::puts("barrier60: scope, eligibility, exclusions and ON/OFF tests passed");
+          }
+          """
+
+          p = "src/graphics/host_gpu/graphicContext.h"
+          replace(
+              p,
+              "\tvk::ImageLayout         layout      = vk::ImageLayout::eUndefined;",
+              "\tvk::ImageLayout         layout      = vk::ImageLayout::eUndefined;\n"
+              "\tbool guest60 = false;"
+          )
+
+          p = "src/graphics/host_gpu/renderer/image/image.cpp"
+          replace(
+              p,
+              '#include "graphics/host_gpu/renderer/image/image.h"',
+              '#include "graphics/host_gpu/renderer/image/image.h"\n'
+              '#include "graphics/host_gpu/renderer/image/storageRepeat60.h"'
+          )
+          replace(
+              p,
+              "\tconst bool has_subresource_states = !subresource_states.empty();",
+              "\tconst bool has_subresource_states = !subresource_states.empty();\n"
+              "    const bool guest60 = KytyStorageRepeat60::active;\n"
+              "    const bool color60 = FullAspectMask(backing.format) == vk::ImageAspectFlagBits::eColor;"
+          )
+          replace(
+              p,
+              "\t\t\t\tconst bool     repeated_write =\n"
+              "\t\t\t\t    static_cast<bool>(subresource_state.access_mask & write_access);",
+              "                const bool skip60 = KytyStorageRepeat60::Skip(\n"
+              "                    subresource_state.guest60, subresource_state.layout, destination_layout,\n"
+              "                    subresource_state.access_mask, destination_access,\n"
+              "                    subresource_state.pl_stage, destination_stage, color60);\n"
+              "\t\t\t\tconst bool repeated_write =\n"
+              "\t\t\t\t    static_cast<bool>(subresource_state.access_mask & write_access) && !skip60;"
+          )
+          replace(
+              p,
+              "subresource_state = {destination_stage, destination_access, destination_layout};",
+              "subresource_state = {destination_stage, destination_access, destination_layout, guest60};"
+          )
+          replace(
+              p,
+              "\t\tconst bool     repeated_write = static_cast<bool>(state.access_mask & write_access);",
+              "        const bool skip60 = KytyStorageRepeat60::Skip(\n"
+              "            state.guest60, state.layout, destination_layout, state.access_mask,\n"
+              "            destination_access, state.pl_stage, destination_stage, color60);\n"
+              "\t\tconst bool repeated_write = static_cast<bool>(state.access_mask & write_access);"
+          )
+          replace(
+              p,
+              "\t\t    !repeated_write) {",
+              "\t\t    (!repeated_write || skip60)) {"
+          )
+          replace(
+              p,
+              "\tstate = {destination_stage, destination_access, destination_layout};",
+              "\tstate = {destination_stage, destination_access, destination_layout, guest60};"
+          )
+
+          p = "src/graphics/host_gpu/renderer/pipeline/descriptors.cpp"
+          replace(
+              p,
+              '#include "graphics/host_gpu/renderer/pipeline/descriptors.h"',
+              '#include "graphics/host_gpu/renderer/pipeline/descriptors.h"\n'
+              '#include "graphics/host_gpu/renderer/image/storageRepeat60.h"'
+          )
+          replace(
+              p,
+              "\t\t\tconst bool storage = binding.desc.type == TextureCache::BindingType::Storage;",
+              "\t\t\tconst bool storage = binding.desc.type == TextureCache::BindingType::Storage;\n"
+              "            const KytyStorageRepeat60::Scope guest_transition60;"
+          )
+
+          p = "src/graphics/host_gpu/renderer/cache/textureCache.cpp"
+          replace(
+              p,
+              '#include "graphics/host_gpu/renderer/cache/textureCache.h"',
+              '#include "graphics/host_gpu/renderer/cache/textureCache.h"\n'
+              '#include "graphics/host_gpu/renderer/image/storageRepeat60.h"'
+          )
+          replace(
+              p,
+              "\tm_dcc_gpu_clear = Config::DccGpuClearEnabled()",
+              "    KytyStorageRepeat60::Banner();\n"
+              "\tm_dcc_gpu_clear = Config::DccGpuClearEnabled()"
+          )
+          replace(
+              p,
+              "void TextureCache::RunGarbageCollector() {\n\t(void)CollectGarbage(false);\n}",
+              "void TextureCache::RunGarbageCollector() {\n\t(void)CollectGarbage(false);\n"
+              "    KytyStorageRepeat60::Frame();\n}"
+          )
+
+          guest = Path("src/graphics/guest_gpu/graphicsRun.cpp").read_text(encoding="utf-8")
+          start = guest.index("void CommandProcessor::EmitGlobalBarrier() {")
+          end = guest.index("\n}", start)
+          if "pipelineBarrier2(dependency)" not in guest[start:end]:
+              raise RuntimeError("Guest global barrier implementation missing")
+
+          for path, text in changes.items():
+              Path(path).write_text(text, encoding="utf-8", newline="\n")
+
+          Path("src/graphics/host_gpu/renderer/image/storageRepeat60.h").write_text(
+              helper, encoding="utf-8", newline="\n"
+          )
+          Path("tests/StorageRepeat60Tests.cpp").write_text(
+              test, encoding="utf-8", newline="\n"
+          )
+
+          p = Path("CMakeLists.txt")
+          p.write_text(
+              p.read_text(encoding="utf-8") +
+              "\nadd_executable(storage_repeat60_tests EXCLUDE_FROM_ALL tests/StorageRepeat60Tests.cpp)\n"
+              "target_link_libraries(storage_repeat60_tests common fmt::fmt Vulkan::Headers)\n"
+              "target_include_directories(storage_repeat60_tests PRIVATE ${inc_headers})\n"
+              "add_test(NAME storage_repeat60 COMMAND $<TARGET_FILE:storage_repeat60_tests>)\n",
+              encoding="utf-8", newline="\n"
+          )
+          print("barrier60 installed; guest global barriers retained; no wide59 changes")
+          '@ | & $env:KYTY_PYTHON -
+
+          if ($LASTEXITCODE -ne 0) { throw "Storage repeat adaptation failed" }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw "Invalid source diff" }
+
+      - name: Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Setup Clang
+        uses: egor-tensin/setup-clang@v1
+        with:
+          version: 18
+          platform: x64
+          cygwin: 0
+
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: 6.8.3
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qt5compat
+          cache: true
+
+      - name: Build and test using pinned working workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Build and test using pinned working workflow"
+          if ($LASTEXITCODE -ne 0) { throw "Build or baseline tests failed" }
+
+      - name: Test storage repeat policy OFF and ON
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake --build _Build/windows --target storage_repeat60_tests --parallel 2
+          if ($LASTEXITCODE -ne 0) { throw "Storage repeat test build failed" }
+
+          foreach ($mode in @("0", "1")) {
+              $env:KYTY_GUEST_STORAGE_REPEAT = $mode
+              ctest --test-dir _Build/windows --output-on-failure --no-tests=error -R "^storage_repeat60$"
+              if ($LASTEXITCODE -ne 0) { throw "Storage repeat tests failed in mode $mode" }
+          }
+
+          Remove-Item Env:KYTY_GUEST_STORAGE_REPEAT -ErrorAction SilentlyContinue
+
+      - name: Package launchers and symbols
+        run: |
+          $ErrorActionPreference = "Stop"
+          & $env:KYTY_PYTHON _run_saved51.py "Package launchers and symbols"
+          if ($LASTEXITCODE -ne 0) { throw "Launcher packaging failed" }
+
+      - name: Write instructions
+        run: |
+          $ErrorActionPreference = "Stop"
+          @(
+              "Comparacion-60.cmd: original image barriers. Prueba-60.cmd: repeated guest storage writes ON.",
+              "Same executable. Occlusion observation OFF; wide59 not installed.",
+              "Keep _Patches, _PipelineCache and kyty_settings.ini. Choose THIS interpreter.",
+              "AMD CPU patch OFF; shader validation OFF; red-zone ON.",
+              "Warm up one minute. Heavy view 60 seconds, then light view 60 seconds.",
+              "Send full consoles with barrier60-stats and FPS for both runs.",
+              "Counters are cumulative. Candidates count eligible subresource transitions; skipped counts avoided barriers.",
+              "This experiment relies on the guest's explicit barriers for dependencies between commands.",
+              "If new graphical errors occur, close the test and use Comparacion-60.cmd."
+          ) | Set-Content "_Build/windows/install/PRUEBA-60.txt" -Encoding ascii
+
+      - name: Create Windows ZIP
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zip = "KytyPS5-Prueba-60.zip"
+          Compress-Archive -Path "_Build/windows/install/*" -DestinationPath $zip -Force -ErrorAction Stop
+          if (-not (Test-Path $zip) -or (Get-Item $zip).Length -eq 0) {
+              throw "Packaging failed: missing or empty ZIP"
+          }
+
+      - name: Upload KytyPS5
+        uses: actions/upload-artifact@v4
+        with:
+          name: KytyPS5-Prueba-60
+          path: KytyPS5-Prueba-60.zip
+          if-no-files-found: error
+          retention-days: 7
